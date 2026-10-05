@@ -30,10 +30,9 @@ struct Client {
       std::lock_guard lock(control_mutex);
       auto it=controls.find(frame.value("request_id","")); if (it==controls.end()) return false;
       auto type=frame.value("type","");
-      if (type != "result" && type != "error") return true;
-      callback=std::move(it->second); controls.erase(it);
+      if(type=="result" || type=="error"){callback=std::move(it->second);controls.erase(it);}else callback=it->second;
     }
-    callback(frame.at("type"),frame.value("payload",Json::object())); return true;
+    auto data=frame.value("payload",Json::object());if(frame.at("type")=="approval.requested")data["_request_id"]=frame.value("request_id","");callback(frame.at("type"),data);return true;
   }
   Json request(std::string type,Json payload = Json::object(),Emit callback = {}) {
     std::unique_lock receive_lock(receive_mutex);
@@ -185,7 +184,7 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   };
   Json payload={{"name",name},{"arguments",args}};
   if (live) client.live_request(std::move(payload),[show_result,callback](const std::string& type,const Json& result){
-    if (type == "error") callback("command.error",result); else show_result(result);
+    if(type=="error")callback("command.error",result);else if(type=="result")show_result(result);else if(callback)callback(type,result);
   });
   else show_result(client.request("command",std::move(payload),callback));
   return Action::Continue;

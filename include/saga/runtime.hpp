@@ -32,6 +32,7 @@ class Runtime {
   std::function<void()> service_;
   bool active_=false,cancelled_=false;
   void chat_turn(std::string input,Emit emit);
+  void cancel_turn(Emit emit);
   bool steering_pending();
   void deliver_steering(Emit emit);
   Completion call(ChatRequest request,const std::string& purpose,Emit emit);

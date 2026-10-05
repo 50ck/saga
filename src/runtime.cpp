@@ -340,8 +340,13 @@ void Runtime::deliver_steering(Emit emit) {
 void Runtime::chat(std::string input,Emit emit) {
   active_=true; cancelled_=false;
   struct Reset {bool& active;bool& cancelled;~Reset(){active=false;cancelled=false;}} reset{active_,cancelled_};
+  if(emit)emit("turn.started",{{"session_id",p_->session}});
   try { chat_turn(std::move(input),emit); }
-  catch(const TurnCancelled&) {
+  catch(const TurnCancelled&) {cancel_turn(emit);}
+  catch(...) {if(emit)emit("turn.finished",{{"failed",true}});throw;}
+  if(emit)emit("turn.finished",{{"stopped",cancelled_}});
+}
+void Runtime::cancel_turn(Emit emit) {
     p_->db->transaction([&]{
       for(auto& row:p_->db->query("SELECT id FROM steering_messages WHERE session_id=? AND status='queued'",{p_->session}))p_->db->event("steering.cancelled",{{"id",row["id"]}},p_->session,p_->task);
       p_->db->exec("UPDATE steering_messages SET status='cancelled',updated_at=? WHERE session_id=? AND status='queued'",{now(),p_->session});
@@ -350,8 +355,8 @@ void Runtime::chat(std::string input,Emit emit) {
     });
     mode(CognitiveMode::Wait,emit);continuity();
     if(emit)emit("turn.cancelled",{{"reason","user_stop"},{"message","Stopped. Completed work is preserved; queued steering was cancelled."}});
-  }
 }
+
 void Runtime::chat_turn(std::string input,Emit emit) {
   if (closed_) throw std::runtime_error("Session is closed");
   if (trim(input).empty() || input.size() > 256*1024) throw std::runtime_error("Message must contain 1–262144 bytes");
@@ -610,7 +615,7 @@ Json Runtime::command(std::string name,const Json& a,Emit emit) {
   if (name == "soul") { if (a.contains("content")) p_->edit_soul(a["content"]); return {{"content",p_->soul}}; }
   if (name == "self") return memory_.self();
   if (name == "project") {
-    if(a.contains("path")){p_->db->event("user.message",{{"content","/project "+a["path"].get<std::string>()}},p_->session,p_->task);return tools_.execute("project_open",{{"path",a["path"]},{"create",true}},emit);}
+    if(a.contains("path")){p_->db->event("user.message",{{"content","/project "+a["path"].get<std::string>()}},p_->session,p_->task);return command("tool",{{"name","project_open"},{"arguments",{{"path",a["path"]},{"create",true}}}},emit);}
     return memory_.project_context();
   }
   if (name == "state") return memory_.wake();
@@ -619,7 +624,11 @@ Json Runtime::command(std::string name,const Json& a,Emit emit) {
     return {{"id",memory_.fact(a.at("subject"),a.at("predicate"),a.at("object"),source,name == "correct",a.value("scope","global") == "project" ? p_->project : 0)}};
   }
   if (name == "new") { close("new_session"); closed_ = false; p_->task = 0; usage_=Json::object(); start(); return {{"session_id",p_->session},{"status",command("status")}}; }
-  if (name == "tool") return tools_.execute(a.at("name"),a.at("arguments"),emit);
+  if (name == "tool") {
+    active_=true;cancelled_=false;
+    struct Reset {bool& active;bool& cancelled;~Reset(){active=false;cancelled=false;}} reset{active_,cancelled_};
+    try {return tools_.execute(a.at("name"),a.at("arguments"),emit);}catch(const TurnCancelled&){cancel_turn(emit);return {{"cancelled",true}};}
+  }
   throw std::runtime_error("Unknown local command");
 }
 void Runtime::close(std::string reason,Emit emit) {

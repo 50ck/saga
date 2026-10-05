@@ -2,10 +2,10 @@
 #include <saga/common.hpp>
 namespace saga {
 enum class ChatAction { Continue, Selector, ModelSetup, Exit, NewSession };
-enum class ChatColor : short { Default, Approval, Saga, Activity, Prompt, Command, String, Option, Variable, Operator, Comment, InlineCode, CodeBlock, Link, Heading, CodeFocus };
+enum class ChatColor : short { Default, Approval, Saga, Activity, Prompt, Command, String, Option, Variable, Operator, Comment, InlineCode, CodeBlock, Link, Heading, CodeFocus, Addition, Deletion };
 enum ChatStyle : unsigned { Bold=1, Italic=2, Underline=4, Strike=8 };
 struct ChatSpan { size_t start,length; ChatColor color; unsigned style=0; };
-struct ChatLine { std::wstring text; std::vector<ChatSpan> spans; };
+struct ChatLine { std::wstring text; std::vector<ChatSpan> spans; std::string target{}; };
 std::vector<ChatLine> markdown_lines(std::string_view source,int width,bool streaming=false);
 std::vector<ChatSpan> shell_highlight(std::wstring_view command);
 std::vector<ChatSpan> json_highlight(std::wstring_view source);
@@ -25,6 +25,7 @@ struct ChatEntry {
   std::vector<ChatSpan> spans{};
   std::string message_id{};
   bool streaming=false;
+  bool diff=false,expanded=false;
 };
 struct ChatView {
   std::string name,model,task,partial,approval_id,approval_request_id;
@@ -36,12 +37,19 @@ struct ChatView {
   size_t compactions = 0;
   std::string phase = "respond",operation;
   Json agent_status = Json::object();
+  Json approval = Json::object();
+  bool approval_expanded=false;
+  size_t approval_scroll=0;
+  unsigned approval_focus=0;
+  Id activity_started=0;
   std::vector<ChatEntry> entries;
   struct MarkdownCache { std::string text; int width=0; bool streaming=false; std::vector<ChatLine> lines; };
   mutable std::vector<MarkdownCache> markdown_cache;
   void event(const std::string& type,const Json& payload);
   std::vector<std::wstring> lines(int width) const;
   std::vector<ChatLine> styled_lines(int width) const;
+  std::vector<ChatLine> approval_lines(int width,int height) const;
+  void activate(const std::string& target);
   std::wstring status(int width) const;
   std::wstring activity(bool busy) const;
   std::string report() const;

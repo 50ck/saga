@@ -85,6 +85,13 @@ int main() {
         bool finished=false;
         for (int n=0;n<20;++n) { auto frame=client.receive(1000); CHECK(frame); CHECK((*frame)["request_id"]==running_id); if ((*frame)["type"]=="result") {CHECK((*frame)["payload"]["stdout"]=="running");finished=true;break;} }
         CHECK(finished);
+        // Stop resolves a pending approval, kills no unstarted action, and retains the session.
+        auto blocked_id=uuid();client.send({{"type","command"},{"request_id",blocked_id},{"payload",{{"name","tool"},{"arguments",{{"name","shell_exec"},{"arguments",{{"command","touch must-not-run"},{"execution","host"}}}}}}}});
+        bool awaiting=false;for(int n=0;n<20;++n){auto frame=client.receive(1000);CHECK(frame);if((*frame)["type"]=="approval.requested"){awaiting=true;break;}}CHECK(awaiting);
+        CHECK(request(client,"command",{{"name","steer"},{"arguments",{{"content","Do not run further commands"}}}})["queued"]==true);
+        CHECK(request(client,"command",{{"name","stop"}})["stopping"]==true);
+        bool cancelled=false;for(int n=0;n<20;++n){auto frame=client.receive(1000);CHECK(frame);if((*frame)["type"]=="result" && (*frame)["request_id"]==blocked_id){CHECK((*frame)["payload"]["cancelled"]==true);cancelled=true;break;}}CHECK(cancelled && !fs::exists(project/"must-not-run"));
+        CHECK(request(client,"command",{{"name","status"}})["session_id"]==session);
         auto count=approval_requests; CHECK(shell("printf next","host").contains("error")); CHECK(approval_requests==count+1);
       }
       CHECK(request(client,"command",{{"name","permissions"},{"arguments",{{"mode","always_approve"}}}})["mode"] == "always_approve");

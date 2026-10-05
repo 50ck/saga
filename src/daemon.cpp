@@ -30,7 +30,7 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
       auto args=payload.value("arguments",Json::object());
       if (!runtime || message.value("type","") != "command" || !live_command_allowed(payload.value("name",""),args))
         throw std::runtime_error("This command requires the agent to finish its current turn. Use /help, /status, /permissions or an inspection command while it works.");
-      auto result=runtime->command(payload.at("name"),args);
+      auto result=runtime->command(payload.at("name"),args,[&](const std::string& type,const Json& data){channel.send({{"type",type},{"request_id",control_id},{"payload",data}});});
       channel.send({{"type","result"},{"request_id",control_id},{"payload",result}});
     } catch (const std::exception& e) {
       channel.send({{"type","error"},{"request_id",control_id},{"payload",{{"message",e.what()}}}});
@@ -125,8 +125,9 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
               }
               live_command(*reply);
               try { runtime->check_cancelled(); }
-              catch(const TurnCancelled&) { emit("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","user_stop"}});throw; }
+              catch(const TurnCancelled&) { runtime->persona().db->event("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","user_stop"}},runtime->persona().session,runtime->persona().task);emit("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","user_stop"}});throw; }
             }
+            runtime->persona().db->event("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","expired"}},runtime->persona().session,runtime->persona().task);
             emit("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","expired"}});
             return false;
           };

@@ -23,6 +23,27 @@ int main(int argc,char** argv) {
         [](const Json&){CHECK(false);});
       CHECK(action==ChatAction::Exit);std::cout<<"MOUSE_EXIT_OK\n";return 0;
     }
+    if(argc==2 && std::string(argv[1])=="--diff-demo") {
+      std::atomic_int decision=0;std::atomic_bool stopped=false;int turns=0;
+      auto action=chat_ui(view,[&](const std::string& input,Emit emit){
+        if(input=="cancel") {
+          emit("turn.started",{{"session_id",1}});
+          emit("tool.output",{{"run_id",9},{"stream","stdout"},{"content","LIVE_OUTPUT_STARTED"}});
+          for(int i=0;i<100 && !stopped;++i)std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          CHECK(stopped);
+          emit("turn.cancelled",{{"message","STOPPED_COPY_WORK"}});emit("turn.finished",Json::object());return;
+        }
+        ++turns;decision=0;std::string diff="--- a/example.c\n+++ b/example.c\n@@ -1,16 +1,16 @@\n";
+        for(int i=0;i<16;++i)diff+="-old "+std::to_string(i)+"\n+new "+std::to_string(i)+"\n";
+        emit("approval.requested",{{"approval_id","diff-approval"},{"_request_id","diff-request"},{"tool","file_edit"},{"arguments",{{"kind","edit"},{"proposal_id","diff-"+std::to_string(turns)},{"path","example.c"},{"diff",diff},{"added",16},{"removed",16}}}});
+        for(int i=0;i<100 && !decision;++i)std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(decision);
+        emit("approval.resolved",{{"approved",decision==1}});
+        if(decision==1)emit("edit.applied",{{"proposal_id","diff-"+std::to_string(turns)},{"path","example.c"},{"diff",diff},{"added",16},{"removed",16}});
+        emit("notification",{{"description",decision==1?"DIFF_ACCEPTED":"DIFF_REJECTED"}});
+      },[]{std::this_thread::sleep_for(std::chrono::milliseconds(10));return std::optional<Json>{};},[&](const Json& frame){decision=frame["payload"]["approved"].get<bool>()?1:2;},[&](const std::string& command,Emit emit){CHECK(command=="/stop");stopped=true;emit("result","Stopping");});
+      CHECK(action==ChatAction::Exit && turns==2 && stopped);std::cout<<"DIFF_EXIT_OK\n";return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--demo") {
       view.entries.push_back({view.name,"Hello! **Bold** *italic* ~~strike~~ `inline code`. Resize the terminal while I respond.",false,0,0,{},true});
       std::atomic_bool accepted=false; int live_changes=0;
@@ -132,6 +153,20 @@ int main(int argc,char** argv) {
     bool yellow=false,gray=false,blue=false;
     for (auto& line : view.styled_lines(80)) for (auto& span : line.spans) { yellow=yellow || span.color == ChatColor::Approval; gray=gray || span.color == ChatColor::Saga; blue=blue || span.color == ChatColor::Prompt; }
     CHECK(yellow && gray && blue);
+    ChatView diffs;std::string diff="--- a/x.c\n+++ b/x.c\n@@ -1 +1 @@\n-old\n";for(int i=0;i<30;++i)diff+="+new line "+std::to_string(i)+"\n";
+    Json edit={{"kind","edit"},{"proposal_id","proposed"},{"path","x.c"},{"diff",diff},{"added",30},{"removed",1}};
+    diffs.event("approval.requested",{{"approval_id","edit-nonce"},{"_request_id","edit-request"},{"tool","file_edit"},{"arguments",edit}});
+    CHECK(diffs.entries.empty());auto popup=diffs.approval_lines(80,40);CHECK(popup.size()==17);
+    CHECK(std::none_of(popup.begin(),popup.end(),[](auto& line){return line.text.find(L"new line 29")!=std::wstring::npos;}));
+    CHECK(std::count_if(popup.begin(),popup.end(),[](auto& line){return !line.target.empty();})==3);
+    diffs.activate("approval:toggle");CHECK(diffs.approval_expanded);diffs.approval_scroll=100;
+    popup=diffs.approval_lines(80,40);CHECK(std::any_of(popup.begin(),popup.end(),[](auto& line){return line.text.find(L"new line 29")!=std::wstring::npos;}));
+    for(int width:{12,20,40,80})for(int height:{15,20,35})for(auto& line:diffs.approval_lines(width,height)){CHECK(chat_columns(line.text)<=width);for(auto span:line.spans)CHECK(span.start+span.length<=line.text.size());}
+    diffs.event("approval.resolved",{{"approved",true}});CHECK(diffs.approval_lines(80,40).empty());
+    diffs.event("edit.applied",edit);auto collapsed=diffs.lines(80);diffs.activate("diff:proposed");CHECK(diffs.entries.back().expanded);auto expanded=diffs.lines(80);CHECK(expanded.size()>collapsed.size());
+    bool additions=false,deletions=false;for(auto& line:diffs.styled_lines(80))for(auto span:line.spans){additions|=span.color==ChatColor::Addition;deletions|=span.color==ChatColor::Deletion;}CHECK(additions && deletions);
+    ChatView public_progress;public_progress.event("progress.updated",{{"message_id","stable"},{"text","**Working**"},{"complete",false}});public_progress.event("progress.updated",{{"message_id","stable"},{"text","**Working** now"},{"complete",true}});CHECK(public_progress.entries.size()==1 && !public_progress.entries[0].streaming);
+    public_progress.event("tool.output",{{"run_id",4},{"stream","stdout"},{"content","hello\x1b[31m"}});public_progress.event("tool.output",{{"run_id",4},{"stream","stdout"},{"content"," world"}});CHECK(public_progress.entries.size()==2 && public_progress.entries[1].text.find('\x1b')==std::string::npos);
     ChatView help;help.name="test";help.event("help",{{"content",command_help()}});CHECK(help.entries[0].label=="Saga");
     bool accent=false,description=false,heading=false;std::wstring help_text;
     for(auto& line:help.styled_lines(80)){help_text+=line.text+L"\n";for(auto span:line.spans){accent|=span.color==ChatColor::Link && (span.style&Bold);description|=span.color==ChatColor::Activity;heading|=span.color==ChatColor::Heading && (span.style&Bold);}}

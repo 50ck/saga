@@ -59,5 +59,6 @@ int wattr_set(WINDOW*,unsigned int,short,void*);
 #define KEY_END 0x168
 #define KEY_MOUSE 0x199
 #define KEY_RESIZE 0x19a
+#define BUTTON1_CLICKED (1U << 2)
 #define BUTTON4_PRESSED (1U << 16)
 #define BUTTON5_PRESSED (1U << 21)

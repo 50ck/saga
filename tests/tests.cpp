@@ -24,6 +24,10 @@ void streaming() {
   for (char c : source) parser.feed(std::string_view(&c,1));
   parser.finish();
   CHECK(frames.size() == 2); CHECK(frames[0] == "one\ntwo"); CHECK(frames[1] == "[DONE]");
+  std::string public_json=Json{{"text","**Public** 東京 \"quoted\" 😀\nNext"}}.dump();
+  for(size_t end=1;end<=public_json.size();++end){auto text=json_string_prefix(std::string_view(public_json).substr(0,end),"text");CHECK(Json::accept(Json(text).dump()));CHECK(std::string("**Public** 東京 \"quoted\" 😀\nNext").starts_with(text));}
+  CHECK(json_string_prefix("{\"text\":\"\\uD83D\\uDE00\"}","text")=="😀");
+  CHECK(json_string_prefix("{\"nested\":{\"text\":\"private\"},\"text\":\"public\"}","text")=="public");
   Completion result;
   result.accept(Json::parse(R"({"choices":[{"index":0,"delta":{"content":"hello","tool_calls":[{"index":0,"id":"call_1","function":{"name":"remember","arguments":"{\"que"}}]},"finish_reason":null}]})"));
   result.accept(Json::parse(R"({"choices":[{"index":0,"delta":{"content":" world","tool_calls":[{"index":0,"function":{"arguments":"ry\":\"widget\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50}})"));

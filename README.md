@@ -74,7 +74,7 @@ remain available while the agent waits for the model, streams a reply, runs a to
 or waits for approval. This includes `/memory`, `/know`, `/praxis`, `/artifacts`,
 `/journal`, `/goals`, `/tasks`, `/self`, `/project`, `/state`, and `/name` or `/soul`
 without editing arguments. Permission changes are saved immediately and apply to
-subsequent host actions. An already pending approval still requires `y` or `n`;
+subsequent host actions and structured edits. An already pending approval still requires `y` or `n`;
 changing the policy does not approve it or change a running command's isolation.
 Session changes, identity edits, knowledge edits and `/compact` wait until the
 current turn finishes. Local command errors leave inference and approvals intact.
@@ -140,24 +140,70 @@ replacement with provenance. Automatic SOUL writes are forbidden; learned
 tendencies belong to the self-model. Seed creation and deliberate edits are
 preserved in the persona's event history.
 
-Project/artifact writes and sandboxed shell commands run automatically. Host shell
-permissions are persisted separately for each persona:
+Sandboxed shell commands run automatically. Structured file edits and workspace
+selection follow the same approval choice as host shell operations. Permissions
+are persisted separately for each persona:
 
-| Option | Alias | Host behavior |
+| Option | Alias | Host operations and structured edits |
 | --- | --- | --- |
-| 1 (default) | `/permissions ask` | Ask before each guarded host operation |
-| 2 | `/permissions always` | Automatically approve guarded host operations |
-| 3 | `/permissions host-ask` | Ask before each unrestricted host operation |
-| 4 | `/permissions host-always` | Unrestricted host without approval (**DANGEROUS**) |
+| 1 (default) | `/permissions ask` | Ask before guarded host operations, edits and workspace changes |
+| 2 | `/permissions always` | Automatically approve guarded host operations, edits and workspace changes |
+| 3 | `/permissions host-ask` | Ask before unrestricted host operations, edits and workspace changes |
+| 4 | `/permissions host-always` | Unrestricted host, edits and workspace changes without approval (**DANGEROUS**) |
 
 Use `/permissions 3` or select **3** in the menu to approve sandbox actions
 automatically and ask before real host commands. Option **4** runs those host
 commands automatically. Existing `ask`/`always` settings keep their guarded behavior;
-they are never silently upgraded to unrestricted access. Persistent macros
+they are never silently upgraded to unrestricted access. Existing settings now
+also determine whether structured file edits and workspace changes need approval. Persistent macros
 containing host actions follow the same policy; sandbox macros are automatic.
 Non-interactive batch clients decline pending
 approval requests. `saga --batch UUID` is an
 explicit selection for scripts; `--json` prints protocol events.
+
+
+### Live coding workflow
+
+The persona can publish concise public commentary with `report_progress` before
+an action group or after a discovery. Saga renders these messages as they stream;
+private reasoning never becomes commentary. Preparing a prompt, generating,
+preparing an operation, running, awaiting approval and verifying are distinct
+activity states with an elapsed clock. Empty or reasoning-only replies get one
+recovery attempt, followed by a visible error if there is still no response/action.
+
+`file_write` proposes a complete creation/replacement diff. `file_edit` takes
+`path`, `expected_hash`, `description` and exact `old_text`/`new_text` replacements;
+each old fragment must occur once and replacements must not overlap. Text files
+up to 512 KiB are supported. In modes 1/3, a yellow approval popup shows the complete
+proposed diff before any write, initially collapsed to ten rendered rows. Click
+**See more/See less**, or use Tab and Enter. Use the mouse wheel or Page Up/Down to
+scroll an expanded proposal. Approve/Reject also accept the existing `y`/`n` input.
+Saga rechecks the original hash and path after approval. A changed file is left
+untouched and requires a fresh proposal. Artifact versions are recorded only after
+the write. In modes 2/4, edits are automatic and their transcript diffs also start
+collapsed to ten rows, with clickable expansion. Additions are green; deletions
+are red. Resizing recomputes wrapping and click targets while keeping the footer.
+
+Shell commands stream stdout/stderr in roughly 100 ms batches, with 256 KiB capture
+limits per stream and a visible truncation notice. Shell approval covers the
+command; it cannot predict arbitrary file changes. Saga shows observed text diffs
+after the command finishes, within a 2 MiB snapshot budget. Use structured file
+tools for source edits and reviewed diffs.
+
+Use `/project PATH` or the agent's `project_open(path, create)` tool to select an
+explicitly requested workspace. Selecting a project never exposes private Saga
+storage. An untouched task can follow the new workspace. Once work has been
+observed, Saga keeps its previous provenance and creates a new scoped task with
+unresolved checks rather than carrying proof from another project.
+
+`/steer PROMPT` queues instructions in the current session. Resolve any pending
+approval first; the current approved command finishes, then queued instructions
+are delivered in order before the next model call. Remaining unstarted calls
+from the old plan are cancelled. `/stop`, Ctrl+C or Esc cancel inference, approval,
+and the running command's process group. Completed edits stay, unfinished tasks
+become blocked, and queued steering is cancelled rather than resumed. The session
+stays open. These stop keys also work during F2 selection/copy mode. Inspection
+commands and permission changes remain available during work.
 
 ## Persistence and cognition
 

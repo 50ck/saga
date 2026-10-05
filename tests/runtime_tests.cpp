@@ -131,7 +131,7 @@ int main() {
     runtime->start(); runtime->chat("Create artifact migration",emit);
     CHECK(runtime->command("tasks")[0]["status"]=="verifying");
     CHECK(runtime->persona().db->query("SELECT * FROM events WHERE type='assistant.completion_gated'").size()==1);
-    CHECK(events.back()["type"]=="assistant.completed"); CHECK(events.back()["payload"]["content"].get<std::string>().starts_with("The task is not complete"));
+    CHECK(events[events.size()-2]["type"]=="assistant.completed" && events.back()["type"]=="turn.finished"); CHECK(events[events.size()-2]["payload"]["content"].get<std::string>().starts_with("The task is not complete"));
     bool fresh_review=false; for (auto& messages:*log) if (messages.size()==2 && messages[1].value("content","").starts_with("Independently review")) fresh_review=true; CHECK(fresh_review);
     runtime->close("user_exit"); runtime.reset();
     runtime=activate(b); runtime->start();
@@ -147,7 +147,7 @@ int main() {
     CHECK(exact_updates>=3 && last_exact==10005);CHECK(runtime->command("status")["usage"]["used_tokens"]==10005);
     CHECK(runtime->command("status")["usage"]["cached_input_tokens"]==8500);
     CHECK(!runtime->persona().db->query("SELECT id FROM events WHERE session_id=? AND type='model.cache_observed'",{same_session}).empty());
-    events=Json::array();runtime->chat("Empty once",emit);CHECK(events.back()["type"]=="assistant.completed");CHECK(!events.back()["payload"]["content"].get<std::string>().empty());
+    events=Json::array();runtime->chat("Empty once",emit);CHECK(events[events.size()-2]["type"]=="assistant.completed" && events.back()["type"]=="turn.finished");CHECK(!events[events.size()-2]["payload"]["content"].get<std::string>().empty());
     auto calls_before=log->size();rejects([&]{runtime->chat("Empty always",emit);});CHECK(log->size()==calls_before+2);
     events=Json::array();runtime->chat("Public progress",emit);
     CHECK(std::any_of(events.begin(),events.end(),[](auto& e){return e["type"]=="progress.updated" && !e["payload"].value("complete",true);}));
@@ -160,7 +160,7 @@ int main() {
       bool output_seen=false,stopped=false;
       runtime->service([&]{if(output_seen && !stopped){stopped=true;runtime->command("steer",{{"content","This queued instruction must be cancelled"}});runtime->command("stop");}});
       auto stop_emit=[&](const std::string& type,const Json& p){emit(type,p);if(type=="tool.output")output_seen=true;};
-      runtime->chat("Exercise stop",stop_emit);CHECK(stopped && events.back()["type"]=="turn.cancelled");
+      runtime->chat("Exercise stop",stop_emit);CHECK(stopped && events[events.size()-2]["type"]=="turn.cancelled" && events.back()["type"]=="turn.finished");
       CHECK(runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="cancelled");
       CHECK(!fs::exists(project/"must-not-exist"));runtime->service({});
     }

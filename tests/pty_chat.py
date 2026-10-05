@@ -154,3 +154,69 @@ finally:
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
     os.close(fd)
+
+# Complete diff proposals: mouse expansion, resize, keyboard approval/rejection,
+# automatic transcript expansion, and cancellation while F2 freezes rendering.
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ.update(TERM='xterm-256color', LANG='C.UTF-8')
+    os.execv(binary, [binary, '--diff-demo'])
+output.clear()
+def click(col, row):
+    os.write(fd, f'\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m'.encode())
+try:
+    resize(28, 90)
+    collect(.3)
+    os.write(fd, b'review\r')
+    collect(.4)
+    assert b'Approve file edit' in output and b'See more' in output
+    assert b'38;5;114m+new' in output and b'38;5;174m-old' in output
+    assert b'new 15' not in output, 'proposal did not start collapsed'
+    # 17-row popup centered in the 23-row chat area; third button is row 19.
+    before_click=len(output)
+    click(6, 19)
+    collect(.3)
+    resize(29, 90)
+    collect(.2)
+    assert b'See less' in output[before_click:], 'See more mouse target did not expand'
+    os.write(fd, b'\x1b[<65;5;3M' * 20)
+    collect(.3)
+    assert b'new 15' in output, 'expanded diff did not scroll to its end'
+    resize(34, 100)
+    collect(.3)
+    assert b'chat with' in output and b'0.0K/65.5K' in output
+    os.write(fd, b'\r')  # Focus starts on Approve; Tab/Enter also reaches other buttons.
+    collect(.4)
+    assert b'DIFF_ACCEPTED' in output
+    # The applied diff follows the user bubble and approval marker.
+    before_click=len(output)
+    click(6, 18)
+    collect(.3)
+    resize(35,100)
+    collect(.2)
+    assert b'See less' in output[before_click:], 'applied diff mouse target did not expand'
+    os.write(fd, b'reject\r')
+    collect(.3)
+    os.write(fd, b'\t\r')
+    collect(.4)
+    assert b'DIFF_REJECTED' in output, 'Tab/Enter did not activate Reject'
+    os.write(fd, b'cancel\r')
+    collect(.2)
+    assert b'LIVE_OUTPUT_STARTED' in output
+    os.write(fd, b'\x1bOQ')
+    collect(.2)
+    assert b'Select text' in output
+    os.write(fd, b'\x03')
+    collect(.4)
+    assert b'STOPPED_COPY_WORK' in output, 'Ctrl+C in copy mode did not stop active work'
+    os.write(fd, b'/exit\r')
+    collect(.3)
+    _, status=os.waitpid(pid,0)
+    pid=0
+    assert os.waitstatus_to_exitcode(status)==0 and b'DIFF_EXIT_OK' in output
+    print('PASS real PTY: complete diff popup, mouse/keyboard actions, resize, transcript expansion and stop in F2')
+finally:
+    if pid:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid,0)
+    os.close(fd)
