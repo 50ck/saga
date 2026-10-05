@@ -118,7 +118,7 @@ static bool restrict_child(const fs::path& cwd,const fs::path& scratch,bool host
   sock_fprog program{static_cast<unsigned short>(filter.size()),filter.data()};
   return prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,&program) == 0;
 }
-ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std::vector<std::string>& argv,int timeout,bool host,const std::vector<fs::path>& private_roots,const Json& environment,bool unrestricted) {
+ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std::vector<std::string>& argv,int timeout,bool host,const std::vector<fs::path>& private_roots,const Json& environment,bool unrestricted,const std::function<void()>& service) {
   if (unrestricted && !host) throw std::runtime_error("Unrestricted execution requires host mode");
   if (argv.empty()) throw std::runtime_error("A process requires a command");
   if (!unrestricted && !shell_sandbox_available()) throw std::runtime_error("Shell execution requires Linux Landlock ABI >= 3; unrestricted host execution remains available");
@@ -168,6 +168,13 @@ ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std:
   std::array<pollfd,2> fds{{{out[0],POLLIN,0},{err[0],POLLIN,0}}};
   bool exited = false; int status = 0;
   while (!exited || fds[0].fd >= 0 || fds[1].fd >= 0) {
+    try { if (service) service(); }
+    catch (...) {
+      kill(-pid,SIGKILL);
+      if (!exited) { while (waitpid(pid,&status,0) < 0 && errno == EINTR) {} }
+      for (auto& pipe : fds) if (pipe.fd >= 0) close(pipe.fd);
+      throw;
+    }
     if (std::chrono::steady_clock::now() >= deadline) { result.timed_out = true; kill(-pid,SIGKILL); }
     poll(fds.data(),fds.size(),25);
     for (size_t i = 0; i < fds.size(); ++i) {
@@ -307,6 +314,7 @@ Json Tools::environment() {
   return result;
 }
 Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
+  if (service_) service_(); // Apply queued permissions before the action gate.
   auto definitions_list = definitions();
   auto it = std::find_if(definitions_list.begin(),definitions_list.end(),[&](auto& d){ return d["function"]["name"] == name; });
   if (it == definitions_list.end()) return {{"error","Unknown tool"}};
@@ -396,7 +404,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     auto before = snapshot(!unrestricted);
     auto scratch=host ? fs::temp_directory_path()/("saga-host-"+uuid()) : p_.directory/"cache/scratch";
     struct Cleanup { fs::path path; ~Cleanup() { if (!path.empty()) { std::error_code ec; fs::remove_all(path,ec); } } } cleanup{host ? scratch : fs::path()};
-    auto r = run_process(p_.project_root,scratch,{"/bin/sh","-c",a["command"]},std::clamp(a.value("timeout_seconds",30),1,120),host,p_.private_roots,p_.host_environment,unrestricted);
+    auto r = run_process(p_.project_root,scratch,{"/bin/sh","-c",a["command"]},std::clamp(a.value("timeout_seconds",30),1,120),host,p_.private_roots,p_.host_environment,unrestricted,service_);
     auto after = snapshot(false); size_t tracked = 0;
     auto task = db->query("SELECT title FROM tasks WHERE id=?",{p_.task});
     auto description = task.empty() ? "File observed after shell action" : task[0]["title"].get<std::string>();

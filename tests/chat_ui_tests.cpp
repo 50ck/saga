@@ -25,7 +25,7 @@ int main(int argc,char** argv) {
     }
     if (argc == 2 && std::string(argv[1]) == "--demo") {
       view.entries.push_back({view.name,"Hello! **Bold** *italic* ~~strike~~ `inline code`. Resize the terminal while I respond.",false,0,0,{},true});
-      std::atomic_bool accepted=false;
+      std::atomic_bool accepted=false; int live_changes=0;
       auto action=chat_ui(view,[&](const std::string&,Emit emit){
         emit("assistant.delta",{{"content","Checking the terminal..."}});
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -42,8 +42,14 @@ int main(int argc,char** argv) {
         CHECK(frame["type"] == "approval" && frame["request_id"] == "demo-request");
         CHECK(frame["payload"]["approval_id"] == "demo-nonce" && frame["payload"]["approved"] == true);
         accepted=true;
+      },[&](const std::string& input,Emit emit){
+        if (input == "/permissions") emit("permissions.menu",{{"label","Ask for guarded host operations"}});
+        else if (input == "/permissions 3") { ++live_changes; emit("permissions.changed",{{"label","Ask for unrestricted host operations"}}); emit("result","LIVE_PERMISSION_UPDATED"); }
+        else if (input == "/status") emit("result",view.report());
+        else if (input == "/tasks") emit("result","LIVE_TASKS_INSPECTED");
+        else throw std::runtime_error("LIVE_COMMAND_REJECTED");
       });
-      CHECK(action == ChatAction::Exit && accepted); std::cout << "NCURSES_EXIT_OK\n"; return 0;
+      CHECK(action == ChatAction::Exit && accepted && live_changes==1); std::cout << "NCURSES_EXIT_OK\n"; return 0;
     }
     view.entries.push_back({"user","Unicode width: 東京 and é. A long message that wraps when the terminal shrinks.\nA second paragraph."});
     view.event("assistant.delta",{{"content","A streamed response."}});
@@ -85,6 +91,10 @@ int main(int argc,char** argv) {
     CHECK(chat_wrap(L"東京",1) == std::vector<std::wstring>({L"?",L"?"}));
     view.event("approval.requested",{{"approval_id","nonce"},{"_request_id","request"},{"tool","shell_exec"},{"arguments",{{"command","echo ok"}}}});
     CHECK(view.approval_id == "nonce" && view.approval_request_id == "request");
+    view.partial="Still writing"; view.generating=true;
+    view.event("command.error",{{"message","Wait for the turn to finish"}});
+    CHECK(view.partial=="Still writing" && view.generating && view.approval_id=="nonce");
+    view.partial.clear();
     view.event("session.reset",Json::object()); CHECK(view.entries.empty() && view.tokens == 0);
     auto detailed=command_help("/permissions"); CHECK(detailed.find("Examples:") != std::string::npos && detailed.find("/permissions always") != std::string::npos);
     CHECK(detailed.find("/permissions 3") != std::string::npos && detailed.find("/permissions 4") != std::string::npos && detailed.find("DANGEROUS") != std::string::npos);

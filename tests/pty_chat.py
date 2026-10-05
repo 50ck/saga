@@ -57,6 +57,18 @@ try:
     os.write(fd, b'/status\r')
     collect(.2)
     assert b'not available' in output, 'local status did not render while approval was pending'
+    os.write(fd, b'/permissions\r')
+    collect(.2)
+    assert b'Choose 1, 2, 3 or 4' in output, 'permission menu is blocked while busy'
+    os.write(fd, b'3\r')
+    collect(.2)
+    assert b'LIVE_PERMISSION_UPDATED' in output, 'numeric permission selection is blocked while busy'
+    os.write(fd, b'/tasks\r')
+    collect(.2)
+    assert b'LIVE_TASKS_INSPECTED' in output, 'inspection command is blocked while busy'
+    os.write(fd, b'/compact\r')
+    collect(.2)
+    assert b'LIVE_COMMAND_REJECTED' in output, 'unsafe live command did not report a local error'
     before_resize=len(output)
     resize(7, 12)
     collect(.2)

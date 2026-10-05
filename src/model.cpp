@@ -134,6 +134,15 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
   auto set = [&](CURLoption option,auto value){ if (curl_easy_setopt(curl.get(),option,value) != CURLE_OK) throw std::runtime_error("Cannot configure HTTP request"); };
   set(CURLOPT_URL,url.c_str()); set(CURLOPT_HTTPHEADER,headers.get());
   set(CURLOPT_WRITEFUNCTION,write_cb); set(CURLOPT_WRITEDATA,&state);
+  if (cb) {
+    // Service local controls even when inference has not sent any SSE bytes yet.
+    auto progress = +[](void* data,curl_off_t,curl_off_t,curl_off_t,curl_off_t)->int {
+      auto& state_ref=*static_cast<State*>(data);
+      try { state_ref.callback(Json::object()); return 0; }
+      catch (...) { state_ref.error=std::current_exception(); return 1; }
+    };
+    set(CURLOPT_NOPROGRESS,0L); set(CURLOPT_XFERINFOFUNCTION,progress); set(CURLOPT_XFERINFODATA,&state);
+  }
   set(CURLOPT_NOSIGNAL,1L); set(CURLOPT_CONNECTTIMEOUT,10L);
   // Non-streaming inference sends no response bytes until generation finishes.
   // A low-speed limit mistakes legitimate model computation for a dead connection.
@@ -258,7 +267,7 @@ void OpenAICompatibleBackend::chat(const ChatRequest& r,StreamCallback cb) {
     body["tool_choice"] = "required";
   }
   bool emitted = false;
-  auto wrapped = [&](const Json& chunk){ emitted = true; cb(chunk); };
+  auto wrapped = [&](const Json& chunk){ if (!chunk.empty()) emitted = true; cb(chunk); };
   try { request("POST",api_ + "/chat/completions",body,wrapped); }
   catch (const std::exception& e) {
     if (!emitted && std::string(e.what()) == "Model HTTP status 400") {

@@ -22,6 +22,27 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
   std::unique_ptr<Runtime> runtime;
   std::string id;
   Emit emit = [&](const std::string& event,const Json& data){ channel.send({{"type",event},{"request_id",id},{"payload",data}}); };
+  auto live_command = [&](const Json& message) {
+    auto control_id=message.value("request_id","");
+    try {
+      auto payload=message.value("payload",Json::object());
+      if (control_id.empty() || control_id.size()>128 || !payload.is_object()) throw std::runtime_error("Invalid control request");
+      auto args=payload.value("arguments",Json::object());
+      if (!runtime || message.value("type","") != "command" || !live_command_allowed(payload.value("name",""),args))
+        throw std::runtime_error("This command requires the agent to finish its current turn. Use /help, /status, /permissions or an inspection command while it works.");
+      auto result=runtime->command(payload.at("name"),args);
+      channel.send({{"type","result"},{"request_id",control_id},{"payload",result}});
+    } catch (const std::exception& e) {
+      channel.send({{"type","error"},{"request_id",control_id},{"payload",{{"message",e.what()}}}});
+    }
+  };
+  auto service = [&] {
+    // Keep cognition on one thread; handle only controls that cannot replace it.
+    for (int n=0; n<16; ++n) {
+      auto message=channel.receive(0); if (!message) break;
+      live_command(*message);
+    }
+  };
   try {
     if (authenticate) {
       auto message=channel.receive(5000);
@@ -102,12 +123,13 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
                 emit("approval.resolved",{{"approval_id",approval_id},{"approved",granted}});
                 return granted;
               }
-              throw std::runtime_error("Expected a matching action approval");
+              live_command(*reply);
             }
             emit("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","expired"}});
             return false;
           };
           runtime = std::make_unique<Runtime>(std::move(context),c,std::make_unique<OpenAICompatibleBackend>(c),approve);
+          runtime->service(service);
           runtime->start(emit); emit("result",{{"active",true}});
         }
         else if (type == "chat") { if (!runtime) throw std::runtime_error("Select a persona first"); runtime->chat(payload.at("content"),emit); emit("result",{{"ok",true}}); }

@@ -11,6 +11,12 @@
 #include <unistd.h>
 
 namespace saga {
+bool live_command_allowed(std::string_view name,const Json& arguments) {
+  if (!arguments.is_object()) return false;
+  if (name == "name" || name == "soul") return arguments.empty();
+  return name == "status" || name == "permissions" || name == "memory" || name == "journal" ||
+    name == "goals" || name == "tasks" || name == "self" || name == "project" || name == "state";
+}
 Id now() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 std::string uuid() {
   unsigned char bytes[16];

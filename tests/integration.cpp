@@ -12,6 +12,9 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#define main saga_client_binary_main
+#include "../src/client.cpp"
+#undef main
 using namespace saga;
 namespace {
 class MockModel {
@@ -83,6 +86,11 @@ class MockModel {
     if (first.starts_with("GET ") && first.find("/props ") != std::string::npos) { if (props) response(Json{{"default_generation_settings",{{"n_ctx",context.load()}}}}.dump()); else response("{}","application/json",404); return; }
     if (first.find("/chat/completions ") == std::string::npos) { response("{}","application/json",404); return; }
     if (reject_usage && request.contains("stream_options")) { response("{}","application/json",400); return; }
+    if (pause.exchange(false)) {
+      waiting=true; auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(8);
+      while (!resume && std::chrono::steady_clock::now()<deadline) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      waiting=false;
+    }
     auto message=reply(request); std::string reason=message.contains("tool_calls") ? "tool_calls" : "stop";
     if (!request.value("stream",false)) { response(Json{{"choices",Json::array({{{"index",0},{"message",message},{"finish_reason",reason}}})}}.dump()); return; }
     std::string body;
@@ -99,6 +107,7 @@ class MockModel {
 public:
   std::atomic<std::uint64_t> context=65536;
   std::atomic_bool metadata=true,props=true,tool_support=true,reject_usage=false,truncated=false;
+  std::atomic_bool pause=false,waiting=false,resume=false;
   std::string endpoint;
   MockModel() {
     listener_=socket(AF_INET,SOCK_STREAM | SOCK_CLOEXEC,0); CHECK(listener_>=0);
@@ -199,7 +208,29 @@ void end_to_end(MockModel& mock,const std::string& daemon,const std::string& cli
   auto other=(env.paths.persona(a["uuid"].get<std::string>())/"SOUL.md").string();
   CHECK(peer.command("tool",{{"name","file_read"},{"arguments",{{"path",other}}}}).contains("error")); peer.request("chat",{{"content","hello"}});
   for (auto& request:mock.requests()) if (request["body"].contains("messages") && request["body"]["messages"].dump().find("Identity name: Identity B")!=std::string::npos) { auto context=request["body"]["messages"].dump(); CHECK(context.find("My core identity A.")==std::string::npos); CHECK(context.find("Identity A —")==std::string::npos); }
-  peer.request("session.close"); env.stop(); env.start(daemon); Peer again(env.paths.socket());
+  peer.request("session.close");
+  {
+    // Use the production client while HTTP inference sends no bytes at all.
+    Client live{Channel::connect(env.paths.socket()),false};
+    live.request("persona.activate",{{"uuid",b["uuid"]},{"cwd",env.project.string()}});
+    mock.resume=false; mock.pause=true;
+    std::atomic_bool done=false; std::atomic_int replies=0; std::exception_ptr error;
+    std::jthread inference([&]{try {live.request("chat",{{"content","hello live controls"}},[](auto&,auto&){});} catch (...) {error=std::current_exception();} done=true;});
+    struct Resume { MockModel& mock; ~Resume(){mock.resume=true;} } resume{mock};
+    auto wait=[&](const std::function<bool()>& ready){auto until=std::chrono::steady_clock::now()+std::chrono::seconds(3);while(!ready() && std::chrono::steady_clock::now()<until)std::this_thread::sleep_for(std::chrono::milliseconds(10));CHECK(ready());};
+    wait([&]{return mock.waiting.load();});
+    live.live_request({{"name","permissions"},{"arguments",{{"mode","host_ask"}}}},[&](const std::string& type,const Json& p){CHECK(type=="result" && p["mode"]=="host_ask");++replies;});
+    live.live_request({{"name","status"}},[&](const std::string& type,const Json& p){CHECK(type=="result" && p["permissions"]["mode"]=="host_ask");CHECK(p["usage"]["output_tokens"]==0);++replies;});
+    live.live_request({{"name","tasks"}},[&](const std::string& type,const Json& p){CHECK(type=="result" && p.is_array());++replies;});
+    wait([&]{return replies==3;}); CHECK(!done && mock.waiting);
+    rejects([&]{local_command(live,"/new",env.project,[](auto&,auto&){},true);});
+    local_command(live,"/permissions 4",env.project,[&](const std::string& type,const Json& p){if(type=="permissions.changed"){CHECK(p["mode"]=="host_always");++replies;}},true);
+    wait([&]{return replies==4;}); CHECK(!done);
+    mock.resume=true; inference.join(); if(error)std::rethrow_exception(error);
+    CHECK(live.request("command",{{"name","permissions"}})["mode"]=="host_always");
+    live.request("session.close");
+  }
+  env.stop(); env.start(daemon); Peer again(env.paths.socket());
   again.request("persona.activate",{{"uuid",a["uuid"]},{"cwd",env.project.string()}}); again.request("chat",{{"content","Do you remember the artifact we made?"}});
   CHECK(!again.command("memory",{{"query","artifact"},{"deep",true}})["results"].empty()); CHECK(again.command("memory",{{"kind","know"},{"query","machine"}})["results"][0]["object"]=="FreeBSD");
   again.command("new"); CHECK(again.command("soul")["content"]=="My core identity A."); again.request("session.close");

@@ -64,6 +64,28 @@ int main() {
         CHECK(shell("printf sandbox","sandbox")["stdout"] == "sandbox"); CHECK(approval_requests == 0);
         CHECK(shell("printf host","host").contains("error")); CHECK(approval_requests == 1);
         CHECK(shell("printf host","host",true)["stdout"] == "host"); CHECK(approval_requests == 2);
+        auto pending_id=uuid();
+        client.send({{"type","command"},{"request_id",pending_id},{"payload",{{"name","tool"},{"arguments",{{"name","shell_exec"},{"arguments",{{"command","printf must-not-run"},{"execution","host"}}}}}}}});
+        Json approval;
+        for (int n=0;n<20;++n) { auto frame=client.receive(1000); CHECK(frame); CHECK((*frame)["request_id"]==pending_id); if ((*frame)["type"]=="approval.requested") {approval=(*frame)["payload"];break;} }
+        CHECK(!approval.empty());
+        auto session=request(client,"command",{{"name","status"}})["session_id"];
+        CHECK(request(client,"command",{{"name","new"}}).contains("error"));
+        CHECK(request(client,"command",{{"name","permissions"},{"arguments",{{"mode","host_always"}}}})["mode"]=="host_always");
+        CHECK(request(client,"command",{{"name","status"}})["session_id"]==session);
+        client.send({{"type","approval"},{"request_id",pending_id},{"payload",{{"approval_id",approval["approval_id"]},{"approved",false}}}});
+        bool declined=false;
+        for (int n=0;n<20;++n) { auto frame=client.receive(1000); CHECK(frame); CHECK((*frame)["request_id"]==pending_id); if ((*frame)["type"]=="result") { CHECK((*frame)["payload"].contains("error"));declined=true;break;} }
+        CHECK(declined); // Changing permissions never implicitly approves a pending action.
+        auto running_id=uuid();
+        client.send({{"type","command"},{"request_id",running_id},{"payload",{{"name","tool"},{"arguments",{{"name","shell_exec"},{"arguments",{{"command","sleep 1; printf running"},{"execution","host"}}}}}}}});
+        auto started=client.receive(1000); CHECK(started && (*started)["type"]=="tool.started" && (*started)["request_id"]==running_id);
+        auto status=request(client,"command",{{"name","status"}}); CHECK(status["permissions"]["mode"]=="host_always");
+        CHECK(request(client,"command",{{"name","permissions"},{"arguments",{{"mode","host_ask"}}}})["mode"]=="host_ask");
+        bool finished=false;
+        for (int n=0;n<20;++n) { auto frame=client.receive(1000); CHECK(frame); CHECK((*frame)["request_id"]==running_id); if ((*frame)["type"]=="result") {CHECK((*frame)["payload"]["stdout"]=="running");finished=true;break;} }
+        CHECK(finished);
+        auto count=approval_requests; CHECK(shell("printf next","host").contains("error")); CHECK(approval_requests==count+1);
       }
       CHECK(request(client,"command",{{"name","permissions"},{"arguments",{{"mode","always_approve"}}}})["mode"] == "always_approve");
       CHECK(request(client,"personas.list").contains("error"));

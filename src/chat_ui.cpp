@@ -50,7 +50,7 @@ std::string command_help(std::string_view query) {
     out << "**/" << help.name << (std::string_view(help.args).empty() ? "" : " ") << help.args << "** — " << help.description << '\n';
   }
   if (!command.empty()) return "Unknown command: /"+command+". Use /help to see available commands.";
-  out << "\nUse **/help command** for details and examples. Mouse wheel or **Page Up/Down** scroll; **F2** toggles selection/copy mode; arrows edit; **Ctrl-U** clears input."; return out.str();
+  out << "\nUse **/help command** for details and examples. **/help**, **/status**, **/permissions** and inspection commands work while the agent is busy. Permission changes apply to subsequent host actions; pending approvals still require **y/n**. Session changes, edits and **/compact** require the current turn to finish.\n\nMouse wheel or **Page Up/Down** scroll; **F2** toggles selection/copy mode; arrows edit; **Ctrl-U** clears input."; return out.str();
 }
 std::string format_agent_status(const Json& data) {
   auto usage=data.value("usage",Json::object()); auto used=usage.value("used_tokens",usage.value("input_tokens",0ULL)+usage.value("output_tokens",0ULL));
@@ -157,6 +157,7 @@ void ChatView::event(const std::string& type,const Json& p) {
     entries.push_back({"Saga","Execution permissions (this persona)\nCurrent: "+p.value("label","")+"\n\nGuarded host:\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations.\n\nUnrestricted host:\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS).\n\nUnrestricted host runs as your OS user without Saga isolation, including access to private Saga storage. System/container restrictions still apply.\nChoose 1, 2, 3 or 4 and press Enter. Sandbox actions stay automatic."});
   } else if (type == "permissions.changed") { agent_status["permissions"]=p; permission_menu=false;
   } else if (type == "notification") entries.push_back({"Saga",p.value("description","")});
+  else if (type == "command.error") entries.push_back({"Saga",p.value("message","Command failed")});
   else if (type == "error") { approval_id.clear(); phase="respond";generating=false; if (!partial.empty()) entries.push_back({name,std::exchange(partial,""),false,0,0,{},true}); entries.push_back({"Saga",p.value("message","Runtime error")}); }
   else if (type == "result") {
     if (p.is_object() && p.contains("name")) name=p.at("name");
@@ -368,7 +369,8 @@ void draw(int row,const ChatLine& line,int width) {
 void draw(int row,std::wstring_view text,int width) { draw(row,ChatLine{std::wstring(text),{}},width); }
 }
 ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emit)>& submit,
-                  const std::function<std::optional<Json>()>& receive,const std::function<void(const Json&)>& approve) {
+                  const std::function<std::optional<Json>()>& receive,const std::function<void(const Json&)>& approve,
+                  const std::function<void(const std::string&,Emit)>& live_submit) {
   Terminal terminal;
   std::mutex mutex; std::vector<std::pair<std::string,Json>> pending;
   std::atomic_bool busy=false;
@@ -448,6 +450,13 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
     if (key != 10 && key != 13) { if (key >= 32 && input.size() < 65536) input.insert(cursor++,1,static_cast<wchar_t>(key)); continue; }
     auto text=trim(chat_utf8(input)); if (text.empty()) continue;
     if (text == "/help" || text.starts_with("/help ")) { view.entries.push_back({"user",text}); view.event("help",{{"content",command_help(text.size()>5 ? text.substr(6) : "")}}); input.clear(); cursor=0; scroll=0; continue; }
+    if (view.permission_menu && (text == "1" || text == "2" || text == "3" || text == "4")) text="/permissions "+text;
+    if (busy && text.starts_with('/') && live_submit) {
+      view.entries.push_back({"user",text}); input.clear(); cursor=0; scroll=0;
+      try { live_submit(text,enqueue); }
+      catch (const std::exception& e) { view.event("command.error",{{"message",e.what()}}); }
+      continue;
+    }
     if (text == "/status" && busy) { view.entries.push_back({"user",text}); view.entries.push_back({"Saga",view.report()}); input.clear(); cursor=0; scroll=0; continue; }
     if (!view.approval_id.empty()) {
       if (lower(text) == "y" || lower(text) == "n") {
@@ -457,7 +466,6 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
       continue;
     }
     if (busy) continue;
-    if (view.permission_menu && (text == "1" || text == "2" || text == "3" || text == "4")) text="/permissions "+text;
     input.clear(); cursor=0; scroll=0;
     if (text == "/exit" || text == "/quit") { action=ChatAction::Exit; continue; }
     if (text == "/persona") { action=ChatAction::Selector; continue; }

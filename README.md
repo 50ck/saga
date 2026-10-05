@@ -67,7 +67,15 @@ formatting, then the completed response is parsed from its original Markdown.
 Ambiguous constructs can change appearance as more text arrives; stored messages
 are never modified. Unchanged bubbles are cached; resizing rebuilds layout.
 Strikes use a combining stroke through the text, and italic appearance depends
-on terminal support. `/help` and `/status` remain available during generation or approval.
+on terminal support. `/help`, `/status`, `/permissions` and inspection commands
+remain available while the agent waits for the model, streams a reply, runs a tool
+or waits for approval. This includes `/memory`, `/know`, `/praxis`, `/artifacts`,
+`/journal`, `/goals`, `/tasks`, `/self`, `/project`, `/state`, and `/name` or `/soul`
+without editing arguments. Permission changes are saved immediately and apply to
+subsequent host actions. An already pending approval still requires `y` or `n`;
+changing the policy does not approve it or change a running command's isolation.
+Session changes, identity edits, knowledge edits and `/compact` wait until the
+current turn finishes. Local command errors leave inference and approvals intact.
 
 The client starts `sagad` automatically. Run `./build/sagad` in the foreground
 to supervise it yourself. `cmake --install build --prefix PREFIX` installs both

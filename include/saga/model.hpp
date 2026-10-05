@@ -15,6 +15,7 @@ struct ChatRequest {
   std::uint64_t max_tokens = 8192;
   bool disable_thinking = false;
 };
+// An empty object is a local keepalive while HTTP inference has no SSE bytes yet.
 using StreamCallback = std::function<void(const Json&)>;
 class ModelBackend {
 public:

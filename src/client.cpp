@@ -3,6 +3,7 @@
 #include <saga/chat_ui.hpp>
 #include <clocale>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <termios.h>
 #include <unistd.h>
@@ -13,11 +14,31 @@ struct Client {
   std::unique_ptr<Channel> channel;
   bool json_output = false;
   std::mutex receive_mutex;
+  std::mutex control_mutex;
+  std::map<std::string,Emit> controls;
   Client(std::unique_ptr<Channel> connection,bool json) : channel(std::move(connection)),json_output(json) {}
+  void send(const Json& message) { std::lock_guard lock(control_mutex); channel->send(message); }
+  void live_request(Json payload,Emit callback) {
+    auto id=uuid(); std::lock_guard lock(control_mutex);
+    controls.emplace(id,std::move(callback));
+    try { channel->send({{"type","command"},{"request_id",id},{"payload",std::move(payload)}}); }
+    catch (...) { controls.erase(id); throw; }
+  }
+  bool dispatch_control(const Json& frame) {
+    Emit callback;
+    {
+      std::lock_guard lock(control_mutex);
+      auto it=controls.find(frame.value("request_id","")); if (it==controls.end()) return false;
+      auto type=frame.value("type","");
+      if (type != "result" && type != "error") return true;
+      callback=std::move(it->second); controls.erase(it);
+    }
+    callback(frame.at("type"),frame.value("payload",Json::object())); return true;
+  }
   Json request(std::string type,Json payload = Json::object(),Emit callback = {}) {
     std::unique_lock receive_lock(receive_mutex);
     std::string streamed;
-    auto id = uuid(); channel->send({{"type",std::move(type)},{"request_id",id},{"payload",std::move(payload)}});
+    auto id = uuid(); send({{"type",std::move(type)},{"request_id",id},{"payload",std::move(payload)}});
     auto started = std::chrono::steady_clock::now(),last_wait_notice = started;
     while (true) {
       auto frame = channel->receive(callback ? 1000 : -1);
@@ -31,6 +52,7 @@ struct Client {
       auto t = frame->value("type",""); auto p = frame->value("payload",Json::object());
       if (t == "approval.requested") p["_request_id"]=frame->value("request_id","");
       if (json_output) std::cout << frame->dump() << '\n' << std::flush;
+      if (dispatch_control(*frame)) continue;
       if (frame->value("request_id","") != id) { if (callback) callback(t,p); continue; }
       if (t == "error") throw std::runtime_error(p.value("message","Runtime error"));
       if (t == "result") return p;
@@ -42,7 +64,7 @@ struct Client {
           std::cout << "\nApprove " << p["tool"].get<std::string>() << ": " << display_text(p["arguments"].dump(2)) << "\n[y/N] " << std::flush;
           std::string answer; std::getline(std::cin,answer); approved = lower(trim(answer)) == "y";
         }
-        channel->send({{"type","approval"},{"request_id",id},{"payload",{{"approval_id",p["approval_id"]},{"approved",approved}}}});
+        send({{"type","approval"},{"request_id",id},{"payload",{{"approval_id",p["approval_id"]},{"approved",approved}}}});
       } else if (callback) callback(t,p);
       else if (!json_output) {
         if (t == "assistant.delta") { streamed += p.value("content",""); std::cout << display_text(p.value("content","")) << std::flush; }
@@ -118,9 +140,11 @@ void setup(Client& client,bool full_screen) {
   std::cout << "✓ Connected\n✓ " << display_text(result["model"]["id"].get<std::string>()) << "\n✓ " << result["model"]["context_length"] << " context\n";
 }
 using Action = ChatAction;
-Action local_command(Client& client,const std::string& input,const fs::path& cwd,Emit callback = {}) {
+Action local_command(Client& client,const std::string& input,const fs::path& cwd,Emit callback = {},bool live = false) {
   auto space = input.find(' '); auto name = input.substr(1,space == std::string::npos ? space : space-1);
   auto arg = space == std::string::npos ? "" : trim(input.substr(space+1));
+  if (live && (name == "exit" || name == "quit" || name == "persona" || name == "model" || name == "new"))
+    throw std::runtime_error("Wait for the current turn before changing or closing the session.");
   if (name == "exit" || name == "quit") return Action::Exit;
   if (name == "persona") return Action::Selector;
   if (name == "model") return Action::ModelSetup;
@@ -140,19 +164,26 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
     else if (value == "4" || value == "host-always" || value == "host_always") args["mode"]="host_always";
     else throw std::runtime_error("Use /permissions 1, 2, 3 or 4 (ask, always, host-ask, host-always)");
   }
-  auto result = client.request("command",{{"name",name},{"arguments",args}},callback);
-  if (name == "status" || name == "compact") {
-    auto status=name == "status" ? result : result["status"];
-    if (callback) { callback("agent.status",status); callback("result",format_agent_status(status)); }
-    else if (!client.json_output) std::cout << display_text(format_agent_status(status)) << '\n';
-  } else if (name == "permissions") {
-    if (callback) { callback(arg.empty() ? "permissions.menu" : "permissions.changed",result); if (!arg.empty()) callback("result","Host permissions: "+result["label"].get<std::string>()); }
-    else if (!client.json_output) std::cout << "Host permissions: " << result["label"].get<std::string>()
-      << "\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations."
-      << "\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS)."
-      << "\nUse /permissions NUMBER. Sandbox actions stay automatic. Unrestricted host uses your OS user privileges; Saga storage is also accessible.\n";
-  } else if (callback) callback("result",result);
-  else if (!client.json_output) std::cout << display_text(result.dump(2)) << '\n';
+  if (live && !live_command_allowed(name,args)) throw std::runtime_error("This command requires the current turn to finish. Inspection commands and /permissions are available while the agent works.");
+  auto show_result = [&,name,arg,callback](const Json& result) {
+    if (name == "status" || name == "compact") {
+      auto status=name == "status" ? result : result["status"];
+      if (callback) { callback("agent.status",status); callback("result",format_agent_status(status)); }
+      else if (!client.json_output) std::cout << display_text(format_agent_status(status)) << '\n';
+    } else if (name == "permissions") {
+      if (callback) { callback(arg.empty() ? "permissions.menu" : "permissions.changed",result); if (!arg.empty()) callback("result","Host permissions: "+result["label"].get<std::string>()); }
+      else if (!client.json_output) std::cout << "Host permissions: " << result["label"].get<std::string>()
+        << "\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations."
+        << "\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS)."
+        << "\nUse /permissions NUMBER. Sandbox actions stay automatic. Unrestricted host uses your OS user privileges; Saga storage is also accessible.\n";
+    } else if (callback) callback("result",result);
+    else if (!client.json_output) std::cout << display_text(result.dump(2)) << '\n';
+  };
+  Json payload={{"name",name},{"arguments",args}};
+  if (live) client.live_request(std::move(payload),[show_result,callback](const std::string& type,const Json& result){
+    if (type == "error") callback("command.error",result); else show_result(result);
+  });
+  else show_result(client.request("command",std::move(payload),callback));
   return Action::Continue;
 }
 Action line_chat(Client& client,const fs::path& cwd) {
@@ -178,8 +209,12 @@ Action tui_chat(Client& client,const fs::path& cwd,const std::string& name,const
   },[&]() -> std::optional<Json> {
     std::unique_lock lock(client.receive_mutex,std::try_to_lock);
     if (!lock.owns_lock()) return {};
-    return client.channel->receive(100);
-  },[&](const Json& message){ client.channel->send(message); });
+    auto frame=client.channel->receive(100);
+    if (frame && client.dispatch_control(*frame)) return {};
+    return frame;
+  },[&](const Json& message){ client.send(message); },[&](const std::string& input,Emit callback){
+    local_command(client,input,cwd,std::move(callback),true);
+  });
 }
 }
 int main(int argc,char** argv) {

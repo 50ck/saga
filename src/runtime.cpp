@@ -218,6 +218,8 @@ Completion Runtime::call(ChatRequest request,const std::string& purpose,Emit emi
   usage(display_input,0,true);
   try {
     backend_->chat(request,[&](const Json& chunk){
+      if (service_) service_();
+      if (chunk.empty()) return; // Local HTTP heartbeat; never a generated token.
       size_t before = completion.content.size(); completion.accept(chunk);
       for (const auto& choice : chunk.value("choices",Json::array())) {
         auto delta=choice.value("delta",Json::object());

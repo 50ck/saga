@@ -47,5 +47,6 @@ struct ChatView {
 ChatAction chat_ui(ChatView view,
   const std::function<void(const std::string&,Emit)>& submit,
   const std::function<std::optional<Json>()>& receive,
-  const std::function<void(const Json&)>& approve);
+  const std::function<void(const Json&)>& approve,
+  const std::function<void(const std::string&,Emit)>& live_submit = {});
 }
