@@ -254,10 +254,11 @@ Completion Runtime::call(ChatRequest request,const std::string& purpose,Emit emi
     if (!completion.saw_chunk || completion.finish_reason.empty()) throw std::runtime_error("Incomplete model completion");
     if (!completion.calls.empty() && completion.finish_reason == "length") throw std::runtime_error("Truncated tool-call arguments");
     completion.message();
-    if(emit && purpose=="chat")for(auto& [index,tool]:completion.calls)if(tool["function"]["name"]=="report_progress") {
+    if(purpose=="chat")for(auto& [index,tool]:completion.calls)if(tool["function"]["name"]=="report_progress") {
       auto args=Json::parse(tool["function"]["arguments"].get<std::string>(),nullptr,false);
       auto valid=args.is_object() && args.contains("text") && args["text"].is_string() && !trim(args["text"].get<std::string>()).empty();
-      emit("progress.updated",{{"message_id",std::to_string(id)+":"+std::to_string(index)},{"text",valid?args["text"]:Json(progress_text[index])},{"complete",true},{"interrupted",!valid}});
+      Json progress={{"message_id",std::to_string(id)+":"+std::to_string(index)},{"text",valid?args["text"]:Json(progress_text[index])},{"complete",true},{"interrupted",!valid}};
+      p_->db->event("progress.completed",progress,p_->session,p_->task);if(emit)emit("progress.updated",progress);
     }
     auto input=completion.input_tokens.value_or(display_input),output=completion.output_tokens.value_or((generated.size()+2)/3);
     bool approximate=!completion.input_tokens || !completion.output_tokens;
@@ -268,7 +269,7 @@ Completion Runtime::call(ChatRequest request,const std::string& purpose,Emit emi
     return completion;
   } catch (...) {
     bool cancelled=false;try{throw;}catch(const TurnCancelled&){cancelled=true;}catch(...){}
-    if(emit)for(auto& [index,text]:progress_text)emit("progress.updated",{{"message_id",std::to_string(id)+":"+std::to_string(index)},{"text",text},{"complete",true},{"interrupted",true}});
+    for(auto& [index,text]:progress_text){Json progress={{"message_id",std::to_string(id)+":"+std::to_string(index)},{"text",text},{"complete",true},{"interrupted",true}};p_->db->event("progress.interrupted",progress,p_->session,p_->task);if(emit)emit("progress.updated",progress);}
     if(!usage_.empty()){usage_["streaming"]=false;if(emit)emit("context.usage",usage_);}
     p_->db->exec("UPDATE model_calls SET status=?,duration_ms=?,error=? WHERE id=?",{cancelled?"cancelled":"failed",now()-start,cancelled?"user_stop":"model operation failed",id});
     if (!completion.content.empty()) p_->db->event("assistant.interrupted",{{"content",completion.content}},p_->session,p_->task);
@@ -472,6 +473,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
         message["content"] = completion.content;
       }
     }
+    check_control();if(steering_pending())continue;
     store(message,"assistant"); p_->db->event("assistant.message",message,p_->session,p_->task);
     mode(CognitiveMode::Respond,emit); continuity(); memory_.maintain();
     emit("assistant.completed",{{"content",completion.content},{"session_id",p_->session}}); return;

@@ -131,13 +131,19 @@ int main() {
     CHECK(runtime->persona().db->query("SELECT * FROM episodes WHERE session_id=?",{offline_session}).size()==1); runtime->close("user_exit"); runtime.reset();
     auto reviewing=std::make_unique<TestBackend>(log); reviewing->approve_review=false;
     runtime=std::make_unique<Runtime>(std::make_unique<PersonaContext>(paths,a,project),config,std::move(reviewing),[](auto&,auto&){ return true; });
-    runtime->start(); runtime->chat("Create artifact migration",emit);
+    runtime->start();bool review_steering=false;
+    runtime->service([&]{if(!review_steering && !runtime->persona().db->query("SELECT id FROM model_calls WHERE purpose='submit_review' AND status='running'").empty()){review_steering=true;runtime->command("steer",{{"content","Continue from the review findings"}});}});
+    runtime->chat("Create artifact migration",emit);runtime->service({});
+    CHECK(review_steering && runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="delivered");
     CHECK(runtime->command("tasks")[0]["status"]=="verifying");
     CHECK(runtime->persona().db->query("SELECT * FROM events WHERE type='assistant.completion_gated'").size()==1);
     CHECK(events[events.size()-2]["type"]=="assistant.completed" && events.back()["type"]=="turn.finished"); CHECK(events[events.size()-2]["payload"]["content"].get<std::string>().starts_with("The task is not complete"));
     bool fresh_review=false; for (auto& messages:*log) if (messages.size()==2 && messages[1].value("content","").starts_with("Independently review")) fresh_review=true; CHECK(fresh_review);
     runtime->close("user_exit"); runtime.reset();
-    runtime=activate(b); runtime->start();
+    runtime=activate(b); runtime->start();bool successful_review_steering=false;
+    runtime->service([&]{if(!successful_review_steering && !runtime->persona().db->query("SELECT id FROM model_calls WHERE purpose='submit_review' AND status='running'").empty()){successful_review_steering=true;runtime->command("steer",{{"content","Continue after successful verification"}});}});
+    runtime->chat("Create artifact migration",emit);runtime->service({});
+    CHECK(successful_review_steering && runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="delivered");
     events=Json::array();runtime->chat("Show live progress",emit);
     CHECK(std::any_of(events.begin(),events.end(),[](auto& e){return e["type"]=="context.usage" && e["payload"].value("approximate",false) && e["payload"].value("output_tokens",0)>0;}));
     CHECK(!runtime->persona().db->query("SELECT id FROM events WHERE type='model.reasoning_observed'").empty());
@@ -154,6 +160,7 @@ int main() {
     auto calls_before=log->size();rejects([&]{runtime->chat("Empty always",emit);});CHECK(log->size()==calls_before+2);
     events=Json::array();runtime->chat("Public progress",emit);
     CHECK(std::any_of(events.begin(),events.end(),[](auto& e){return e["type"]=="progress.updated" && !e["payload"].value("complete",true);}));
+    CHECK(!runtime->persona().db->query("SELECT id FROM events WHERE type='progress.completed'").empty());
     if(shell_sandbox_available()) {
       bool running=false,queued=false;
       auto controlled_emit=[&](const std::string& type,const Json& p){emit(type,p);if(type=="tool.started" && p["tool"]=="shell_exec")running=true;};
