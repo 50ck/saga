@@ -45,6 +45,11 @@ history in selection mode. Terminals such as xterm also support Shift-drag witho
 changing modes. Mouse wheel scrolling is restored when leaving selection mode.
 
 Approval borders are yellow, Saga borders dark gray, and tool activity light gray.
+Approval arguments use JSON syntax colors: bold cyan keys, amber strings, cyan
+numbers, purple booleans/null and blue punctuation. A `command` string uses the
+same shell highlighting as tool activity, including its JSON-escaped quotes,
+newlines and Unicode. The displayed JSON and submitted arguments remain unchanged;
+colors follow the text when the terminal resizes.
 Shell commands have a muted blue prompt and lexical syntax highlighting. `/help`
 uses parsed Markdown with bold blue section headings, bold cyan commands, light
 gray explanations and highlighted examples. The terminal size comes from the

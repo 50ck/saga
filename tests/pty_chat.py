@@ -45,6 +45,9 @@ try:
     assert b'Awaiting approval' in output
     assert b'38;5;220m' in output, 'approval border is not yellow'
     assert b'38;5;67m' in output, 'shell prompt is not muted blue'
+    assert b'38;5;73m"command"' in output, 'approval JSON key is not cyan'
+    assert b'38;5;180m"' in output, 'approval JSON string quotes are not amber'
+    assert b'38;5;114mtmux' in output, 'approval command does not use shell command highlighting'
     os.write(fd, b'/help permissions\r')
     collect(.2)
     assert b'Examples:' in output

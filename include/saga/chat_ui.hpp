@@ -8,6 +8,7 @@ struct ChatSpan { size_t start,length; ChatColor color; unsigned style=0; };
 struct ChatLine { std::wstring text; std::vector<ChatSpan> spans; };
 std::vector<ChatLine> markdown_lines(std::string_view source,int width,bool streaming=false);
 std::vector<ChatSpan> shell_highlight(std::wstring_view command);
+std::vector<ChatSpan> json_highlight(std::wstring_view source);
 std::string command_help(std::string_view command = {});
 std::string format_agent_status(const Json& status);
 std::wstring chat_wide(std::string_view text);
@@ -21,6 +22,7 @@ struct ChatEntry {
   std::string command{};
   bool markdown=false;
   bool help=false;
+  std::vector<ChatSpan> spans{};
 };
 struct ChatView {
   std::string name,model,task,partial,approval_id,approval_request_id;

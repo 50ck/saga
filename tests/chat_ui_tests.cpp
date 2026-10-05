@@ -98,6 +98,26 @@ int main(int argc,char** argv) {
     view.compactions=0; CHECK(view.report().find(" x0") == std::string::npos);
     auto syntax=shell_highlight(L"notify-send --icon dialog \"hello world\" $USER | cat # comment");
     for (auto color : {ChatColor::Command,ChatColor::Option,ChatColor::String,ChatColor::Variable,ChatColor::Operator,ChatColor::Comment}) CHECK(std::any_of(syntax.begin(),syntax.end(),[&](const ChatSpan& span){ return span.color == color; }));
+    Json approval_args={{"command","printf --help \"Hello 東京 😀\" $USER | cat # first line\npwd"},{"execution","host"},{"timeout_seconds",30},{"enabled",true},{"optional",nullptr}};
+    for(bool ascii:{false,true}) {
+      auto json=chat_wide(approval_args.dump(2,' ',ascii));auto spans=json_highlight(json);
+      auto color_at=[&](std::wstring_view token){auto at=json.find(token);CHECK(at!=std::wstring::npos);ChatColor color=ChatColor::Default;for(auto span:spans){CHECK(span.start+span.length<=json.size());if(at>=span.start && at<span.start+span.length)color=span.color;}return color;};
+      CHECK(color_at(L"\"command\"")==ChatColor::Link);
+      CHECK(color_at(L"printf")==ChatColor::Command && color_at(L"--help")==ChatColor::Option);
+      CHECK(color_at(L"Hello")==ChatColor::String && color_at(L"$USER")==ChatColor::Variable);
+      CHECK(color_at(L"|")==ChatColor::Operator && color_at(L"# first")==ChatColor::Comment);
+      CHECK(color_at(L"pwd")==ChatColor::Command && color_at(L"\"host\"")==ChatColor::String);
+      CHECK(color_at(L"30")==ChatColor::Option && color_at(L"true")==ChatColor::Variable && color_at(L"null")==ChatColor::Variable);
+    }
+    ChatView approval;approval.event("approval.requested",{{"approval_id","color-nonce"},{"_request_id","color-request"},{"tool","shell_exec"},{"arguments",approval_args}});
+    CHECK(approval.entries[0].text.find(approval_args.dump(2))!=std::string::npos);
+    for(int width:{6,12,20,40,80,120}) {
+      bool key=false,command=false,option=false,variable=false;
+      for(auto line:approval.styled_lines(width)){CHECK(chat_columns(line.text)<=width);for(auto span:line.spans){CHECK(span.start+span.length<=line.text.size());key|=span.color==ChatColor::Link && (span.style&Bold);command|=span.color==ChatColor::Command;option|=span.color==ChatColor::Option;variable|=span.color==ChatColor::Variable;}}
+      CHECK(key && command && option && variable);
+    }
+    approval.event("approval.resolved",{{"approved",true}});CHECK(approval.entries[0].text.ends_with("Approved."));
+    CHECK(!json_highlight(L"{\"command\":\"unfinished").empty());
     view.entries={{"Approval","Approve?"},{"Saga","Status"},{"", "Working",true,1,0,"printf \"hello\""}};
     bool yellow=false,gray=false,blue=false;
     for (auto& line : view.styled_lines(80)) for (auto& span : line.spans) { yellow=yellow || span.color == ChatColor::Approval; gray=gray || span.color == ChatColor::Saga; blue=blue || span.color == ChatColor::Prompt; }

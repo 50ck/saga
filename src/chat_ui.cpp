@@ -136,7 +136,13 @@ void ChatView::event(const std::string& type,const Json& p) {
     if (p.contains("active_task")) { task=p["active_task"].empty() ? "" : p["active_task"][0].value("title",""); agent_status["task"]=p["active_task"]; }
   } else if (type == "approval.requested") {
     approval_id=p.at("approval_id"); approval_request_id=p.at("_request_id");
-    entries.push_back({"Approval","Approve "+p.at("tool").get<std::string>()+":\n"+p.at("arguments").dump(2)+"\nType y or n and press Enter."});
+    auto prefix="Approve "+p.at("tool").get<std::string>()+":\n";
+    auto arguments=p.at("arguments").dump(2);
+    ChatEntry entry{"Approval",prefix+arguments+"\nType y or n and press Enter."};
+    auto offset=chat_wide(prefix).size();
+    entry.spans.push_back({0,offset-1,ChatColor::Approval,Bold});
+    for(auto span:json_highlight(chat_wide(arguments))) {span.start+=offset;entry.spans.push_back(span);}
+    entries.push_back(std::move(entry));
     phase="approval";
   } else if (type == "approval.resolved") {
     approval_id.clear(); phase="act";
@@ -161,7 +167,7 @@ std::vector<ChatSpan> shell_highlight(std::wstring_view command) {
   std::vector<ChatSpan> result; bool command_word=true;
   for (size_t i=0; i<command.size();) {
     wchar_t c=command[i]; size_t begin=i; ChatColor color=ChatColor::Default;
-    if (std::iswspace(c)) { ++i; continue; }
+    if (std::iswspace(c)) { if(c==L'\n')command_word=true; ++i; continue; }
     if (c == L'\'' || c == L'"') {
       color=ChatColor::String; wchar_t quote=c; ++i;
       while (i<command.size()) { if (command[i] == L'\\' && quote == L'"' && i+1<command.size()) { i+=2; continue; } if (command[i++] == quote) break; }
@@ -169,7 +175,7 @@ std::vector<ChatSpan> shell_highlight(std::wstring_view command) {
       color=ChatColor::Variable; ++i;
       if (i<command.size() && command[i] == L'{') { while (i<command.size() && command[i++] != L'}') {} }
       else while (i<command.size() && (std::iswalnum(command[i]) || command[i] == L'_')) ++i;
-    } else if (c == L'#' && (i == 0 || std::iswspace(command[i-1]))) { color=ChatColor::Comment; i=command.size(); }
+    } else if (c == L'#' && (i == 0 || std::iswspace(command[i-1]))) { color=ChatColor::Comment; while(i<command.size() && command[i]!=L'\n')++i; }
     else if (std::wstring_view(L";|&<>()").find(c) != std::wstring_view::npos) { color=ChatColor::Operator; ++i; if (c == L';' || c == L'|' || c == L'&') command_word=true; }
     else {
       while (i<command.size() && !std::iswspace(command[i]) && std::wstring_view(L";'\"$|&<>()").find(command[i]) == std::wstring_view::npos) ++i;
@@ -178,6 +184,59 @@ std::vector<ChatSpan> shell_highlight(std::wstring_view command) {
       command_word=false;
     }
     if (color != ChatColor::Default) result.push_back({begin,i-begin,color});
+  }
+  return result;
+}
+std::vector<ChatSpan> json_highlight(std::wstring_view source) {
+  std::vector<ChatSpan> result; std::string key;
+  for(size_t i=0;i<source.size();) {
+    auto begin=i; auto c=source[i];
+    if(c==L'"') {
+      ++i;
+      while(i<source.size()) {if(source[i]==L'\\' && i+1<source.size()){i+=2;continue;}if(source[i++]==L'"')break;}
+      auto next=i;while(next<source.size() && std::iswspace(source[next]))++next;
+      bool property=next<source.size() && source[next]==L':';
+      result.push_back({begin,i-begin,property?ChatColor::Link:ChatColor::String,property?Bold:0U});
+      try {
+        auto value=Json::parse(chat_utf8(source.substr(begin,i-begin))).get<std::string>();
+        if(property) {key=value;continue;}
+        if(key=="command") {
+          // Keep the JSON representation exact; map decoded shell spans back
+          // over escaped quotes, backslashes, newlines and Unicode sequences.
+          std::wstring command;std::vector<std::pair<size_t,size_t>> positions;
+          for(size_t at=begin+1;at+1<i;) {
+            auto end=at+1;std::wstring decoded(1,source[at]);
+            if(source[at]==L'\\') {
+              end=at+2;
+              if(source[at+1]==L'u') {
+                end=at+6;auto code=std::stoul(std::wstring(source.substr(at+2,4)),nullptr,16);
+                if(code>=0xd800 && code<=0xdbff)end+=6;
+              }
+              decoded=chat_wide(Json::parse("\""+chat_utf8(source.substr(at,end-at))+"\"").get<std::string>());
+              if(decoded.empty())decoded=L" ";
+            }
+            for(auto ch:decoded){command+=ch;positions.emplace_back(at,end);}
+            at=end;
+          }
+          result.push_back({begin+1,i-begin-2,ChatColor::Default});
+          for(auto span:shell_highlight(command)) {
+            auto start=positions.at(span.start).first,end=positions.at(span.start+span.length-1).second;
+            result.push_back({start,end-start,span.color,span.style});
+          }
+        }
+      } catch(const Json::exception&) { /* Incomplete JSON stays string-colored. */ }
+      key.clear();
+    } else if(std::wstring_view(L"{}[]:,").find(c)!=std::wstring_view::npos) {
+      result.push_back({i++,1,ChatColor::Operator});if(c!=L':')key.clear();
+    } else if(std::iswdigit(c) || c==L'-') {
+      ++i;while(i<source.size() && std::wstring_view(L"0123456789.eE+-").find(source[i])!=std::wstring_view::npos)++i;
+      result.push_back({begin,i-begin,ChatColor::Option});key.clear();
+    } else if(std::iswalpha(c)) {
+      ++i;while(i<source.size() && std::iswalpha(source[i]))++i;
+      auto word=source.substr(begin,i-begin);
+      if(word==L"true" || word==L"false" || word==L"null")result.push_back({begin,i-begin,ChatColor::Variable});
+      key.clear();
+    } else ++i;
   }
   return result;
 }
@@ -219,6 +278,13 @@ std::vector<ChatLine> ChatView::styled_lines(int width) const {
       if (entry.markdown) {
         bool streaming=index>entries.size();
         if(cache.text != entry.text || cache.width != width-4 || cache.streaming!=streaming) { cache.lines=markdown_lines(entry.text,width-4,streaming); cache.text=entry.text; cache.width=width-4; cache.streaming=streaming; }
+      } else if(!entry.spans.empty()) {
+        auto body=chat_wide(entry.text);size_t offset=0;
+        for(auto& text:chat_wrap(body,width-4)) {
+          ChatLine line{text,{}};
+          for(auto span:entry.spans){auto begin=std::max(span.start,offset),end=std::min(span.start+span.length,offset+text.size());if(end>begin)line.spans.push_back({begin-offset,end-begin,span.color,span.style});}
+          literal.push_back(std::move(line));offset+=text.size();if(offset<body.size() && body[offset]==L'\n')++offset;
+        }
       } else for(auto& line:word_wrap(chat_wide(entry.text),width-4)) literal.push_back({line,{}});
       for (auto& line : entry.markdown ? cache.lines : literal) {
         auto text=L"│ "+line.text+std::wstring(static_cast<size_t>(std::max(0,width-4-chat_columns(line.text))),L' ')+L" │";
