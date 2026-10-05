@@ -1,5 +1,6 @@
 #include "check.hpp"
 #include <saga/runtime.hpp>
+#include <saga/edit.hpp>
 #include <saga/ipc.hpp>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -194,6 +195,44 @@ void host_permissions() {
   Tools other_tools(*other,other_memory,[](auto&,auto&){ return false; });
   CHECK(other_tools.permissions()["mode"] == "ask_always");
 }
+void reviewed_edits() {
+  Fixture f;Registry registry(f.paths);auto p=f.persona(registry.create());auto db=p->db.get();
+  p->project=db->exec("INSERT INTO projects(name,root_path,created_at,last_seen_at) VALUES('initial',?,?,?)",{f.project.string(),now(),now()});
+  p->session=db->exec("INSERT INTO sessions(started_at,project_id,status) VALUES(?,?,'active')",{now(),p->project});
+  Memory memory(*p,f.config());int approvals=0;bool accept=false,stale=false;Json proposal,events=Json::array();
+  Tools tools(*p,memory,[&](auto&,const Json& args){++approvals;proposal=args;if(stale)atomic_write(f.project/"review.txt","concurrent change\n");return accept;});
+  auto emit=[&](const std::string& type,const Json& data){events.push_back({{"type",type},{"data",data}});};
+  auto write=[&]{return tools.execute("file_write",{{"path","review.txt"},{"content","first\nsecond\n"},{"description","Synthetic reviewed edit"}},emit);};
+  CHECK(write().contains("error"));CHECK(!fs::exists(f.project/"review.txt"));CHECK(db->query("SELECT * FROM artifacts").empty());
+  CHECK(proposal["kind"]=="edit" && proposal["diff"].get<std::string>().find("+first")!=std::string::npos);
+  accept=true;CHECK(!write().contains("error"));CHECK(approvals==2);CHECK(events.back()["type"]=="tool.completed");CHECK(db->query("SELECT * FROM artifact_versions").size()==1);
+  Json edit={{"path","review.txt"},{"expected_hash",digest("first\nsecond\n")},{"description","Targeted edit"},{"edits",Json::array({{{"old_text","second"},{"new_text","next"}}})}};
+  stale=true;CHECK(tools.execute("file_edit",edit).contains("error"));CHECK(read_file(f.project/"review.txt")=="concurrent change\n");CHECK(db->query("SELECT * FROM artifact_versions").size()==1);stale=false;
+  CHECK(tools.execute("file_edit",edit).contains("error"));edit["expected_hash"]=digest("concurrent change\n");edit["edits"]=Json::array({{{"old_text","concurrent"},{"new_text","good"}}});
+  CHECK(!tools.execute("file_edit",edit).contains("error"));CHECK(read_file(f.project/"review.txt")=="good change\n");
+  edit["expected_hash"]=digest("good change\n");edit["edits"]=Json::array({{{"old_text","good"},{"new_text","a"}},{{"old_text","good change"},{"new_text","b"}}});CHECK(tools.execute("file_edit",edit).contains("error"));
+  for(auto mode:{"ask_always","always_approve","host_ask","host_always"}) {
+    tools.permissions(mode);int previous=approvals;auto result=tools.execute("file_write",{{"path",std::string(mode)+".txt"},{"content","test"},{"description","Permission fixture"}});
+    CHECK(!result.contains("error"));CHECK(approvals-previous==((std::string(mode)=="ask_always" || std::string(mode)=="host_ask")?1:0));
+  }
+  auto task=tools.execute("task_create",{{"title","Synthetic workspace task"},{"objective","Test scoped work"},{"risk","low"},{"checks",Json::array({"Verify workspace output"})}})["id"];
+  auto target=f.root/"next";CHECK(tools.execute("project_open",{{"path",target.string()},{"create",true}}).contains("error"));
+  db->event("user.message",{{"content","Work in "+target.string()}},p->session);
+  CHECK(!tools.execute("project_open",{{"path",target.string()},{"create",true}}).contains("error"));CHECK(p->task==task && p->project_root==target);
+  CHECK(!tools.execute("file_write",{{"path","new.txt"},{"content","new"},{"description","Scoped artifact"}}).contains("error"));
+  auto third=f.root/"third";db->event("user.message",{{"content","Continue in "+third.string()}},p->session);
+  CHECK(!tools.execute("project_open",{{"path",third.string()},{"create",true}}).contains("error"));CHECK(p->task!=task);CHECK(db->query("SELECT status FROM tasks WHERE id=?",{task})[0]["status"]=="blocked");
+  CHECK(db->query("SELECT status,evidence_id FROM task_checks WHERE task_id=?",{p->task})[0]["status"]=="unresolved");
+  CHECK(tools.execute("project_open",{{"path",f.paths.data.string()},{"create",true}}).contains("error"));
+  CHECK(unified_diff("same\n","same\n","fixture").text.empty());
+  auto diff=unified_diff("a\nb\nc","a\nB\nc\n","fixture");CHECK(diff.added==2 && diff.removed==2);CHECK(diff.text.find("\\ No newline at end of file")!=std::string::npos);
+  // An independent patch consumer verifies the generated hunks, including EOF and UTF-8.
+  for(auto& [before,after]:std::vector<std::pair<std::string,std::string>>{{"","new\n"},{"old\n",""},{"a\nb\nc","a\nB\nc\n"},{"a\nb\na\nb\n","b\na\nb\na\n"},{"東京\nfirst\n","東京\nlast"},{"one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n","ONE\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nTEN\n"}}) {
+    atomic_write(f.project/"fixture",before);atomic_write(f.project/"patch",unified_diff(before,after,"fixture").text);
+    auto applied=run_process(f.project,f.root/"patch-scratch",{"/usr/bin/git","apply","--unsafe-paths","patch"},5,true,{},Json::object(),true);
+    CHECK(applied.exit_code==0);CHECK(read_file(f.project/"fixture")==after);
+  }
+}
 void gates_and_praxis() {
   Fixture f; Registry registry(f.paths); auto p = f.persona(registry.create());
   auto db = p->db.get(); p->project = db->exec("INSERT INTO projects(name,root_path,created_at,last_seen_at) VALUES('test',?,?,?)",{f.project.string(),now(),now()});
@@ -244,7 +283,7 @@ void gates_and_praxis() {
   auto skill=declined.execute("compile_skill",{{"praxis_id",praxis},{"name","safe read"},{"steps",Json::array({{{"tool","file_read"},{"arguments",{{"path","output.txt"}}}}})}});CHECK(skill.contains("id"));
   CHECK(declined.execute("run_skill",{{"id",skill["id"]}})["results"][0]["content"]=="artifact");
   CHECK(declined.execute("compile_skill",{{"praxis_id",praxis},{"name","host read"},{"steps",Json::array({{{"tool","shell_exec"},{"arguments",{{"command","printf host"},{"execution","host"}}}}})}}).contains("error"));
-  CHECK(!declined.execute("file_write",{{"path","automatic.txt"},{"content","automatic"},{"description","sandbox write"}}).contains("error")); CHECK(fs::exists(f.project / "automatic.txt"));
+  CHECK(declined.execute("file_write",{{"path","automatic.txt"},{"content","automatic"},{"description","reviewed write"}}).contains("error")); CHECK(!fs::exists(f.project / "automatic.txt"));
   CHECK(declined.execute("shell_exec",{{"command","touch denied-host.txt"},{"execution","host"}}).contains("error")); CHECK(!fs::exists(f.project/"denied-host.txt"));
   atomic_write(f.project / "binary.dat",std::string("\0\xff",2));
   auto binary = tools.execute("file_read",{{"path","binary.dat"}});
@@ -336,7 +375,7 @@ void config_and_ipc() {
 }
 }
 int main() {
-  std::vector<std::pair<std::string,std::function<void()>>> tests = {{"streaming",streaming},{"capability probe and progress",capability_probe},{"persistence and isolation",persistence},{"guarded and unrestricted host permissions",host_permissions},{"tools, proof gates, praxis and context",gates_and_praxis},{"configuration and IPC",config_and_ipc}};
+  std::vector<std::pair<std::string,std::function<void()>>> tests = {{"streaming",streaming},{"capability probe and progress",capability_probe},{"persistence and isolation",persistence},{"guarded and unrestricted host permissions",host_permissions},{"reviewed edits and workspaces",reviewed_edits},{"tools, proof gates, praxis and context",gates_and_praxis},{"configuration and IPC",config_and_ipc}};
   int failed = 0;
   for (auto& [name,test] : tests) { try { test(); std::cout << "PASS " << name << '\n'; } catch (const std::exception& e) { ++failed; std::cerr << "FAIL " << name << ": " << e.what() << '\n'; } }
   return failed ? 1 : 0;

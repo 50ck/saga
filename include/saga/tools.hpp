@@ -20,6 +20,7 @@ class Tools {
   Approve approve_;
   std::function<void()> service_;
   Emit output_;
+  Emit events_;
   fs::path safe_path(const std::string& path, bool write) const;
   Json dispatch(const std::string& name, const Json& args);
 public:

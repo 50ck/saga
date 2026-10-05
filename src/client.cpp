@@ -154,7 +154,8 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   if (name == "steer") {args["content"]=arg;}
   else if (name == "memory" || name == "know" || name == "praxis" || name == "artifacts") {
     args = {{"query",arg},{"kind",name == "know" ? "know" : name == "praxis" ? "know_how" : name == "artifacts" ? "recall_artifact" : "remember"},{"deep",true}}; name = "memory";
-  } else if (name == "name" && !arg.empty()) args = {{"name",arg}};
+  } else if (name == "project" && !arg.empty()) args = {{"path",arg}};
+  else if (name == "name" && !arg.empty()) args = {{"name",arg}};
   else if (name == "soul" && !arg.empty()) args = {{"content",read_file(fs::path(arg).is_absolute() ? fs::path(arg) : cwd / arg,32768)}};
   else if (name == "fact" || name == "correct") args = Json::parse(arg);
   else if (name == "permissions" && !arg.empty()) {

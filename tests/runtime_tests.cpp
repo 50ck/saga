@@ -95,7 +95,7 @@ int main() {
       auto& previous=(*log)[i-1];auto& next=(*log)[i];CHECK(next.size()>previous.size());
       for(size_t j=0;j<previous.size();++j)CHECK(next[j]==previous[j]);
     }
-    CHECK(approvals == 0); CHECK(read_file(project/"artifact.txt") == "persistent identity artifact\n"); CHECK(runtime->command("tasks")[0]["status"] == "completed");
+    CHECK(approvals == 1); CHECK(read_file(project/"artifact.txt") == "persistent identity artifact\n"); CHECK(runtime->command("tasks")[0]["status"] == "completed");
     CHECK(std::any_of(events.begin(),events.end(),[](const Json& e){ return e["type"] == "context.usage" && e["payload"].value("approximate",false); }));
     CHECK(std::any_of(events.begin(),events.end(),[](const Json& e){ return e["type"] == "context.usage" && !e["payload"].value("approximate",true) && e["payload"].value("used_tokens",0) == 210; }));
     runtime->command("fact",{{"subject","machine"},{"predicate","OS"},{"object","FreeBSD"}});

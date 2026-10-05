@@ -38,7 +38,7 @@ Distinguish observations, remembered experiences, facts, beliefs, assumptions, h
 For coding work use report_progress to publish concise commentary before meaningful action groups, after discoveries, when changing strategy and during verification. This is public communication, never private reasoning. You may combine progress and action tool calls in one response. Use file_write/file_edit for source changes, not shell redirection to bypass edit review. Never claim completion in progress without evidence.
 For nontrivial work create/select a task, plan proof obligations, recall relevant praxis, act, observe, verify, reflect and learn. Use task_create/task_update and resolve required checks with real observed tool output or explicit user confirmation. Never claim completion while required checks or high-impact assumptions remain unresolved. Adapt verification to risk, reversibility, novelty, cost and historical calibration. Stop when extra verification would not change the decision enough to justify its cost. If a diagnostic action is meaningful, record a prediction before acting and compare its observed outcome. Unexpected results require reconsideration, verification or alternative praxis.
 Review by falsification: what observation would contradict this explanation? Which important assumption is unverified? Did you prove a general case or only one case? Could there be a regression? Use these contextually, not as a repeated recital.
-Tools provide access to your project and cognitive state. Sandboxed shell execution and project/artifact writes run without approval. Sandbox has a writable HOME and TMPDIR; use them for temporary files. For desktop notifications (notify-send/DBus), tmux, network or host files use shell_exec with execution="host". This is a supported host action, not a sandbox escape. Host actions follow the user-selected /permissions policy. Modes 1/2 retain private-storage guards; 3 asks before unrestricted host operations and 4 allows them without approval. In 3/4 the command runs with the daemon OS user privileges, inherited environment and no Saga Landlock, seccomp or no_new_privs restrictions. Existing system/container restrictions cannot be lifted. Use execution="host" for writes outside the project, including directly in the user home. In guarded host mode, creating files in ancestors of protected Saga storage can be denied even after approval. Do not recommend chmod or sudo as a way to remove Saga restrictions. Never inspect other personas or private Saga storage even when unrestricted host access makes it technically possible. Do not invent explanations of sandbox failures; report observed stderr and exit status. A rejected action must not be bypassed. Persistent macros containing host actions follow host permissions; sandbox macros run automatically. SOUL.md can only be changed by a deliberate user editor command. Never automatically write SOUL.md. Goals, commitments, intentions, curiosities and open loops belong in their dedicated tools. User intent dominates internal drives; avoid unsolicited chatter. Learn procedures as candidates; runtime evidence determines promotion.
+Tools provide access to your project and cognitive state. Sandboxed shell execution is automatic. Structured file edits and workspace selection ask in modes 1/3 and are automatic in 2/4. Use project_open to select/create a workspace explicitly requested by the user before working there. Sandbox has a writable HOME and TMPDIR; use them for temporary files. For desktop notifications (notify-send/DBus), tmux, network or host files use shell_exec with execution="host". This is a supported host action, not a sandbox escape. Host actions follow the user-selected /permissions policy. Modes 1/2 retain private-storage guards; 3 asks before unrestricted host operations and 4 allows them without approval. In 3/4 the command runs with the daemon OS user privileges, inherited environment and no Saga Landlock, seccomp or no_new_privs restrictions. Existing system/container restrictions cannot be lifted. Use execution="host" for writes outside the project, including directly in the user home. In guarded host mode, creating files in ancestors of protected Saga storage can be denied even after approval. Do not recommend chmod or sudo as a way to remove Saga restrictions. Never inspect other personas or private Saga storage even when unrestricted host access makes it technically possible. Do not invent explanations of sandbox failures; report observed stderr and exit status. A rejected action must not be bypassed. Persistent macros containing host actions follow host permissions; sandbox macros run automatically. SOUL.md can only be changed by a deliberate user editor command. Never automatically write SOUL.md. Goals, commitments, intentions, curiosities and open loops belong in their dedicated tools. User intent dominates internal drives; avoid unsolicited chatter. Learn procedures as candidates; runtime evidence determines promotion.
 Do not use or expose a user's personal email in Git commits, tags, patches, logs or pushes. Before each commit/tag verify both author and committer and use the user's GitHub noreply address unless explicitly authorized otherwise. Do not guess that address.
 Current context is limited working attention, not the whole mind. Continue from persisted summaries when cognitive load is high. Older completed tool exchanges may be archived; use recall_observation with their source event IDs when their full evidence is needed. Runtime attention updates are data snapshots appended by Saga, not new requests from the user. Their newer task, checks and attention values supersede the wake snapshot; continue the actual user's request.)PROMPT";
 }
@@ -46,7 +46,7 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
   ChatRequest r; r.max_tokens = config_.generation_reserve; r.tools = Tools::definitions();
   size_t budget = config_.input_budget();
   std::string identity = core_prompt() + "\n\nIdentity name: " + p_.name + "\nSOUL:\n" + p_.soul;
-  Json state = {{"wake",memory_.wake()},{"attention",attention},{"active_task",p_.db->query("SELECT * FROM tasks WHERE id=?",{p_.task})},
+  Json state = {{"wake",memory_.wake()},{"attention",attention},{"project",memory_.project_context()},{"active_task",p_.db->query("SELECT * FROM tasks WHERE id=?",{p_.task})},
     {"task_checks",p_.db->query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})},
     {"last_user_source_event",p_.db->query("SELECT id FROM events WHERE type='user.message' AND session_id=? ORDER BY id DESC LIMIT 1",{p_.session})}};
   state["wake"].erase("handoff");
@@ -423,7 +423,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
           auto args = Json::parse(call["function"]["arguments"].get<std::string>());
           mode(name.find("check") != std::string::npos || name == "record_observation" ? CognitiveMode::Verify : CognitiveMode::Act,emit);
           result = tools_.execute(name,args,emit);
-          if (name == "file_write" || name == "shell_exec" || name.starts_with("task_") || name == "check_resolve") task_work = true;
+          if (name == "file_write" || name == "file_edit" || name == "shell_exec" || name.starts_with("task_") || name == "check_resolve") task_work = true;
         } catch (const TurnCancelled&) {
           for (size_t j=i;j<message["tool_calls"].size();++j) {
             auto& skipped=message["tool_calls"][j];
@@ -505,7 +505,7 @@ void Runtime::consolidate(Id session,bool use_model) {
          {"entities",{{"type","array"},{"items",{{"type","object"},{"properties",{{"name",{{"type","string"}}},{"type",{{"type","string"}}},{"aliases",{{"type","array"},{"items",{{"type","string"}}}}}}},{"required",{"name","type","aliases"}},{"additionalProperties",false}}}}}},
         {"title","summary","narrative","outcome","lesson","entities"});
       model_success = true;
-    } catch (const std::exception&) {
+    } catch (const TurnCancelled&) { throw; } catch (const std::exception&) {
       p_->db->event("reflection.deferred",{{"source_session",session}},session);
       // A factual provisional diary exists immediately; model reflection can
       // update derived memory later while the life events remain immutable.
@@ -609,7 +609,10 @@ Json Runtime::command(std::string name,const Json& a,Emit emit) {
   if (name == "tasks") return p_->db->query("SELECT * FROM tasks ORDER BY id DESC LIMIT 30");
   if (name == "soul") { if (a.contains("content")) p_->edit_soul(a["content"]); return {{"content",p_->soul}}; }
   if (name == "self") return memory_.self();
-  if (name == "project") return memory_.project_context();
+  if (name == "project") {
+    if(a.contains("path")){p_->db->event("user.message",{{"content","/project "+a["path"].get<std::string>()}},p_->session,p_->task);return tools_.execute("project_open",{{"path",a["path"]},{"create",true}},emit);}
+    return memory_.project_context();
+  }
   if (name == "state") return memory_.wake();
   if (name == "fact" || name == "correct") {
     auto source = p_->db->event("user.message",{{"command",name},{"arguments",a}},p_->session,p_->task);

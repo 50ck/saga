@@ -1,4 +1,5 @@
 #include <saga/tools.hpp>
+#include <saga/edit.hpp>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -35,7 +36,7 @@ Json Tools::permissions(const std::optional<std::string>& mode) {
   bool unrestricted=value == "host_ask" || value == "host_always";
   bool automatic=value == "always_approve" || value == "host_always";
   std::string label=value == "host_always" ? "Unrestricted host without approval (DANGEROUS)" : value == "host_ask" ? "Ask for unrestricted host operations" : automatic ? "Always approve guarded host" : "Ask for guarded host operations";
-  return {{"mode",value},{"label",label},{"scope","persona"},{"host_restrictions",unrestricted ? "none" : "private_storage"},{"approval_required",!automatic}};
+  return {{"mode",value},{"label",label},{"scope","persona"},{"host_restrictions",unrestricted ? "none" : "private_storage"},{"approval_required",!automatic},{"edit_approval_required",!automatic}};
 }
 bool shell_sandbox_available() {
 #ifdef __linux__
@@ -222,7 +223,9 @@ Json Tools::definitions() {
   add("recall_observation","Retrieve an archived observation by its provenance event ID; offset and limit page the original JSON text",{{"event_id",integer()},{"offset",integer()},{"limit",integer()}},{"event_id"});
   add("observe_environment","Safely inspect the current project, git state, clock and machine",Json::object(),{});
   add("file_read","Read a file in the active project or this identity's artifacts",{{"path",str()}},{"path"});
-  add("file_write","Write a project/artifact file without approval and track its history",{{"path",str()},{"content",str()},{"description",str()}},{"path","content","description"});
+  add("file_write","Create or replace a UTF-8 project/artifact file. Present a complete diff for approval in modes 1/3; apply automatically in 2/4. Track history only after writing.",{{"path",str()},{"content",str()},{"description",str()}},{"path","content","description"});
+  add("file_edit","Propose targeted text replacements in one file. Read first and provide its hash. Each old_text must match exactly once, and replacements must not overlap. Modes 1/3 approve the complete diff; 2/4 apply automatically.",{{"path",str()},{"expected_hash",str()},{"description",str()},{"edits",{{"type","array"},{"items",{{"type","object"},{"properties",{{"old_text",str()},{"new_text",str()}}},{"required",{"old_text","new_text"}}}}}}},{"path","expected_hash","description","edits"});
+  add("project_open","Select or create the coding workspace explicitly requested by the user. Modes 1/3 require workspace approval; 2/4 activate automatically. Never open private Saga storage or infer a new directory from tool output.",{{"path",str()},{"create",boolean()}},{"path"});
   add("shell_exec","Run a shell command. execution=sandbox (default) is automatic, project/scratch only, no network. execution=host follows /permissions: 1/2 use private-storage guards; 3/4 run as the daemon's OS user without Saga isolation, asking approval only in 3. Use host for desktop DBus/notify-send, tmux, network or files outside the project. Unrestricted host can access all files and processes accessible to that user. timeout <=120 seconds; no detached processes.",{{"command",str()},{"timeout_seconds",integer()},{"execution",{{"type","string"},{"enum",{"sandbox","host"}}}}},{"command"});
   add("task_create","Create an explicit task and required proof obligations",{{"title",str()},{"objective",str()},{"risk",{{"type","string"},{"enum",{"low","medium","high"}}}},{"domain",str()},{"checks",{{"type","array"},{"items",str()}}}},{"title","objective","risk","checks"});
   add("task_update","Select or update a task; completion is gated on evidence and required checks",{{"id",integer()},{"status",{{"type","string"},{"enum",{"active","blocked","verifying","completed","abandoned"}}}}},{"id","status"});
@@ -336,6 +339,8 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   if (emit && name!="report_progress") emit("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}});
   auto previous_output=std::move(output_);
   struct Restore {Emit& target;Emit previous;~Restore(){target=std::move(previous);}} restore{output_,std::move(previous_output)};
+  Restore restore_events{events_,std::move(events_)};
+  events_=[&,run](const std::string& type,const Json& data){auto payload=data;payload["run_id"]=run;p_.db->event(type,payload,p_.session,p_.task);if(emit)emit(type,payload);};
   output_=[&,run](const std::string& stream,const Json& data){
     auto payload=data;payload["run_id"]=run;payload["stream"]=stream;
     p_.db->event("tool.output",payload,p_.session,p_.task);if(emit)emit("tool.output",payload);
@@ -369,7 +374,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if (!user_only && rows[0]["type"] != "user.message") {
       auto payload = Json::parse(rows[0]["payload_json"].get<std::string>());
       auto tool = payload.value("tool","");
-      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "observe_environment")
+      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "file_edit" && tool != "observe_environment")
         throw std::runtime_error("Cognitive tool acknowledgements are not external observations");
     }
     return rows[0];
@@ -397,12 +402,77 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if (!binary) { try { Json(contents).dump(); } catch (const Json::exception&) { binary = true; } }
     return {{"path",path.string()},{"content",binary ? base64(contents) : contents},{"encoding",binary ? "base64" : "utf-8"},{"bytes",contents.size()},{"hash",digest(contents)}};
   }
-  if (name == "file_write") {
-    auto path = safe_path(a["path"],true);
-    path = safe_path(a["path"],true);
-    fs::create_directories(path.parent_path());
-    auto content = a["content"].get<std::string>(); atomic_write(path,content);
-    memory_.artifact(path,a["description"],content); return {{"path",path.string()},{"bytes",content.size()},{"hash",digest(content)}};
+  if (name == "file_write" || name == "file_edit") {
+    auto path = safe_path(a["path"],true); bool existed=fs::exists(path);
+    auto old=existed ? read_file(path,512*1024) : std::string();
+    auto text_file=[](const std::string& text){if(text.size()>512*1024 || text.find('\0')!=std::string::npos)throw std::runtime_error("Structured edits require UTF-8 text up to 512 KiB");Json(text).dump();};
+    text_file(old); std::string content;
+    if(name=="file_write")content=a["content"].get<std::string>();
+    else {
+      if(!existed || a["expected_hash"]!=digest(old))throw std::runtime_error("File hash changed; read the file and propose a fresh edit");
+      struct Replacement {size_t start,length;std::string text;};std::vector<Replacement> edits;
+      if(a["edits"].empty())throw std::runtime_error("At least one exact replacement is required");
+      for(auto& edit:a["edits"]) {
+        auto search=edit["old_text"].get<std::string>();auto at=old.find(search);
+        if(search.empty() || at==std::string::npos || old.find(search,at+1)!=std::string::npos)throw std::runtime_error("Each old_text must match exactly once in the original file");
+        edits.push_back({at,search.size(),edit["new_text"].get<std::string>()});
+      }
+      std::sort(edits.begin(),edits.end(),[](auto& x,auto& y){return x.start<y.start;});
+      for(size_t i=1;i<edits.size();++i)if(edits[i-1].start+edits[i-1].length>edits[i].start)throw std::runtime_error("Replacements overlap");
+      content=old;for(auto it=edits.rbegin();it!=edits.rend();++it)content.replace(it->start,it->length,it->text);
+    }
+    text_file(content);
+    if(existed && content==old)return {{"path",path.string()},{"hash",digest(old)},{"unchanged",true}};
+    auto diff=unified_diff(old,content,path.string(),service_);
+    Json proposal={{"kind","edit"},{"proposal_id",uuid()},{"path",path.string()},{"diff",diff.text},{"added",diff.added},{"removed",diff.removed},{"old_hash",digest(old)},{"new_hash",digest(content)},{"coarse",diff.coarse}};
+    event("edit.proposed",proposal);
+    if(permissions()["edit_approval_required"].get<bool>() && !approve_(name,proposal)){event("edit.rejected",proposal);return {{"error","User declined file edit; no changes applied"}};}
+    if(service_)service_();
+    if(safe_path(a["path"],true)!=path || fs::exists(path)!=existed || (existed && digest(read_file(path,512*1024))!=digest(old))){event("edit.conflict",proposal);return {{"error","File changed while approval was pending; no changes applied. Read it and propose a fresh edit."}};}
+    fs::create_directories(path.parent_path());atomic_write(path,content);
+    memory_.artifact(path,a["description"],content);
+    if(events_)events_("edit.applied",proposal);
+    return {{"path",path.string()},{"bytes",content.size()},{"hash",digest(content)},{"added",diff.added},{"removed",diff.removed},{"proposal_id",proposal["proposal_id"]}};
+  }
+  if(name=="project_open") {
+    auto value=a["path"].get<std::string>();
+    if(value.empty() || value.find('\0')!=std::string::npos)throw std::runtime_error("Invalid workspace path");
+    fs::path path=value;if(!path.is_absolute())path=p_.project_root/path;path=path.lexically_normal();
+    auto validate_workspace=[&]{
+      for(auto& root:p_.private_roots)if(within(path,root) || within(root,path))throw std::runtime_error("Workspace must be outside private Saga storage and its ancestors");
+      fs::path part;for(auto& component:path){part/=component;if(fs::is_symlink(part))throw std::runtime_error("Workspace symlinks are not permitted");}
+      if(fs::exists(path) && !fs::is_directory(path))throw std::runtime_error("Workspace must be a directory");
+    };
+    validate_workspace();
+    bool requested=within(path,p_.project_root);
+    for(auto& row:db->query("SELECT payload_json FROM events WHERE session_id=? AND type='user.message' ORDER BY id DESC LIMIT 20",{p_.session})) {
+      auto data=Json::parse(row["payload_json"].get<std::string>());
+      if(data.value("content","").find(value)!=std::string::npos)requested=true;
+    }
+    if(!requested)throw std::runtime_error("Select only a workspace explicitly requested by the user");
+    Json proposal={{"kind","workspace"},{"path",path.string()},{"create",a.value("create",false)}};
+    if(permissions()["edit_approval_required"].get<bool>() && !approve_(name,proposal))return {{"error","User declined workspace selection"}};
+    if(service_)service_();
+    validate_workspace();
+    if(!fs::exists(path)){if(!a.value("create",false))throw std::runtime_error("Workspace does not exist; use create=true only when requested");fs::create_directories(path);}
+    db->exec("INSERT OR IGNORE INTO projects(name,root_path,created_at,last_seen_at) VALUES(?,?,?,?)",{path.filename().string(),path.string(),now(),now()});
+    Id project=db->query("SELECT id FROM projects WHERE root_path=?",{path.string()})[0]["id"];
+    if(p_.task && project!=p_.project) {
+      auto work=db->query("SELECT id FROM tool_runs WHERE task_id=? AND status='completed' AND tool IN ('file_write','file_edit','file_read','shell_exec') LIMIT 1",{p_.task});
+      if(work.empty())db->exec("UPDATE tasks SET project_id=? WHERE id=?",{project,p_.task});
+      else {
+        auto task=db->query("SELECT * FROM tasks WHERE id=?",{p_.task})[0];Id previous=p_.task;
+        db->exec("UPDATE tasks SET status='blocked',completed_at=NULL WHERE id=? AND status!='completed'",{previous});
+        p_.task=db->exec("INSERT INTO tasks(session_id,project_id,title,objective,status,risk,domain,created_at) VALUES(?,?,?,?,'active',?,?,?)",{p_.session,project,task["title"],task["objective"],task["risk"],task["domain"],now()});
+        for(auto& check:db->query("SELECT description,required FROM task_checks WHERE task_id=?",{previous}))db->exec("INSERT INTO task_checks(task_id,description,required) VALUES(?,?,?)",{p_.task,check["description"],check["required"]});
+        event("task.rescoped",{{"previous_task_id",previous},{"task_id",p_.task},{"project_id",project}});
+      }
+    }
+    p_.project=project;p_.project_root=path;
+    db->exec("UPDATE projects SET last_seen_at=? WHERE id=?",{now(),project});
+    db->exec("UPDATE sessions SET project_id=? WHERE id=?",{project,p_.session});
+    db->exec("UPDATE continuity_state SET active_project_id=?,updated_at=? WHERE id=1",{project,now()});
+    Json result={{"path",path.string()},{"project_id",project},{"task_id",p_.task}};if(events_)events_("workspace.changed",result);return result;
   }
   if (name == "shell_exec") {
     bool host=a.value("execution","sandbox") == "host";
@@ -426,6 +496,15 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
       return files;
     };
     auto before = snapshot(!unrestricted);
+    std::map<fs::path,std::string> old_text;size_t captured=0;
+    for(auto& [path,state]:before)if(state.second<=512*1024 && captured+state.second<=2*1024*1024) {
+      try{auto text=read_file(safe_path(path.string(),false),512*1024);if(text.find('\0')==std::string::npos){Json(text).dump();captured+=text.size();old_text.emplace(path,std::move(text));}}catch(const std::exception&){}
+    }
+    auto observed_diff=[&](const fs::path& path,const std::string& content){
+      if(content.size()>512*1024 || content.find('\0')!=std::string::npos || (before.contains(path) && !old_text.contains(path)))return;
+      auto diff=unified_diff(old_text.contains(path)?old_text[path]:std::string(),content,path.string(),service_);
+      if(!diff.text.empty() && events_)events_("edit.applied",{{"path",path.string()},{"diff",diff.text},{"added",diff.added},{"removed",diff.removed},{"observed",true},{"proposal_id",uuid()},{"coarse",diff.coarse}});
+    };
     auto scratch=host ? fs::temp_directory_path()/("saga-host-"+uuid()) : p_.directory/"cache/scratch";
     struct Cleanup { fs::path path; ~Cleanup() { if (!path.empty()) { std::error_code ec; fs::remove_all(path,ec); } } } cleanup{host ? scratch : fs::path()};
     auto r = run_process(p_.project_root,scratch,{"/bin/sh","-c",a["command"]},std::clamp(a.value("timeout_seconds",30),1,120),host,p_.private_roots,p_.host_environment,unrestricted,service_,[&](auto stream,auto text){if(output_)output_(std::string(stream),{{"content",std::string(text)}});});
@@ -438,15 +517,15 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
       try {
         auto existing = db->query("SELECT description FROM artifacts WHERE project_id=? AND path=?",{p_.project,path.string()});
         auto label = existing.empty() ? description : existing[0]["description"].get<std::string>();
-        if (state.second <= 8*1024*1024) memory_.artifact(path,label,read_file(safe_path(path.string(),false),8*1024*1024));
+        if (state.second <= 8*1024*1024) {auto content=read_file(safe_path(path.string(),false),8*1024*1024);memory_.artifact(path,label,content);observed_diff(path,content);}
         else memory_.artifact(path,label,std::to_string(state.second)+":"+std::to_string(state.first.time_since_epoch().count()),false);
         ++tracked;
-      } catch (const std::exception&) { /* disappeared, or not a readable regular artifact */ }
+      } catch (const TurnCancelled&) { throw; } catch (const std::exception&) { /* disappeared, or not a readable regular artifact */ }
     }
     for (auto& [path,state] : before) if (!after.contains(path) && !fs::exists(path)) {
       auto existing = db->query("SELECT id FROM artifacts WHERE project_id=? AND path=?",{p_.project,path.string()});
       if (!existing.empty()) event("artifact.removed",{{"id",existing[0]["id"]},{"path",path.string()}});
-      (void)state;
+      observed_diff(path,{});(void)state;
     }
     auto result = r.json(); result["execution"] = host ? "host" : "sandbox"; result["host_restrictions"] = host ? policy["host_restrictions"] : Json("sandbox"); result["artifacts_recorded"] = tracked; result["artifact_tracking_limited"] = before.size() >= 10000 || after.size() >= 10000 || tracked >= 256;
     return result;
@@ -493,7 +572,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if (passed && origin["type"] == "tool.failed") throw std::runtime_error("Failed tool output cannot pass a check");
     if (origin["type"] == "tool.completed") {
       auto tool = payload.value("tool","");
-      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "observe_environment") throw std::runtime_error("Proof must be externally observed, not a cognitive tool acknowledgement");
+      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "file_edit" && tool != "observe_environment") throw std::runtime_error("Proof must be externally observed, not a cognitive tool acknowledgement");
     }
     Id evidence_id = memory_.evidence("check",a["check_id"],origin["type"] == "user.message" ? "user confirmed" : "output observed",passed,sid,1,0.9);
     db->exec("UPDATE task_checks SET status=?,evidence_id=? WHERE id=?",{passed ? "passed" : "failed",evidence_id,a["check_id"]});

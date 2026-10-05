@@ -13,7 +13,7 @@
 namespace saga {
 bool live_command_allowed(std::string_view name,const Json& arguments) {
   if (!arguments.is_object()) return false;
-  if (name == "name" || name == "soul") return arguments.empty();
+  if (name == "name" || name == "soul" || name == "project") return arguments.empty();
   return name == "stop" || name == "steer" || name == "status" || name == "permissions" || name == "memory" || name == "journal" ||
     name == "goals" || name == "tasks" || name == "self" || name == "project" || name == "state";
 }
