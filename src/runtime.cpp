@@ -208,7 +208,7 @@ Completion Runtime::call(ChatRequest request,const std::string& purpose,Emit emi
   bool exact_seen=false;
   std::string generated,reasoning;
   std::map<int,std::string> progress_text;
-  std::set<int> preparing;
+  std::map<int,std::string> preparing;
   auto last_update=std::chrono::steady_clock::now();
   std::uint64_t display_input=(request.messages.dump().size()+request.tools.dump().size()+2)/3;
   auto usage=[&](std::uint64_t input,std::uint64_t output,bool approximate,bool streaming=true){
@@ -229,7 +229,7 @@ Completion Runtime::call(ChatRequest request,const std::string& purpose,Emit emi
         if(name=="report_progress") {
           auto text=json_string_prefix(tool["function"]["arguments"].get<std::string>(),"text");
           if(!text.empty() && text!=progress_text[index]) {progress_text[index]=text;emit("progress.updated",{{"message_id",std::to_string(id)+":"+std::to_string(index)},{"text",text},{"complete",false}});}
-        } else if(!name.empty() && preparing.insert(index).second)emit("operation.preparing",{{"tool",name},{"model_call_id",id}});
+        } else if(!name.empty() && preparing[index]!=name){preparing[index]=name;emit("operation.preparing",{{"tool",name},{"model_call_id",id}});}
       }
       for (const auto& choice : chunk.value("choices",Json::array())) {
         auto delta=choice.value("delta",Json::object());
@@ -579,6 +579,11 @@ Json Runtime::command(std::string name,const Json& a,Emit emit) {
       id=p_->db->exec("INSERT INTO steering_messages(session_id,source_event_id,content,created_at,updated_at) VALUES(?,?,?,?,?)",{p_->session,source,content,now(),now()});
       p_->db->event("steering.queued",{{"id",id}},p_->session,p_->task);});
     return {{"id",id},{"queued",true}};
+  }
+  if(name=="diff") {
+    auto rows=p_->db->query("SELECT id,payload_json FROM events WHERE id=? AND type='edit.applied'",{a.at("event_id")});
+    if(rows.empty())throw std::runtime_error("No applied diff at this event ID");
+    auto result=Json::parse(rows[0]["payload_json"].get<std::string>());result["event_id"]=rows[0]["id"];return result;
   }
   if (name == "permissions") return tools_.permissions(a.contains("mode") ? std::optional<std::string>(a.at("mode").get<std::string>()) : std::nullopt);
   if (name == "compact") {

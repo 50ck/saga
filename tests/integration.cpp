@@ -228,6 +228,19 @@ void end_to_end(MockModel& mock,const std::string& daemon,const std::string& cli
     wait([&]{return replies==4;}); CHECK(!done);
     mock.resume=true; inference.join(); if(error)std::rethrow_exception(error);
     CHECK(live.request("command",{{"name","permissions"}})["mode"]=="host_always");
+    // Cancel during prompt preparation, while the endpoint sends no SSE bytes.
+    done=false;error=nullptr;mock.resume=false;mock.pause=true;std::atomic_bool stop_ack=false,cancel_event=false;
+    std::jthread waiting_turn([&]{try{live.request("chat",{{"content","hello cancellation"}},[&](const std::string& type,const Json&){if(type=="turn.cancelled")cancel_event=true;});}catch(...){error=std::current_exception();}done=true;});
+    wait([&]{return mock.waiting.load();});
+    live.live_request({{"name","stop"}},[&](const std::string& type,const Json& data){if(type=="result"){CHECK(data["stopping"]==true);stop_ack=true;}});
+    wait([&]{return done.load();});waiting_turn.join();if(error)std::rethrow_exception(error);CHECK(stop_ack && cancel_event);mock.resume=true;
+    wait([&]{return !mock.waiting.load();});
+    // A live steering request arriving after completion still forwards its turn events.
+    std::atomic_bool steer_reply=false,steer_completed=false;
+    local_command(live,"/steer Continue the same conversation",env.project,[&](const std::string& type,const Json&){if(type=="assistant.completed")steer_completed=true;},true);
+    auto until=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+    while(!steer_completed && std::chrono::steady_clock::now()<until){auto frame=live.channel->receive(100);if(frame){if((*frame)["type"]=="result")steer_reply=true;live.dispatch_control(*frame);}}
+    CHECK(steer_completed);while(!steer_reply && std::chrono::steady_clock::now()<until){auto frame=live.channel->receive(100);if(frame){if((*frame)["type"]=="result")steer_reply=true;live.dispatch_control(*frame);}}CHECK(steer_reply);
     live.request("session.close");
   }
   env.stop(); env.start(daemon); Peer again(env.paths.socket());

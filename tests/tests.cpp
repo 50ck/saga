@@ -212,8 +212,8 @@ void reviewed_edits() {
   accept=true;CHECK(!write().contains("error"));CHECK(approvals==2);CHECK(events.back()["type"]=="tool.completed");CHECK(db->query("SELECT * FROM artifact_versions").size()==1);
   Json edit={{"path","review.txt"},{"expected_hash",digest("first\nsecond\n")},{"description","Targeted edit"},{"edits",Json::array({{{"old_text","second"},{"new_text","next"}}})}};
   stale=true;CHECK(tools.execute("file_edit",edit).contains("error"));CHECK(read_file(f.project/"review.txt")=="concurrent change\n");CHECK(db->query("SELECT * FROM artifact_versions").size()==1);stale=false;
-  CHECK(tools.execute("file_edit",edit).contains("error"));edit["expected_hash"]=digest("concurrent change\n");edit["edits"]=Json::array({{{"old_text","concurrent"},{"new_text","good"}}});
-  CHECK(!tools.execute("file_edit",edit).contains("error"));CHECK(read_file(f.project/"review.txt")=="good change\n");
+  CHECK(tools.execute("file_edit",edit).contains("error"));fs::permissions(f.project/"review.txt",fs::perms::owner_all);edit["expected_hash"]=digest("concurrent change\n");edit["edits"]=Json::array({{{"old_text","concurrent"},{"new_text","good"}}});
+  CHECK(!tools.execute("file_edit",edit).contains("error"));CHECK(read_file(f.project/"review.txt")=="good change\n");CHECK((fs::status(f.project/"review.txt").permissions() & fs::perms::owner_exec)!=fs::perms::none);
   edit["expected_hash"]=digest("good change\n");edit["edits"]=Json::array({{{"old_text","good"},{"new_text","a"}},{{"old_text","good change"},{"new_text","b"}}});CHECK(tools.execute("file_edit",edit).contains("error"));
   for(auto mode:{"ask_always","always_approve","host_ask","host_always"}) {
     tools.permissions(mode);int previous=approvals;auto result=tools.execute("file_write",{{"path",std::string(mode)+".txt"},{"content","test"},{"description","Permission fixture"}});

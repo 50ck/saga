@@ -182,7 +182,10 @@ Saga rechecks the original hash and path after approval. A changed file is left
 untouched and requires a fresh proposal. Artifact versions are recorded only after
 the write. In modes 2/4, edits are automatic and their transcript diffs also start
 collapsed to ten rows, with clickable expansion. Additions are green; deletions
-are red. Resizing recomputes wrapping and click targets while keeping the footer.
+are red. Collapsed diffs retain small previews in the client; expanding loads the
+complete diff from this persona's event history, including while the agent works.
+F2 coalesces token/progress updates and bounds live output previews while keeping
+final outcomes. Resizing recomputes wrapping and click targets while keeping the footer.
 
 Shell commands stream stdout/stderr in roughly 100 ms batches, with 256 KiB capture
 limits per stream and a visible truncation notice. Shell approval covers the
@@ -225,7 +228,7 @@ metadata. Each persona has an exclusive context lock and an independent database
 
 Databases use WAL, foreign keys, full synchronization, atomic migrations and
 explicit schema versions. Version 2 adds project-scoped facts; version 3 adds
-persona permission settings and context checkpoints. Existing databases migrate
+persona permission settings, context checkpoints and durable steering messages. Existing databases migrate
 without deleting identity or history. Triggers reject updates/deletions of life events.
 Derived memory may change while its sources remain immutable. FTS5 BM25 retrieval
 combines lexical, entity, project, goal, salience, recency, confidence and

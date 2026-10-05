@@ -340,7 +340,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   auto previous_output=std::move(output_);
   struct Restore {Emit& target;Emit previous;~Restore(){target=std::move(previous);}} restore{output_,std::move(previous_output)};
   Restore restore_events{events_,std::move(events_)};
-  events_=[&,run](const std::string& type,const Json& data){auto payload=data;payload["run_id"]=run;p_.db->event(type,payload,p_.session,p_.task);if(emit)emit(type,payload);};
+  events_=[&,run](const std::string& type,const Json& data){auto payload=data;payload["run_id"]=run;payload["event_id"]=p_.db->event(type,payload,p_.session,p_.task);if(emit)emit(type,payload);};
   output_=[&,run](const std::string& stream,const Json& data){
     auto payload=data;payload["run_id"]=run;payload["stream"]=stream;
     p_.db->event("tool.output",payload,p_.session,p_.task);if(emit)emit("tool.output",payload);
@@ -429,7 +429,8 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if(permissions()["edit_approval_required"].get<bool>() && !approve_(name,proposal)){event("edit.rejected",proposal);return {{"error","User declined file edit; no changes applied"}};}
     if(service_)service_();
     if(safe_path(a["path"],true)!=path || fs::exists(path)!=existed || (existed && digest(read_file(path,512*1024))!=digest(old))){event("edit.conflict",proposal);return {{"error","File changed while approval was pending; no changes applied. Read it and propose a fresh edit."}};}
-    fs::create_directories(path.parent_path());atomic_write(path,content);
+    auto mode=existed ? fs::status(path).permissions() : fs::perms::owner_read|fs::perms::owner_write;
+    fs::create_directories(path.parent_path());atomic_write(path,content);fs::permissions(path,mode & fs::perms::all);
     memory_.artifact(path,a["description"],content);
     if(events_)events_("edit.applied",proposal);
     return {{"path",path.string()},{"bytes",content.size()},{"hash",digest(content)},{"added",diff.added},{"removed",diff.removed},{"proposal_id",proposal["proposal_id"]}};

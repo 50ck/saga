@@ -26,6 +26,8 @@ struct ChatEntry {
   std::string message_id{};
   bool streaming=false;
   bool diff=false,expanded=false;
+  Id diff_event=0;
+  bool diff_loaded=true;
 };
 struct ChatView {
   std::string name,model,task,partial,approval_id,approval_request_id;

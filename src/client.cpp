@@ -150,7 +150,8 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   if (name == "help") { auto help=command_help(arg); if (callback) callback("help",{{"content",help}}); else {for(auto& line:markdown_lines(help,100))std::cout<<chat_utf8(line.text)<<'\n';} return Action::Continue; }
   if (name == "new") { auto r=client.request("command",{{"name","new"}},callback); if (callback) {callback("session.reset",Json::object());if(r.contains("status"))callback("agent.status",r["status"]);} return Action::NewSession; }
   Json args = Json::object();
-  if (name == "steer") {args["content"]=arg;}
+  if(name=="diff") {args["event_id"]=std::stoll(arg);}
+  else if (name == "steer") {args["content"]=arg;}
   else if (name == "memory" || name == "know" || name == "praxis" || name == "artifacts") {
     args = {{"query",arg},{"kind",name == "know" ? "know" : name == "praxis" ? "know_how" : name == "artifacts" ? "recall_artifact" : "remember"},{"deep",true}}; name = "memory";
   } else if (name == "project" && !arg.empty()) args = {{"path",arg}};
@@ -167,7 +168,8 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   }
   if (live && !live_command_allowed(name,args)) throw std::runtime_error("This command requires the current turn to finish. Inspection commands and /permissions are available while the agent works.");
   auto show_result = [&,name,arg,callback](const Json& result) {
-    if (name == "status" || name == "compact") {
+    if(name=="diff"){if(callback)callback("diff.loaded",result);}
+    else if (name == "status" || name == "compact") {
       auto status=name == "status" ? result : result["status"];
       if (callback) { callback("agent.status",status); callback("result",format_agent_status(status)); }
       else if (!client.json_output) std::cout << display_text(format_agent_status(status)) << '\n';

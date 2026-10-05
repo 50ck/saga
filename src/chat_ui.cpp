@@ -120,10 +120,12 @@ void ChatView::event(const std::string& type,const Json& p) {
     auto id="output:"+std::to_string(p.value("run_id",0LL))+":"+p.value("stream","");
     auto it=std::find_if(entries.begin(),entries.end(),[&](auto& entry){return entry.message_id==id;});
     if(it==entries.end()){ChatEntry entry{p.value("stream","Output"),""};entry.message_id=id;entries.push_back(std::move(entry));it=std::prev(entries.end());}
-    if(it->text.size()<512*1024)it->text+=display_text(p.value("content",""));
+    if(it->text.size()<65536) {it->text+=display_text(p.value("content",""));if(it->text.size()>65536)it->text=utf8_excerpt(it->text,65536)+"\n[Live preview truncated; captured output remains in tool history.]";}
   } else if(type=="edit.applied") {
     ChatEntry entry{display_text(p.value("path","File edit"))+" · +"+std::to_string(p.value("added",0ULL))+" / -"+std::to_string(p.value("removed",0ULL)),p.value("diff","")};
-    entry.diff=true;entry.message_id=p.value("proposal_id",uuid());entries.push_back(std::move(entry));
+    entry.diff=true;entry.diff_event=p.value("event_id",0LL);entry.diff_loaded=!p.value("preview",false);entry.message_id=p.value("proposal_id",uuid());entries.push_back(std::move(entry));
+  } else if(type=="diff.loaded") {
+    for(auto& entry:entries)if(entry.diff && entry.diff_event==p.value("event_id",0LL)) {entry.text=p.value("diff","");entry.diff_loaded=true;entry.expanded=true;break;}
   } else if(type=="workspace.changed") {agent_status["project_path"]=p.value("path","");entries.push_back({"Saga","Workspace: "+p.value("path","")});}
   else if(type=="steering.delivered")entries.push_back({"Saga","Queued steering delivered. Replanning before further actions."});
   else if(type=="turn.started") {activity_started=now();phase="respond";}
@@ -336,7 +338,7 @@ std::vector<ChatLine> ChatView::styled_lines(int width) const {
       std::vector<ChatLine> literal;
       if(entry.diff) {
         literal=diff_lines(entry.text,width-4);auto total=literal.size();if(!entry.expanded && total>10)literal.resize(10);
-        auto label=entry.expanded ? L"See less" : L"See more";auto text=std::wstring(L"[ ")+label+L" ] · "+std::to_wstring(total)+L" rows";
+        auto label=entry.expanded ? L"See less" : L"See more";auto text=std::wstring(L"[ ")+label+L" ] · "+(entry.diff_loaded?std::to_wstring(total)+L" rows":L"full diff on expansion");
         text=fit(text,width-4);literal.push_back({text,{{0,text.size(),ChatColor::Link,Bold}},"diff:"+entry.message_id});
       } else if (entry.markdown) {
         bool streaming=entry.streaming || index>entries.size();
@@ -435,14 +437,31 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
                   const std::function<std::optional<Json>()>& receive,const std::function<void(const Json&)>& approve,
                   const std::function<void(const std::string&,Emit)>& live_submit) {
   Terminal terminal;
-  std::mutex mutex; std::vector<std::pair<std::string,Json>> pending;
+  std::mutex mutex; std::vector<std::pair<std::string,Json>> pending;size_t output_bytes=0;bool output_overflow=false;
   std::atomic_bool busy=false;
   Emit enqueue=[&](const std::string& type,const Json& p){ std::lock_guard lock(mutex);
+    if(type=="edit.applied" && p.contains("event_id")) {
+      auto preview=p;auto diff=preview.value("diff","");size_t end=0;
+      for(int line=0;line<10 && end<diff.size();++line){auto next=diff.find('\n',end);end=next==std::string::npos?diff.size():next+1;}
+      preview["diff"]=utf8_excerpt(diff.substr(0,end),16384);preview["preview"]=true;pending.emplace_back(type,std::move(preview));return;
+    }
+    if(type=="tool.completed" || type=="tool.failed") {
+      auto summary=p;if(summary.contains("result") && summary["result"].is_object())for(auto key:{"stdout","stderr","content"})if(summary["result"].contains(key) && summary["result"][key].is_string())summary["result"][key]=utf8_excerpt(summary["result"][key].get<std::string>(),4096);
+      pending.emplace_back(type,std::move(summary));return;
+    }
+    if(type=="tool.started") {
+      auto summary=p;auto args=p.value("arguments",Json::object());summary["arguments"]=Json::object();
+      for(auto key:{"path","command"})if(args.contains(key) && args[key].is_string())summary["arguments"][key]=utf8_excerpt(args[key].get<std::string>(),16384);
+      pending.emplace_back(type,std::move(summary));return;
+    }
+    if(type=="tool.output") {
+      auto text=p.value("content","");
+      if(output_bytes+text.size()>512*1024){if(!output_overflow){pending.emplace_back("notification",Json{{"description","Live output display truncated while rendering was paused; captured output remains in tool history."}});output_overflow=true;}return;}
+      output_bytes+=text.size();
+      for(auto it=pending.rbegin();it!=pending.rend();++it)if(it->first==type && it->second.value("run_id",0LL)==p.value("run_id",0LL) && it->second.value("stream","")==p.value("stream","")){it->second["content"]=it->second.value("content","")+text;return;}
+    }
     if(type=="context.usage" || type=="progress.updated" || type=="operation.preparing") {
       for(auto it=pending.rbegin();it!=pending.rend();++it)if(it->first==type && (type!="progress.updated" || it->second.value("message_id","")==p.value("message_id",""))) {it->second=p;return;}
-    }
-    if(type=="tool.output" && !pending.empty() && pending.back().first==type && pending.back().second.value("run_id",0LL)==p.value("run_id",0LL) && pending.back().second.value("stream","")==p.value("stream","")) {
-      auto text=pending.back().second.value("content","");text+=p.value("content","");pending.back().second["content"]=std::move(text);return;
     }
     pending.emplace_back(type,p); };
   std::jthread worker;
@@ -458,10 +477,16 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
   bool selecting=false,redraw=true;
   int previous_height=0,previous_width=0;
   std::vector<std::pair<int,std::string>> targets;
+  auto activate=[&](const std::string& target){
+    for(auto& entry:view.entries)if(entry.diff && target=="diff:"+entry.message_id && !entry.diff_loaded && entry.diff_event) {
+      try{if(live_submit)live_submit("/diff "+std::to_string(entry.diff_event),enqueue);else submit("/diff "+std::to_string(entry.diff_event),enqueue);}catch(const std::exception& e){view.event("command.error",{{"message",e.what()}});}return;
+    }
+    view.activate(target);
+  };
   auto respond=[&](bool accepted){try{approve({{"type","approval"},{"request_id",view.approval_request_id},{"payload",{{"approval_id",view.approval_id},{"approved",accepted}}}});view.approval_id.clear();view.approval=Json::object();view.phase="act";input.clear();cursor=0;}catch(const std::exception& e){view.event("error",{{"message",e.what()}});}};
   while (action == ChatAction::Continue) {
     std::vector<std::pair<std::string,Json>> events;
-    if(!selecting){std::lock_guard lock(mutex);events.swap(pending);}
+    if(!selecting){std::lock_guard lock(mutex);events.swap(pending);output_bytes=0;output_overflow=false;}
     for (auto& [type,p] : events) view.event(type,p);
     winsize size{};if(ioctl(STDOUT_FILENO,TIOCGWINSZ,&size)==0 && size.ws_row && size.ws_col && (getmaxy(stdscr)!=size.ws_row || getmaxx(stdscr)!=size.ws_col))resizeterm(size.ws_row,size.ws_col);
     int height=getmaxy(stdscr),width=getmaxx(stdscr);bool working=busy || view.activity_started;
@@ -502,7 +527,7 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
       if (key == KEY_MOUSE) {
         MEVENT mouse{};
         if (getmouse(&mouse) != ERR) {
-          if(!selecting && (mouse.bstate & BUTTON1_CLICKED))for(auto& [row,target]:targets)if(row==mouse.y){if(target=="approval:yes")respond(true);else if(target=="approval:no")respond(false);else view.activate(target);redraw=true;break;}
+          if(!selecting && (mouse.bstate & BUTTON1_CLICKED))for(auto& [row,target]:targets)if(row==mouse.y){if(target=="approval:yes")respond(true);else if(target=="approval:no")respond(false);else activate(target);redraw=true;break;}
           bool popup=!view.approval_id.empty() && view.approval.value("kind","")=="edit";
           if(popup) {if(view.approval_expanded){if(mouse.bstate & BUTTON4_PRESSED)view.approval_scroll=view.approval_scroll>3?view.approval_scroll-3:0;if(mouse.bstate & BUTTON5_PRESSED)view.approval_scroll+=3;}}
           else {if(mouse.bstate & BUTTON4_PRESSED)scroll+=3;if(mouse.bstate & BUTTON5_PRESSED)scroll=scroll>3?scroll-3:0;}
