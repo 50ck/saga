@@ -15,7 +15,7 @@ using Json = nlohmann::json;
 namespace fs = std::filesystem;
 using Id = std::int64_t;
 using Emit = std::function<void(const std::string&, const Json&)>;
-inline constexpr int runtime_context_revision=2;
+inline constexpr int runtime_context_revision=3;
 Id now();
 std::string uuid();
 bool valid_uuid(std::string_view value);

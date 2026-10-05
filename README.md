@@ -98,7 +98,7 @@ model, increase this advanced setting in `config.toml`; backend setup preserves 
 | --- | --- |
 | `/help`, `/help COMMAND` | Descriptions grouped by section, or detailed examples |
 | `/status` | Identity, SOUL path, context progress, task, memory and permissions |
-| `/permissions`, `/permissions ask`, `/permissions always` | Select Ask always or Always approve for host execution |
+| `/permissions`, `/permissions 1`, `2`, `3`, `4` | Choose guarded host or unrestricted host, with or without approval |
 | `/compact` | Save typed cognition and a handoff, then rebuild working context |
 | `/new` | Close/consolidate this session and start another |
 | `/persona` | Close the session and return to the selector |
@@ -126,9 +126,20 @@ tendencies belong to the self-model. Seed creation and deliberate edits are
 preserved in the persona's event history.
 
 Project/artifact writes and sandboxed shell commands run automatically. Host shell
-commands ask approval by default. `/permissions always` persists automatic host
-approval for that persona; `/permissions ask` restores the default. Persistent
-macros containing host actions follow the same policy; sandbox macros are automatic.
+permissions are persisted separately for each persona:
+
+| Option | Alias | Host behavior |
+| --- | --- | --- |
+| 1 (default) | `/permissions ask` | Ask before each guarded host operation |
+| 2 | `/permissions always` | Automatically approve guarded host operations |
+| 3 | `/permissions host-ask` | Ask before each unrestricted host operation |
+| 4 | `/permissions host-always` | Unrestricted host without approval (**DANGEROUS**) |
+
+Use `/permissions 3` or select **3** in the menu to approve sandbox actions
+automatically and ask before real host commands. Option **4** runs those host
+commands automatically. Existing `ask`/`always` settings keep their guarded behavior;
+they are never silently upgraded to unrestricted access. Persistent macros
+containing host actions follow the same policy; sandbox macros are automatic.
 Non-interactive batch clients decline pending
 approval requests. `saga --batch UUID` is an
 explicit selection for scripts; `--json` prints protocol events.
@@ -213,8 +224,8 @@ preserved in assistant history when supplied by the server. Server cache reuse
 still depends on its model, chat template and available cache checkpoints.
 Detected llama.cpp requests explicitly enable `cache_prompt` and
 `chat_template_kwargs.preserve_thinking` without disabling normal reasoning.
-The client checks the daemon's context revision at startup and reports when an
-older running daemon must be restarted to load these updates.
+The client checks the daemon's runtime revision at startup and reports when an
+older running daemon must be restarted to load context or permission updates.
 Each compaction displays
 `xN` in the status bar and `/status`, omitted before the first compaction.
 
@@ -244,13 +255,29 @@ project/artifact area, symlinks and hard links. The shell guard also rejects
 hard-linked workspaces. These boundaries are enforced independently of prompting.
 
 For desktop notifications, tmux, network access or host files, the model can request
-`shell_exec` with `execution="host"`. Approval runs a child process with the user's
-whitelisted desktop environment (including DISPLAY, DBus and XDG runtime settings).
-It retains mandatory guards on Saga configuration/data/state/runtime storage and
-`/proc`, closes inherited descriptors and keeps process/output limits. Host access
-can use existing unprotected directories; listing or creating files directly in
-ancestors of protected storage can remain restricted by Landlock. It is not an
-interactive terminal emulator. Backend credentials are never forwarded.
+`shell_exec` with `execution="host"`. The selected permission mode determines what
+host means. Options **1/2** use a whitelisted desktop environment and retain
+Landlock/seccomp guards on Saga storage and `/proc`. Because Landlock permissions
+are inherited through directories, creating files directly in an ancestor of Saga
+storage (often the home directory) can be denied even after approval. Changing
+approval policy alone does not remove those guards.
+
+Options **3/4** run a normal child process as the daemon's OS user, inheriting its
+environment plus the client's desktop settings. Saga adds no Landlock, seccomp,
+`no_new_privs` or sandbox resource limits. These commands can write directly in
+the home directory and access every file or process that user can access, including
+Saga configuration, credentials and other persona storage. OS-enforced persona
+isolation therefore applies only in guarded modes. The model is still instructed
+not to inspect other identities or modify SOUL automatically.
+
+All shell tools capture output, close inherited descriptors, use noninteractive
+stdin, enforce the requested timeout (up to 120 seconds) and clean up their process
+group. Host mode is not an interactive terminal emulator and cannot remove
+restrictions inherited from the OS or an outer container. `sudo` follows the host's
+normal policy and can require an interactive terminal/password. Unrestricted host
+does not automatically grant root privileges. Backend credentials are stripped
+from guarded command environments; unrestricted execution inherits the host
+environment as requested.
 
 File writes track artifacts directly. Shell actions observe created/modified
 project files and removals. Tracking excludes `.git`, `build`, `node_modules` and

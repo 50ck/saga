@@ -134,9 +134,11 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   else if (name == "fact" || name == "correct") args = Json::parse(arg);
   else if (name == "permissions" && !arg.empty()) {
     auto value=lower(arg);
-    if (value == "ask" || value == "ask always" || value == "ask_always") args["mode"]="ask_always";
-    else if (value == "always" || value == "always approve" || value == "always_approve") args["mode"]="always_approve";
-    else throw std::runtime_error("Use /permissions ask or /permissions always");
+    if (value == "1" || value == "ask" || value == "ask always" || value == "ask_always") args["mode"]="ask_always";
+    else if (value == "2" || value == "always" || value == "always approve" || value == "always_approve") args["mode"]="always_approve";
+    else if (value == "3" || value == "host-ask" || value == "host_ask") args["mode"]="host_ask";
+    else if (value == "4" || value == "host-always" || value == "host_always") args["mode"]="host_always";
+    else throw std::runtime_error("Use /permissions 1, 2, 3 or 4 (ask, always, host-ask, host-always)");
   }
   auto result = client.request("command",{{"name",name},{"arguments",args}},callback);
   if (name == "status" || name == "compact") {
@@ -145,7 +147,10 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
     else if (!client.json_output) std::cout << display_text(format_agent_status(status)) << '\n';
   } else if (name == "permissions") {
     if (callback) { callback(arg.empty() ? "permissions.menu" : "permissions.changed",result); if (!arg.empty()) callback("result","Host permissions: "+result["label"].get<std::string>()); }
-    else if (!client.json_output) std::cout << "Host permissions: " << result["label"].get<std::string>() << "\n/permissions ask — Ask always\n/permissions always — Always approve\n";
+    else if (!client.json_output) std::cout << "Host permissions: " << result["label"].get<std::string>()
+      << "\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations."
+      << "\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS)."
+      << "\nUse /permissions NUMBER. Sandbox actions stay automatic. Unrestricted host uses your OS user privileges; Saga storage is also accessible.\n";
   } else if (callback) callback("result",result);
   else if (!client.json_output) std::cout << display_text(result.dump(2)) << '\n';
   return Action::Continue;
@@ -200,7 +205,7 @@ int main(int argc,char** argv) {
       client.request(request.at("type"),request.value("payload",Json::object())); return 0;
     }
     if(client.request("ping").value("context_revision",0)<runtime_context_revision)
-      throw std::runtime_error("The running sagad predates this client's context updates. Close existing Saga sessions, run 'pkill -TERM -x sagad', then reopen Saga to load the updated daemon.");
+      throw std::runtime_error("The running sagad predates this client's runtime updates. Close existing Saga sessions, run 'pkill -TERM -x sagad', then reopen Saga to load the updated daemon.");
     auto cwd = fs::current_path();
     while (true) {
       Json metadata;

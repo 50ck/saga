@@ -12,7 +12,7 @@ struct ProcessResult {
 };
 bool shell_sandbox_available();
 ProcessResult run_process(const fs::path& cwd, const fs::path& scratch, const std::vector<std::string>& argv, int timeout_seconds = 30,
-                          bool host = false,const std::vector<fs::path>& private_roots = {},const Json& environment = Json::object());
+                          bool host = false,const std::vector<fs::path>& private_roots = {},const Json& environment = Json::object(),bool unrestricted = false);
 using Approve = std::function<bool(const std::string&,const Json&)>;
 class Tools {
   PersonaContext& p_;

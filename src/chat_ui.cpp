@@ -37,7 +37,7 @@ std::string command_help(std::string_view query) {
     {"compact","","Work and continuity","Persist a cognitive checkpoint and handoff, then rebuild working context. Original messages, events and typed memories stay available.","/compact\n/status"},
     {"fact","JSON","Knowledge edits","Record a user-supplied fact with provenance. Required JSON fields: subject, predicate and object. Optional scope: global or project.","/fact {\"subject\":\"machine\",\"predicate\":\"OS\",\"object\":\"FreeBSD\"}"},
     {"correct","JSON","Knowledge edits","Correct a fact using the same JSON fields as /fact. Keep the old validity interval and preserve correction history.","/correct {\"subject\":\"machine\",\"predicate\":\"OS\",\"object\":\"Void Linux\"}"},
-    {"permissions","[ask|always]","Runtime and permissions","Set host execution policy for this persona. Ask always is the default; Always approve grants automatic host execution as your user. Sandboxed actions remain automatic and private Saga storage stays protected.","/permissions\n/permissions ask\n/permissions always"},
+    {"permissions","[1|2|3|4]","Runtime and permissions","Set permissions for this persona. 1 asks before guarded host operations (default); 2 automatically approves guarded host. 3 asks before unrestricted host operations; 4 allows unrestricted host without approval (DANGEROUS). Sandbox actions stay automatic. Unrestricted host removes Saga's filesystem, seccomp and no_new_privs restrictions; it can access private Saga storage and uses your OS user privileges. Aliases: ask, always, host-ask, host-always.","/permissions\n/permissions ask\n/permissions always\n/permissions 3\n/permissions 4\n/permissions host-ask\n/permissions host-always"},
     {"status","","Runtime and permissions","Show the agent's name, SOUL path, mode, task, context progress, compaction count, permission mode and memory counts. During generation, context usage is approximate.","/status"},
     {"help","[command]","Runtime and permissions","Show commands by section, or detailed help and examples for one command. /quit is an alias for /exit.","/help\n/help permissions\n/help /memory"}
   };
@@ -148,7 +148,7 @@ void ChatView::event(const std::string& type,const Json& p) {
     if (p.contains("usage") && !p["usage"].empty()) event("context.usage",p["usage"]);
   } else if (type == "permissions.menu") {
     permission_menu=true; agent_status["permissions"]=p;
-    entries.push_back({"Saga","Host execution permissions (this persona)\nCurrent: "+p.value("label","")+"\n\n1. Ask always — approve each host command.\n2. Always approve — run host commands automatically.\n\nHost commands use your desktop session and user privileges.\nChoose 1 or 2 and press Enter. Sandbox actions stay automatic."});
+    entries.push_back({"Saga","Execution permissions (this persona)\nCurrent: "+p.value("label","")+"\n\nGuarded host:\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations.\n\nUnrestricted host:\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS).\n\nUnrestricted host runs as your OS user without Saga isolation, including access to private Saga storage. System/container restrictions still apply.\nChoose 1, 2, 3 or 4 and press Enter. Sandbox actions stay automatic."});
   } else if (type == "permissions.changed") { agent_status["permissions"]=p; permission_menu=false;
   } else if (type == "notification") entries.push_back({"Saga",p.value("description","")});
   else if (type == "error") { approval_id.clear(); phase="respond";generating=false; if (!partial.empty()) entries.push_back({name,std::exchange(partial,""),false,0,0,{},true}); entries.push_back({"Saga",p.value("message","Runtime error")}); }
@@ -391,7 +391,7 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
       continue;
     }
     if (busy) continue;
-    if (view.permission_menu && (text == "1" || text == "2")) text=text == "1" ? "/permissions ask" : "/permissions always";
+    if (view.permission_menu && (text == "1" || text == "2" || text == "3" || text == "4")) text="/permissions "+text;
     input.clear(); cursor=0; scroll=0;
     if (text == "/exit" || text == "/quit") { action=ChatAction::Exit; continue; }
     if (text == "/persona") { action=ChatAction::Selector; continue; }

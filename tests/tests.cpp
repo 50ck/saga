@@ -3,6 +3,7 @@
 #include <saga/ipc.hpp>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
 #include <unistd.h>
 using namespace saga;
 namespace {
@@ -153,6 +154,46 @@ void persistence() {
   rejects([&]{ f.paths.persona("../../escape"); });
   struct stat st{}; stat((f.paths.data / "registry.db").c_str(),&st); CHECK((st.st_mode & 0777) == 0600);
 }
+void host_permissions() {
+  Fixture f; Registry registry(f.paths); auto meta=registry.create(); auto p=f.persona(meta);
+  p->project=p->db->exec("INSERT INTO projects(name,root_path,created_at,last_seen_at) VALUES('host test',?,?,?)",{f.project.string(),now(),now()});
+  p->session=p->db->exec("INSERT INTO sessions(started_at,project_id,status) VALUES(?,?,'active')",{now(),p->project});
+  Memory memory(*p,f.config()); int approvals=0; bool approve=false;
+  Tools policy(*p,memory,[&](auto&,auto&){ ++approvals; return approve; });
+  auto shell=[&](std::string command,std::string execution="host") {
+    return policy.execute("shell_exec",{{"command",command},{"execution",execution}});
+  };
+  auto file=f.root/"host-created.html";
+  auto create="printf '<h1>Host write</h1>' > '"+file.string()+"'";
+  CHECK(policy.permissions()["mode"] == "ask_always");
+  rejects([&]{ policy.permissions("unknown"); });
+  CHECK(policy.permissions("host_ask")["host_restrictions"] == "none");
+  CHECK(shell(create).contains("error")); CHECK(approvals == 1); CHECK(!fs::exists(file));
+  approve=true;
+  auto result=shell(create); CHECK(result["exit_code"] == 0); CHECK(approvals == 2);
+  CHECK(result["host_restrictions"] == "none"); CHECK(read_file(file) == "<h1>Host write</h1>");
+  CHECK(policy.permissions("host_always")["approval_required"] == false);
+  CHECK(shell("printf automatic >> '"+file.string()+"'")["exit_code"] == 0); CHECK(approvals == 2);
+  // Unrestricted execution inherits the host's setting; Saga must not add no_new_privs.
+  auto nnp=prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0); CHECK(nnp >= 0);
+  result=shell("cat /proc/self/status"); CHECK(result["exit_code"] == 0);
+  CHECK(result["stdout"].get<std::string>().find("NoNewPrivs:\t"+std::to_string(nnp)) != std::string::npos);
+  setenv("SAGA_HOST_FIXTURE","inherited-environment",1);
+  result=shell("printf '%s' \"$SAGA_HOST_FIXTURE\""); unsetenv("SAGA_HOST_FIXTURE");
+  CHECK(result["stdout"] == "inherited-environment"); CHECK(approvals == 2);
+  // These are synthetic credentials: dangerous mode really removes private-storage guards.
+  atomic_write(f.paths.runtime/"control.token","synthetic-private-token");
+  result=shell("cat '"+(f.paths.runtime/"control.token").string()+"'"); CHECK(result["stdout"] == "synthetic-private-token");
+  CHECK(p->db->query("SELECT value FROM runtime_settings WHERE key='host_permissions'")[0]["value"] == "host_always");
+  if (shell_sandbox_available()) {
+    CHECK(shell("cat '"+file.string()+"'","sandbox")["exit_code"] != 0); CHECK(approvals == 2);
+    fs::remove(file); policy.permissions("always_approve");
+    CHECK(shell(create)["exit_code"] != 0); CHECK(!fs::exists(file)); CHECK(approvals == 2);
+  }
+  auto other=f.persona(registry.create()); Memory other_memory(*other,f.config());
+  Tools other_tools(*other,other_memory,[](auto&,auto&){ return false; });
+  CHECK(other_tools.permissions()["mode"] == "ask_always");
+}
 void gates_and_praxis() {
   Fixture f; Registry registry(f.paths); auto p = f.persona(registry.create());
   auto db = p->db.get(); p->project = db->exec("INSERT INTO projects(name,root_path,created_at,last_seen_at) VALUES('test',?,?,?)",{f.project.string(),now(),now()});
@@ -295,7 +336,7 @@ void config_and_ipc() {
 }
 }
 int main() {
-  std::vector<std::pair<std::string,std::function<void()>>> tests = {{"streaming",streaming},{"capability probe and progress",capability_probe},{"persistence and isolation",persistence},{"tools, proof gates, praxis and context",gates_and_praxis},{"configuration and IPC",config_and_ipc}};
+  std::vector<std::pair<std::string,std::function<void()>>> tests = {{"streaming",streaming},{"capability probe and progress",capability_probe},{"persistence and isolation",persistence},{"guarded and unrestricted host permissions",host_permissions},{"tools, proof gates, praxis and context",gates_and_praxis},{"configuration and IPC",config_and_ipc}};
   int failed = 0;
   for (auto& [name,test] : tests) { try { test(); std::cout << "PASS " << name << '\n'; } catch (const std::exception& e) { ++failed; std::cerr << "FAIL " << name << ": " << e.what() << '\n'; } }
   return failed ? 1 : 0;

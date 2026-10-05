@@ -24,14 +24,18 @@ Json ProcessResult::json() const { return {{"exit_code",exit_code},{"timed_out",
   {"stdout_size",stdout_size},{"stderr_size",stderr_size},{"stdout_truncated",stdout_truncated},{"stderr_truncated",stderr_truncated}}; }
 Json Tools::permissions(const std::optional<std::string>& mode) {
   if (mode) {
-    if (*mode != "ask_always" && *mode != "always_approve") throw std::runtime_error("Choose Ask always or Always approve");
+    if (*mode != "ask_always" && *mode != "always_approve" && *mode != "host_ask" && *mode != "host_always")
+      throw std::runtime_error("Choose guarded host (ask/always) or unrestricted host (host-ask/host-always)");
     p_.db->transaction([&]{
       p_.db->exec("UPDATE runtime_settings SET value=?,updated_at=? WHERE key='host_permissions'",{*mode,now()});
       p_.db->event("permissions.user_changed",{{"host_execution",*mode}},p_.session);
     });
   }
-  auto value=p_.db->query("SELECT value FROM runtime_settings WHERE key='host_permissions'")[0]["value"];
-  return {{"mode",value},{"label",value == "always_approve" ? "Always approve" : "Ask always"},{"scope","persona"}};
+  auto value=p_.db->query("SELECT value FROM runtime_settings WHERE key='host_permissions'")[0]["value"].get<std::string>();
+  bool unrestricted=value == "host_ask" || value == "host_always";
+  bool automatic=value == "always_approve" || value == "host_always";
+  std::string label=value == "host_always" ? "Unrestricted host without approval (DANGEROUS)" : value == "host_ask" ? "Ask for unrestricted host operations" : automatic ? "Always approve guarded host" : "Ask for guarded host operations";
+  return {{"mode",value},{"label",label},{"scope","persona"},{"host_restrictions",unrestricted ? "none" : "private_storage"},{"approval_required",!automatic}};
 }
 bool shell_sandbox_available() {
 #ifdef __linux__
@@ -114,8 +118,10 @@ static bool restrict_child(const fs::path& cwd,const fs::path& scratch,bool host
   sock_fprog program{static_cast<unsigned short>(filter.size()),filter.data()};
   return prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,&program) == 0;
 }
-ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std::vector<std::string>& argv,int timeout,bool host,const std::vector<fs::path>& private_roots,const Json& environment) {
-  if (argv.empty() || !shell_sandbox_available()) throw std::runtime_error("Shell execution requires Linux Landlock ABI >= 3; file and cognitive tools remain available");
+ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std::vector<std::string>& argv,int timeout,bool host,const std::vector<fs::path>& private_roots,const Json& environment,bool unrestricted) {
+  if (unrestricted && !host) throw std::runtime_error("Unrestricted execution requires host mode");
+  if (argv.empty()) throw std::runtime_error("A process requires a command");
+  if (!unrestricted && !shell_sandbox_available()) throw std::runtime_error("Shell execution requires Linux Landlock ABI >= 3; unrestricted host execution remains available");
   private_dir(scratch);
   int out[2],err[2];
   if (pipe2(out,O_CLOEXEC) != 0) throw std::runtime_error("Cannot create process pipe");
@@ -127,17 +133,26 @@ ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std:
     dup2(out[1],STDOUT_FILENO); dup2(err[1],STDERR_FILENO);
     int null = open("/dev/null",O_RDONLY); if (null >= 0) { dup2(null,STDIN_FILENO); close(null); }
     syscall(SYS_close_range,3,~0U,0);
-    rlimit cpu{static_cast<rlim_t>(timeout+1),static_cast<rlim_t>(timeout+1)}; setrlimit(RLIMIT_CPU,&cpu);
-    rlimit files{128,128}; setrlimit(RLIMIT_NOFILE,&files);
-    rlimit size{64*1024*1024,64*1024*1024}; setrlimit(RLIMIT_FSIZE,&size);
-    rlimit core{0,0}; setrlimit(RLIMIT_CORE,&core);
+    if (!unrestricted) {
+      rlimit cpu{static_cast<rlim_t>(timeout+1),static_cast<rlim_t>(timeout+1)}; setrlimit(RLIMIT_CPU,&cpu);
+      rlimit files{128,128}; setrlimit(RLIMIT_NOFILE,&files);
+      rlimit size{64*1024*1024,64*1024*1024}; setrlimit(RLIMIT_FSIZE,&size);
+      rlimit core{0,0}; setrlimit(RLIMIT_CORE,&core);
+    }
     try {
-      if (chdir(cwd.c_str()) || !restrict_child(cwd,scratch,host,private_roots)) { const char* msg = "OS isolation unavailable; execution refused\n"; write(2,msg,strlen(msg)); _exit(126); }
+      if (chdir(cwd.c_str()) || (!unrestricted && !restrict_child(cwd,scratch,host,private_roots))) { const char* msg = "OS isolation unavailable; execution refused\n"; write(2,msg,strlen(msg)); _exit(126); }
     } catch (...) { const char* msg="Cannot establish private storage isolation\n"; write(2,msg,strlen(msg)); _exit(126); }
     std::vector<char*> args;
     for (auto& arg : argv) args.push_back(const_cast<char*>(arg.c_str()));
     args.push_back(nullptr);
     std::map<std::string,std::string> values{{"PATH","/usr/bin:/bin:/usr/sbin:/sbin"},{"LANG","C.UTF-8"},{"HOME",scratch.string()},{"TMPDIR",scratch.string()}};
+    if (unrestricted) {
+      values.clear();
+      for (char** item=::environ; *item; ++item) {
+        std::string variable(*item); auto equal=variable.find('=');
+        if (equal != std::string::npos) values[variable.substr(0,equal)]=variable.substr(equal+1);
+      }
+    }
     if (host) for (auto* key : {"PATH","LANG","LC_ALL","HOME","USER","SHELL","DISPLAY","WAYLAND_DISPLAY","DBUS_SESSION_BUS_ADDRESS","XDG_RUNTIME_DIR","XAUTHORITY","SSH_AUTH_SOCK"}) {
       if (const char* v=std::getenv(key)) values[key]=v;
       if (environment.contains(key) && environment[key].is_string()) values[key]=environment[key].get<std::string>();
@@ -190,7 +205,7 @@ Json Tools::definitions() {
   add("observe_environment","Safely inspect the current project, git state, clock and machine",Json::object(),{});
   add("file_read","Read a file in the active project or this identity's artifacts",{{"path",str()}},{"path"});
   add("file_write","Write a project/artifact file without approval and track its history",{{"path",str()},{"content",str()},{"description",str()}},{"path","content","description"});
-  add("shell_exec","Run a shell command. execution=sandbox (default) is automatic, project/scratch only, no network; use execution=host for desktop DBus/notify-send, tmux, network or files outside the project. Host access asks approval unless the user set Always approve. Private Saga storage stays inaccessible. timeout <=120 seconds; no detached processes.",{{"command",str()},{"timeout_seconds",integer()},{"execution",{{"type","string"},{"enum",{"sandbox","host"}}}}},{"command"});
+  add("shell_exec","Run a shell command. execution=sandbox (default) is automatic, project/scratch only, no network. execution=host follows /permissions: 1/2 use private-storage guards; 3/4 run as the daemon's OS user without Saga isolation, asking approval only in 3. Use host for desktop DBus/notify-send, tmux, network or files outside the project. Unrestricted host can access all files and processes accessible to that user. timeout <=120 seconds; no detached processes.",{{"command",str()},{"timeout_seconds",integer()},{"execution",{{"type","string"},{"enum",{"sandbox","host"}}}}},{"command"});
   add("task_create","Create an explicit task and required proof obligations",{{"title",str()},{"objective",str()},{"risk",{{"type","string"},{"enum",{"low","medium","high"}}}},{"domain",str()},{"checks",{{"type","array"},{"items",str()}}}},{"title","objective","risk","checks"});
   add("task_update","Select or update a task; completion is gated on evidence and required checks",{{"id",integer()},{"status",{{"type","string"},{"enum",{"active","blocked","verifying","completed","abandoned"}}}}},{"id","status"});
   add("task_add_check","Refine the current task's definition of done with a specific proof obligation",{{"description",str()}},{"description"});
@@ -359,8 +374,9 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
   }
   if (name == "shell_exec") {
     bool host=a.value("execution","sandbox") == "host";
-    if (host && permissions()["mode"] != "always_approve" && !approve_(name,a)) return {{"error","User declined host execution"}};
-    if (host) db->event("host.action_authorized",{{"tool",name},{"arguments",a},{"mode",permissions()["mode"]}},p_.session,p_.task);
+    auto policy=permissions(); bool unrestricted=host && policy["host_restrictions"] == "none";
+    if (host && policy["approval_required"].get<bool>() && !approve_(name,a)) return {{"error","User declined host execution"}};
+    if (host) db->event("host.action_authorized",{{"tool",name},{"arguments",a},{"mode",policy["mode"]},{"unrestricted",unrestricted}},p_.session,p_.task);
     using Snapshot = std::map<fs::path,std::pair<fs::file_time_type,std::uintmax_t>>;
     auto snapshot = [&](bool security_check) {
       Snapshot files;
@@ -377,10 +393,10 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
       }
       return files;
     };
-    auto before = snapshot(true);
+    auto before = snapshot(!unrestricted);
     auto scratch=host ? fs::temp_directory_path()/("saga-host-"+uuid()) : p_.directory/"cache/scratch";
     struct Cleanup { fs::path path; ~Cleanup() { if (!path.empty()) { std::error_code ec; fs::remove_all(path,ec); } } } cleanup{host ? scratch : fs::path()};
-    auto r = run_process(p_.project_root,scratch,{"/bin/sh","-c",a["command"]},std::clamp(a.value("timeout_seconds",30),1,120),host,p_.private_roots,p_.host_environment);
+    auto r = run_process(p_.project_root,scratch,{"/bin/sh","-c",a["command"]},std::clamp(a.value("timeout_seconds",30),1,120),host,p_.private_roots,p_.host_environment,unrestricted);
     auto after = snapshot(false); size_t tracked = 0;
     auto task = db->query("SELECT title FROM tasks WHERE id=?",{p_.task});
     auto description = task.empty() ? "File observed after shell action" : task[0]["title"].get<std::string>();
@@ -399,7 +415,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
       if (!existing.empty()) event("artifact.removed",{{"id",existing[0]["id"]},{"path",path.string()}});
       (void)state;
     }
-    auto result = r.json(); result["execution"] = host ? "host" : "sandbox"; result["artifacts_recorded"] = tracked; result["artifact_tracking_limited"] = before.size() >= 10000 || after.size() >= 10000 || tracked >= 256;
+    auto result = r.json(); result["execution"] = host ? "host" : "sandbox"; result["host_restrictions"] = host ? policy["host_restrictions"] : Json("sandbox"); result["artifacts_recorded"] = tracked; result["artifact_tracking_limited"] = before.size() >= 10000 || after.size() >= 10000 || tracked >= 256;
     return result;
   }
   if (name == "task_create") {
@@ -562,7 +578,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if (a["steps"].empty() || a["steps"].size() > 16) throw std::runtime_error("Skill needs 1–16 steps");
     for (auto& step : a["steps"]) if (step["tool"] != "shell_exec" && step["tool"] != "file_read" && step["tool"] != "file_write") throw std::runtime_error("Invalid skill action");
     bool host=std::any_of(a["steps"].begin(),a["steps"].end(),[](const Json& step){return step["tool"]=="shell_exec" && step["arguments"].value("execution","sandbox")=="host";});
-    if (host && permissions()["mode"]!="always_approve" && !approve_(name,a)) return {{"error","User declined persistent host skill"}};
+    if (host && permissions()["approval_required"].get<bool>() && !approve_(name,a)) return {{"error","User declined persistent host skill"}};
     auto ev = event("skill.compiled",a);
     auto id = db->exec("INSERT INTO skills(praxis_id,name,workflow_json,source_event_id,created_at) VALUES(?,?,?,?,?)",{a["praxis_id"],a["name"],a["steps"].dump(),ev,now()}); return {{"id",id}};
   }

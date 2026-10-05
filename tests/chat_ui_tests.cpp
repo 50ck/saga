@@ -87,6 +87,11 @@ int main(int argc,char** argv) {
     CHECK(view.approval_id == "nonce" && view.approval_request_id == "request");
     view.event("session.reset",Json::object()); CHECK(view.entries.empty() && view.tokens == 0);
     auto detailed=command_help("/permissions"); CHECK(detailed.find("Examples:") != std::string::npos && detailed.find("/permissions always") != std::string::npos);
+    CHECK(detailed.find("/permissions 3") != std::string::npos && detailed.find("/permissions 4") != std::string::npos && detailed.find("DANGEROUS") != std::string::npos);
+    view.event("permissions.menu",{{"mode","host_ask"},{"label","Ask for unrestricted host operations"}});
+    CHECK(view.permission_menu && view.entries.back().text.find("3. Sandbox automatic") != std::string::npos && view.entries.back().text.find("4. Allow unrestricted") != std::string::npos);
+    view.event("permissions.changed",{{"mode","host_always"},{"label","Unrestricted host without approval (DANGEROUS)"}});
+    CHECK(!view.permission_menu && view.agent_status["permissions"]["mode"] == "host_always");
     CHECK(command_help().find("Memory and knowledge:") != std::string::npos);
     view.event("context.usage",{{"used_tokens",22700},{"input_tokens",21900},{"output_tokens",800},{"context_length",65536},{"compactions",2},{"approximate",true}});
     CHECK(view.tokens == 22700 && view.compactions == 2); CHECK(view.report().find("x2") != std::string::npos);

@@ -205,7 +205,10 @@ void end_to_end(MockModel& mock,const std::string& daemon,const std::string& cli
   again.command("new"); CHECK(again.command("soul")["content"]=="My core identity A."); again.request("session.close");
   int pipe_fd[2]; CHECK(pipe(pipe_fd)==0); pid_t cli=fork(); CHECK(cli>=0);
   if (!cli) { chdir(env.project.c_str()); dup2(pipe_fd[0],0); close(pipe_fd[0]); close(pipe_fd[1]); int out=open((env.root/"cli.out").c_str(),O_CREAT | O_WRONLY | O_TRUNC,0600); dup2(out,1); dup2(out,2); close(out); auto id=a["uuid"].get<std::string>(); execl(client.c_str(),client.c_str(),"--batch",id.c_str(),"--no-tui",static_cast<char*>(nullptr)); _exit(127); }
-  close(pipe_fd[0]); const char* input="hello\n/journal\n/exit\n"; CHECK(write(pipe_fd[1],input,strlen(input))>0); close(pipe_fd[1]); int status; CHECK(waitpid(cli,&status,0)==cli); CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0); CHECK(read_file(env.root/"cli.out").find("Hello from the mock")!=std::string::npos);
+  close(pipe_fd[0]); const char* input="/permissions 3\n/status\n/permissions 4\n/status\n/permissions ask\nhello\n/journal\n/exit\n"; CHECK(write(pipe_fd[1],input,strlen(input))>0); close(pipe_fd[1]); int status; CHECK(waitpid(cli,&status,0)==cli); CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0);
+  auto cli_output=read_file(env.root/"cli.out"); CHECK(cli_output.find("Hello from the mock")!=std::string::npos);
+  CHECK(cli_output.find("Ask for unrestricted host operations")!=std::string::npos);
+  CHECK(cli_output.find("Unrestricted host without approval (DANGEROUS)")!=std::string::npos);
   bool saw_no_key=false; for (auto& request:mock.requests()) if (request["headers"].get<std::string>().find("Authorization:")==std::string::npos) saw_no_key=true; CHECK(saw_no_key);
 }
 }
