@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr const char* saga_schema = R"SAGASQL(@SAGA_SCHEMA@)SAGASQL";

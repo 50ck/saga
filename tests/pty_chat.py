@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Optional development check: real ncurses PTY, no live model or daemon needed."""
+import fcntl
+import os
+import pty
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+
+binary = sys.argv[1] if len(sys.argv) > 1 else './build/saga_chat_ui_tests'
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ.update(TERM='xterm-256color', LANG='C.UTF-8', LINES='10', COLUMNS='30')
+    os.execv(binary, [binary, '--demo'])
+
+output = bytearray()
+def collect(seconds):
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        ready, _, _ = select.select([fd], [], [], min(.05, max(0, until-time.monotonic())))
+        if ready:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output.extend(chunk)
+
+def resize(rows, cols):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+    os.kill(pid, signal.SIGWINCH)
+
+try:
+    resize(28, 90)
+    collect(.4)
+    assert b'Bold' in output and b'**Bold**' not in output
+    assert b'\x1b[3m' in output, 'italic attribute not emitted'
+    assert b'48;5;236m' in output, 'inline code background not emitted'
+    os.write(fd, 'hola 東京\r'.encode())
+    collect(.6)
+    assert b'Awaiting approval' in output
+    assert b'38;5;220m' in output, 'approval border is not yellow'
+    assert b'38;5;67m' in output, 'shell prompt is not muted blue'
+    os.write(fd, b'/help permissions\r')
+    collect(.2)
+    assert b'Examples:' in output
+    assert b'**/permissions' not in output and b'```bash' not in output
+    assert b'38;5;73m' in output, 'help command accent is missing'
+    assert b'38;5;250m' in output, 'help description gray is missing'
+    os.write(fd, b'/status\r')
+    collect(.2)
+    assert b'not available' in output, 'local status did not render while approval was pending'
+    before_resize=len(output)
+    resize(7, 12)
+    collect(.2)
+    resize(34, 110)
+    collect(.2)
+    assert b'\x1b[2J' in output[before_resize:], 'resize did not force a full screen repaint'
+    os.write(fd, b'y\r')
+    collect(.8)
+    assert b'Approved.' in output
+    assert b'21.9K/65.5K' in output
+    assert b'All done.' in output and b'**All done.**' not in output
+    os.write(fd, b'\x1b[5~\x1b[6~')
+    collect(.2)
+    os.write(fd, b'/exit\r')
+    collect(.4)
+    _, status = os.waitpid(pid, 0)
+    pid = 0
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert b'NCURSES_EXIT_OK' in output
+    print('PASS real PTY: Markdown styles, colors, Unicode, approval Enter, help/status, resize and scrolling')
+finally:
+    if pid:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)
+
+# Check SGR wheel events, matching the protocol enabled for xterm-256color.
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ.update(TERM='xterm-256color', LANG='C.UTF-8')
+    os.execv(binary, [binary, '--mouse-demo'])
+output.clear()
+try:
+    resize(28, 90)
+    collect(.4)
+    assert b'HISTORY_LATEST' in output and b'HISTORY_OLDEST' not in output
+    assert b'1000h' in output, 'terminal mouse reporting was not enabled'
+    os.write(fd, b'pending draft')
+    os.write(fd, b'\x1b[<64;5;3M' * 30)
+    collect(.4)
+    before_resize = len(output)
+    resize(29, 90)
+    collect(.2)
+    top = output[before_resize:]
+    assert b'HISTORY_OLDEST' in top and b'HISTORY_LATEST' not in top
+    assert b'pending draft' in top and b'0.0K/65.5K' in top, 'wheel moved or cleared the footer/input'
+    os.write(fd, b'\x1b[<65;5;3M' * 30)
+    collect(.4)
+    before_resize = len(output)
+    resize(28, 90)
+    collect(.2)
+    bottom = output[before_resize:]
+    assert b'HISTORY_LATEST' in bottom and b'HISTORY_OLDEST' not in bottom
+    assert b'pending draft' in bottom and b'0.0K/65.5K' in bottom
+    os.write(fd, b'\x15background\r')
+    collect(.1)
+    os.write(fd, b'copy draft\x1bOQ')
+    before_selection=len(output)
+    collect(.15)
+    assert b'1000l' in output[before_selection:] and b'Select text' in output[before_selection:]
+    paused=len(output)
+    collect(.6)
+    assert len(output)==paused, 'selection mode repainted while an update arrived'
+    resize(29, 90)
+    collect(.2)
+    assert b'copy draft' in output[paused:] and b'COPY_QUEUED_UPDATE' not in output[paused:]
+    before_resume=len(output)
+    os.write(fd,b'\x1bOQ')
+    collect(.3)
+    assert b'1000h' in output[before_resume:] and b'COPY_QUEUED_UPDATE' in output[before_resume:]
+    resize(28,90)
+    collect(.2)
+    assert b'copy draft' in output[before_resume:]
+    os.write(fd, b'\x15/exit\r')
+    collect(.4)
+    _, status = os.waitpid(pid, 0)
+    pid = 0
+    assert os.waitstatus_to_exitcode(status) == 0 and b'MOUSE_EXIT_OK' in output
+    assert b'1000l' in output, 'terminal mouse reporting was not disabled on exit'
+    print('PASS real PTY: mouse wheel, selection mode, paused repaint, queued updates and preserved footer/input')
+finally:
+    if pid:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    os.close(fd)

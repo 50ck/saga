@@ -1,0 +1,134 @@
+#include "check.hpp"
+#include <saga/chat_ui.hpp>
+#include <algorithm>
+#include <clocale>
+#include <atomic>
+#include <iostream>
+#include <thread>
+using namespace saga;
+int main(int argc,char** argv) {
+  std::setlocale(LC_ALL,"C.UTF-8");
+  try {
+    ChatView view; view.name="Persona 東京"; view.model="Long-local-model-name-for-status-testing"; view.context=65536;
+    if (argc == 2 && std::string(argv[1]) == "--mouse-demo") {
+      std::string history="HISTORY_OLDEST\n";
+      for(int i=0;i<60;++i) history += "History line "+std::to_string(i)+"\n";
+      history += "HISTORY_LATEST";
+      view.entries.push_back({view.name,history});
+      auto action=chat_ui(view,[](const std::string& input,Emit emit){
+        CHECK(input=="background");std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        emit("notification",{{"description","COPY_QUEUED_UPDATE"}});
+      },
+        []{std::this_thread::sleep_for(std::chrono::milliseconds(10));return std::optional<Json>{};},
+        [](const Json&){CHECK(false);});
+      CHECK(action==ChatAction::Exit);std::cout<<"MOUSE_EXIT_OK\n";return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--demo") {
+      view.entries.push_back({view.name,"Hello! **Bold** *italic* ~~strike~~ `inline code`. Resize the terminal while I respond.",false,0,0,{},true});
+      std::atomic_bool accepted=false;
+      auto action=chat_ui(view,[&](const std::string&,Emit emit){
+        emit("assistant.delta",{{"content","Checking the terminal..."}});
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        emit("tool.started",{{"run_id",1},{"tool","shell_exec"},{"arguments",{{"command","tmux capture-pane -t 0:0 -p -S -300"}}}});
+        emit("approval.requested",{{"approval_id","demo-nonce"},{"_request_id","demo-request"},{"tool","shell_exec"},{"arguments",{{"command","tmux capture-pane -t 0:0 -p -S -300"}}}});
+        for (int i=0; i<100 && !accepted; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        CHECK(accepted);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        emit("tool.completed",{{"run_id",1},{"tool","shell_exec"},{"result",Json::object()}});
+        emit("context.usage",{{"input_tokens",21900},{"context_length",65536},{"approximate",true},{"active_task",Json::array({{{"title","Inspect tmux"}}})}});
+        emit("approval.resolved",{{"approved",true},{"approval_id","demo-nonce"}});
+        emit("assistant.completed",{{"content","Terminal checked. Unicode: español, 東京.\n**All done.** `inline code`"}});
+      },[]{ std::this_thread::sleep_for(std::chrono::milliseconds(10)); return std::optional<Json>{}; },[&](const Json& frame){
+        CHECK(frame["type"] == "approval" && frame["request_id"] == "demo-request");
+        CHECK(frame["payload"]["approval_id"] == "demo-nonce" && frame["payload"]["approved"] == true);
+        accepted=true;
+      });
+      CHECK(action == ChatAction::Exit && accepted); std::cout << "NCURSES_EXIT_OK\n"; return 0;
+    }
+    view.entries.push_back({"user","Unicode width: 東京 and é. A long message that wraps when the terminal shrinks.\nA second paragraph."});
+    view.event("assistant.delta",{{"content","A streamed response."}});
+    CHECK(view.partial == "A streamed response.");
+    view.event("tool.started",{{"run_id",7},{"tool","shell_exec"},{"arguments",{{"command","tmux capture-pane -t 0:0 -p -S -300"}}}});
+    CHECK(view.partial.empty()); CHECK(view.entries[1].label == view.name);
+    view.event("tool.completed",{{"run_id",7},{"result",Json::object()}});
+    CHECK(view.entries.back().command.find("s") != std::string::npos);
+    view.event("assistant.completed",{{"content","Final answer."}});
+    view.event("context.usage",{{"input_tokens",21900},{"context_length",65536},{"approximate",true},{"active_task",Json::array({{{"title","Inspect tmux"}}})}});
+    CHECK(view.tokens == 21900 && view.task == "Inspect tmux");
+    CHECK(chat_utf8(view.status(120)).find("~21.9K/65.5K") != std::string::npos);
+    view.event("context.usage",{{"input_tokens",10000},{"output_tokens",17},{"used_tokens",10017},{"streaming",true},{"approximate",false}});
+    CHECK(chat_utf8(view.status(120)).find("+17")!=std::string::npos);
+    CHECK(chat_utf8(view.activity(true))==view.name+" is typing...");
+    view.event("context.usage",{{"input_tokens",10000},{"output_tokens",17},{"cached_input_tokens",8500},{"used_tokens",10017},{"streaming",true},{"approximate",false}});
+    CHECK(view.report().find("Prompt cache: 8500 tokens reused / 10000 input")!=std::string::npos);
+    view.event("context.usage",{{"input_tokens",10000},{"output_tokens",18},{"used_tokens",10018},{"streaming",false},{"approximate",false}});
+    CHECK(chat_utf8(view.status(120)).find("+18")==std::string::npos);
+    CHECK(chat_utf8(view.activity(true))==view.name+" is preparing context...");
+    view.event("context.usage",{{"input_tokens",12000},{"output_tokens",0},{"streaming",true}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is preparing context...");
+    view.event("context.usage",{{"input_tokens",12500},{"output_tokens",0},{"streaming",true}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is preparing context...");
+    view.phase="act";
+    view.event("context.usage",{{"output_tokens",1},{"streaming",true}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is typing...");
+    view.event("context.usage",{{"output_tokens",1},{"streaming",false}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is running a tool...");
+    CHECK(view.activity(false).empty());view.phase="respond";
+    auto wide=view.lines(100); auto narrow=view.lines(20); CHECK(narrow.size() > wide.size());
+    for (int width : {6,12,20,40,80,120}) {
+      for (const auto& line : view.lines(width)) CHECK(chat_columns(line) <= width);
+      CHECK(chat_columns(view.status(width)) <= width);
+    }
+    CHECK(chat_columns(chat_wide("東京")) == 4);
+    CHECK(chat_columns(chat_wide("é")) == 1);
+    CHECK(chat_utf8(chat_wide("español 東京")) == "español 東京");
+    CHECK(chat_wrap(L"東京",1) == std::vector<std::wstring>({L"?",L"?"}));
+    view.event("approval.requested",{{"approval_id","nonce"},{"_request_id","request"},{"tool","shell_exec"},{"arguments",{{"command","echo ok"}}}});
+    CHECK(view.approval_id == "nonce" && view.approval_request_id == "request");
+    view.event("session.reset",Json::object()); CHECK(view.entries.empty() && view.tokens == 0);
+    auto detailed=command_help("/permissions"); CHECK(detailed.find("Examples:") != std::string::npos && detailed.find("/permissions always") != std::string::npos);
+    CHECK(command_help().find("Memory and knowledge:") != std::string::npos);
+    view.event("context.usage",{{"used_tokens",22700},{"input_tokens",21900},{"output_tokens",800},{"context_length",65536},{"compactions",2},{"approximate",true}});
+    CHECK(view.tokens == 22700 && view.compactions == 2); CHECK(view.report().find("x2") != std::string::npos);
+    view.compactions=0; CHECK(view.report().find(" x0") == std::string::npos);
+    auto syntax=shell_highlight(L"notify-send --icon dialog \"hello world\" $USER | cat # comment");
+    for (auto color : {ChatColor::Command,ChatColor::Option,ChatColor::String,ChatColor::Variable,ChatColor::Operator,ChatColor::Comment}) CHECK(std::any_of(syntax.begin(),syntax.end(),[&](const ChatSpan& span){ return span.color == color; }));
+    view.entries={{"Approval","Approve?"},{"Saga","Status"},{"", "Working",true,1,0,"printf \"hello\""}};
+    bool yellow=false,gray=false,blue=false;
+    for (auto& line : view.styled_lines(80)) for (auto& span : line.spans) { yellow=yellow || span.color == ChatColor::Approval; gray=gray || span.color == ChatColor::Saga; blue=blue || span.color == ChatColor::Prompt; }
+    CHECK(yellow && gray && blue);
+    ChatView help;help.name="test";help.event("help",{{"content",command_help()}});CHECK(help.entries[0].label=="Saga");
+    bool accent=false,description=false,heading=false;std::wstring help_text;
+    for(auto& line:help.styled_lines(80)){help_text+=line.text+L"\n";for(auto span:line.spans){accent|=span.color==ChatColor::Link && (span.style&Bold);description|=span.color==ChatColor::Activity;heading|=span.color==ChatColor::Heading && (span.style&Bold);}}
+    CHECK(accent && description && heading && help_text.find(L"**/new")==std::wstring::npos && help_text.find(L"## Session")==std::wstring::npos);
+    auto fixture=read_file(SAGA_MARKDOWN_FIXTURE);
+    auto rendered=markdown_lines(fixture,110); std::wstring visible;
+    bool bold=false,italic=false,strike=false,inline_code=false,link=false,focus=false;
+    for(auto& line:rendered){visible+=line.text+L"\n";for(auto span:line.spans){bold|=(span.style&Bold)!=0;italic|=(span.style&Italic)!=0;strike|=(span.style&Strike)!=0;inline_code|=span.color==ChatColor::InlineCode;link|=span.color==ChatColor::Link;focus|=span.color==ChatColor::CodeFocus;}}
+    CHECK(bold && italic && strike && inline_code && link && focus);
+    for(auto text:{L"H1: Titulo principal",L"H6: Detalle minimo",L"`backtick literal`",L"def hola(mundo: str)",L"☑ tarea completada",L"☐ tarea pendiente",L"│ Encabezado dentro de cita",L"triple tilde",L"fin del documento"})CHECK(visible.find(text)!=std::wstring::npos);
+    for(auto text:{L"**Negrita",L"___Negrita",L"~~Texto",L"[texto de enlace]",L"![alt text]",L"```",L"backslash\\",L"~~~strike~~~"})CHECK(visible.find(text)==std::wstring::npos);
+    for(int width:{1,2,6,20,40,80})for(auto& line:markdown_lines(fixture,width))CHECK(chat_columns(line.text)<=width);
+    for(size_t end=1;end<fixture.size();end+=7)for(auto& line:markdown_lines(std::string_view(fixture).substr(0,end),40))CHECK(chat_columns(line.text)<=40);
+    std::string fragmented="### Streaming 東京\n**bold** *italic* ~~strike~~ `inline` [link](https://example.com)\n\n```bash\nprintf '**literal** `code`'\n```";
+    ChatView streaming;streaming.name="parser";
+    for(char byte:fragmented){streaming.event("assistant.delta",{{"content",std::string(1,byte)}});for(auto& line:streaming.styled_lines(42))CHECK(chat_columns(line.text)<=42);}
+    streaming.event("assistant.completed",{{"content",fragmented}});
+    std::wstring completed;for(auto& line:streaming.lines(100))completed+=line+L"\n";
+    CHECK(completed.find(L"**bold**")==std::wstring::npos && completed.find(L"**literal** `code`")!=std::wstring::npos && completed.find(L"東京")!=std::wstring::npos);
+    auto nested=markdown_lines("~~**both**~~",80);CHECK(std::any_of(nested[0].spans.begin(),nested[0].spans.end(),[](auto s){return (s.style&(Bold|Strike))==(Bold|Strike);}));
+    auto provisional=markdown_lines("**unfinished bold",80,true);CHECK(provisional[0].text==L"unfinished bold" && (provisional[0].spans[0].style&Bold));
+    CHECK(markdown_lines("**unfinished bold",80)[0].text==L"**unfinished bold");
+    CHECK(markdown_lines("`unfinished code",80,true)[0].text==L"unfinished code");
+    CHECK(markdown_lines("[label](https://exa",80,true)[0].text==L"label");
+    CHECK(markdown_lines("**",80,true)[0].text.empty());
+    CHECK(markdown_lines("`",80,true)[0].text.empty());
+    for(size_t end=1;end<fixture.size();end+=11)for(auto& line:markdown_lines(std::string_view(fixture).substr(0,end),40,true))CHECK(chat_columns(line.text)<=40);
+    for(auto& line:markdown_lines("**safe**\x1b[31m\x1b]0;injected\a",80))CHECK(line.text.find(L'\x1b')==std::wstring::npos);
+    auto escaped=markdown_lines("\\*literal\\* &amp; &#65;\n\n```\n~~~literal~~~\n**raw**\n```",80);std::wstring raw;for(auto& line:escaped)raw+=line.text+L"\n";CHECK(raw.find(L"*literal* & A")!=std::wstring::npos && raw.find(L"~~~literal~~~")!=std::wstring::npos && raw.find(L"**raw**")!=std::wstring::npos);
+    auto literal_example=markdown_lines("````markdown\n# h1\n**bold**\n```bash\n~~~literal~~~\n```\n````\n\n# rendered header\n**formatted**",80);std::wstring literal_text;for(auto& line:literal_example)literal_text+=line.text+L"\n";CHECK(literal_text.find(L"# h1")!=std::wstring::npos && literal_text.find(L"**bold**")!=std::wstring::npos && literal_text.find(L"~~~literal~~~")!=std::wstring::npos && literal_text.find(L"# rendered header")==std::wstring::npos && literal_text.find(L"**formatted**")==std::wstring::npos);
+    CHECK(markdown_lines("![](https://example.com/image.png)",80)[0].text==L"▧ image");
+    ChatView named_user;named_user.name="user";named_user.entries.push_back({"user","**literal user input**"});named_user.event("assistant.completed",{{"content","**formatted assistant**"}});std::wstring separate;for(auto& line:named_user.lines(80))separate+=line+L"\n";CHECK(separate.find(L"**literal user input**")!=std::wstring::npos && separate.find(L"**formatted assistant**")==std::wstring::npos);
+    std::cout << "PASS ncurses chat layout, resize, Unicode, streaming, tools, usage and approvals\n"; return 0;
+  } catch (const std::exception& e) { std::cerr << "FAIL chat UI: " << e.what() << '\n'; return 1; }
+}
