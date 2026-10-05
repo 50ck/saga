@@ -69,6 +69,8 @@ PersonaContext::PersonaContext(const Paths& paths, const Json& meta, const fs::p
       }
       db->exec("UPDATE tool_runs SET status='failed',error_type='crash_recovery' WHERE status='running'");
       db->exec("UPDATE model_calls SET status='failed',error='crash_recovery' WHERE status='running'");
+      for(auto& row:db->query("SELECT id FROM steering_messages WHERE status='queued'"))db->event("steering.cancelled",{{"id",row["id"]},{"reason","crash_recovery"}});
+      db->exec("UPDATE steering_messages SET status='cancelled',updated_at=? WHERE status='queued'",{now()});
     });
   } catch (...) { close(lock_fd); lock_fd = -1; throw; }
 }

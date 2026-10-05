@@ -30,6 +30,10 @@ class Runtime {
   Json usage_ = Json::object();
   CognitiveMode current_mode_ = CognitiveMode::Respond;
   std::function<void()> service_;
+  bool active_=false,cancelled_=false;
+  void chat_turn(std::string input,Emit emit);
+  bool steering_pending();
+  void deliver_steering(Emit emit);
   Completion call(ChatRequest request,const std::string& purpose,Emit emit);
   Json structured(std::string name,std::string prompt,Json properties,Json required,Emit emit = {});
   void consolidate(Id session,bool use_model);
@@ -46,6 +50,8 @@ public:
   void close(std::string reason,Emit emit = {});
   void tick(Emit emit = {},bool use_model = true);
   PersonaContext& persona() { return *p_; }
-  void service(std::function<void()> callback) { service_=callback; tools_.service(std::move(callback)); }
+  void service(std::function<void()> callback);
+  void check_control();
+  void check_cancelled() { if(cancelled_)throw TurnCancelled(); }
 };
 }

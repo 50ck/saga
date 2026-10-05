@@ -66,7 +66,7 @@ void Database::transaction(const std::function<void()>& operation) {
 void Database::migrate() {
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  if (version > 3) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if (version > 4) throw std::runtime_error("Database schema is newer than this Saga binary");
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -79,6 +79,10 @@ void Database::migrate() {
     sql("CREATE TABLE IF NOT EXISTS context_checkpoints(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),through_message_id INTEGER NOT NULL,reason TEXT NOT NULL,state_json TEXT NOT NULL CHECK(json_valid(state_json)),created_at INTEGER NOT NULL);");
     sql("CREATE INDEX IF NOT EXISTS checkpoints_session ON context_checkpoints(session_id,id);");
     sql("UPDATE schema_version SET version=3");
+  });
+  if (version < 4) transaction([&]{
+    sql("CREATE TABLE IF NOT EXISTS steering_messages(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),source_event_id INTEGER NOT NULL REFERENCES events(id),content TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','delivered','cancelled')),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);");
+    sql("UPDATE schema_version SET version=4");
   });
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {

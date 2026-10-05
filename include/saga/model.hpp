@@ -18,8 +18,11 @@ struct ChatRequest {
 // An empty object is a local keepalive while HTTP inference has no SSE bytes yet.
 using StreamCallback = std::function<void(const Json&)>;
 class ModelBackend {
+protected:
+  std::function<void()> control_;
 public:
-  virtual ~ModelBackend() = default;
+    virtual ~ModelBackend() = default;
+    void control(std::function<void()> callback) { control_=std::move(callback); }
   virtual ModelInfo discover() = 0;
   virtual CapabilityReport probe() = 0;
   virtual void chat(const ChatRequest& request, StreamCallback callback) = 0;

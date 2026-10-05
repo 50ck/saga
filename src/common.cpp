@@ -14,8 +14,39 @@ namespace saga {
 bool live_command_allowed(std::string_view name,const Json& arguments) {
   if (!arguments.is_object()) return false;
   if (name == "name" || name == "soul") return arguments.empty();
-  return name == "status" || name == "permissions" || name == "memory" || name == "journal" ||
+  return name == "stop" || name == "steer" || name == "status" || name == "permissions" || name == "memory" || name == "journal" ||
     name == "goals" || name == "tasks" || name == "self" || name == "project" || name == "state";
+}
+std::string json_string_prefix(std::string_view source,std::string_view key) {
+  // Decode only complete JSON characters of a top-level string argument.
+  size_t pos=0; int depth=0;
+  while(pos<source.size()) {
+    char c=source[pos++]; if(c=='{' || c=='['){++depth;continue;} if(c=='}' || c==']'){--depth;continue;}
+    if(c!='"')continue;
+    size_t start=pos-1;
+    while(pos<source.size()){if(source[pos]=='\\'){pos=std::min(pos+2,source.size());continue;}if(source[pos++]=='"')break;}
+    auto property=Json::parse(source.substr(start,pos-start),nullptr,false);
+    if(depth!=1 || !property.is_string() || property.get<std::string>()!=key)continue;
+    while(pos<source.size() && std::isspace(static_cast<unsigned char>(source[pos])))++pos;
+    if(pos==source.size() || source[pos++]!=':')continue;
+    while(pos<source.size() && std::isspace(static_cast<unsigned char>(source[pos])))++pos;
+    if(pos==source.size() || source[pos++]!='"')return {};
+    start=pos-1;size_t end=pos;
+    while(pos<source.size() && source[pos]!='"') {
+      auto ch=static_cast<unsigned char>(source[pos]);size_t length=1;
+      if(ch=='\\') {
+        if(pos+1>=source.size())break;
+        length=source[pos+1]=='u'?6:2;
+        if(pos+length>source.size())break;
+        if(length==6) {auto hex=static_cast<char>(std::tolower(static_cast<unsigned char>(source[pos+3])));if(std::tolower(static_cast<unsigned char>(source[pos+2]))=='d' && (hex=='8' || hex=='9' || hex=='a' || hex=='b'))length=12;}
+      } else if(ch>=0x80) length=(ch&0xe0)==0xc0?2:(ch&0xf0)==0xe0?3:(ch&0xf8)==0xf0?4:1;
+      if(pos+length>source.size())break;
+      pos+=length;end=pos;
+    }
+    auto decoded=Json::parse(std::string(source.substr(start,end-start))+"\"",nullptr,false);
+    return decoded.is_string()?decoded.get<std::string>():std::string();
+  }
+  return {};
 }
 Id now() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 std::string uuid() {

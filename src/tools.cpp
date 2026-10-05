@@ -118,7 +118,7 @@ static bool restrict_child(const fs::path& cwd,const fs::path& scratch,bool host
   sock_fprog program{static_cast<unsigned short>(filter.size()),filter.data()};
   return prctl(PR_SET_SECCOMP,SECCOMP_MODE_FILTER,&program) == 0;
 }
-ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std::vector<std::string>& argv,int timeout,bool host,const std::vector<fs::path>& private_roots,const Json& environment,bool unrestricted,const std::function<void()>& service) {
+ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std::vector<std::string>& argv,int timeout,bool host,const std::vector<fs::path>& private_roots,const Json& environment,bool unrestricted,const std::function<void()>& service,const std::function<void(std::string_view,std::string_view)>& output) {
   if (unrestricted && !host) throw std::runtime_error("Unrestricted execution requires host mode");
   if (argv.empty()) throw std::runtime_error("A process requires a command");
   if (!unrestricted && !shell_sandbox_available()) throw std::runtime_error("Shell execution requires Linux Landlock ABI >= 3; unrestricted host execution remains available");
@@ -167,14 +167,22 @@ ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std:
   ProcessResult result; auto deadline = std::chrono::steady_clock::now()+std::chrono::seconds(timeout);
   std::array<pollfd,2> fds{{{out[0],POLLIN,0},{err[0],POLLIN,0}}};
   bool exited = false; int status = 0;
-  while (!exited || fds[0].fd >= 0 || fds[1].fd >= 0) {
-    try { if (service) service(); }
-    catch (...) {
-      kill(-pid,SIGKILL);
-      if (!exited) { while (waitpid(pid,&status,0) < 0 && errno == EINTR) {} }
-      for (auto& pipe : fds) if (pipe.fd >= 0) close(pipe.fd);
-      throw;
+  struct Cleanup {
+    pid_t pid;bool& exited;int& status;std::array<pollfd,2>& fds;
+    ~Cleanup(){if(!exited){kill(-pid,SIGKILL);while(waitpid(pid,&status,0)<0 && errno==EINTR){}}for(auto& pipe:fds)if(pipe.fd>=0)close(pipe.fd);}
+  } cleanup{pid,exited,status,fds};
+  std::array<std::string,2> pending;
+  auto last_output=std::chrono::steady_clock::now();
+  auto flush=[&](bool final=false){
+    if(output)for(size_t i=0;i<pending.size();++i)if(!pending[i].empty()) {
+      size_t end=pending[i].size();
+      if(!final) {size_t at=0;while(at<end){auto c=static_cast<unsigned char>(pending[i][at]);size_t n=(c&0xe0)==0xc0?2:(c&0xf0)==0xe0?3:(c&0xf8)==0xf0?4:1;if(at+n>end){end=at;break;}at+=n;}}
+      if(end){auto text=utf8_text(pending[i].substr(0,end));output(i==0?"stdout":"stderr",text);pending[i].erase(0,end);}
     }
+    last_output=std::chrono::steady_clock::now();
+  };
+  while (!exited || fds[0].fd >= 0 || fds[1].fd >= 0) {
+    try {if (service) service();}catch(...){flush(true);throw;}
     if (std::chrono::steady_clock::now() >= deadline) { result.timed_out = true; kill(-pid,SIGKILL); }
     poll(fds.data(),fds.size(),25);
     for (size_t i = 0; i < fds.size(); ++i) {
@@ -185,7 +193,7 @@ ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std:
         auto& total = i == 0 ? result.stdout_size : result.stderr_size;
         auto& truncated = i == 0 ? result.stdout_truncated : result.stderr_truncated;
         total += static_cast<size_t>(n); truncated = truncated || total > 256*1024;
-        if (target.size() < 256*1024) target.append(buffer,std::min<size_t>(static_cast<size_t>(n),256*1024-target.size()));
+        if (target.size() < 256*1024) {auto bytes=std::min<size_t>(static_cast<size_t>(n),256*1024-target.size());target.append(buffer,bytes);pending[i].append(buffer,bytes);}
       }
       if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { close(fds[i].fd); fds[i].fd = -1; }
     }
@@ -195,7 +203,9 @@ ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std:
       if (exited) kill(-pid,SIGKILL); // no detached persistent automation
     }
     if (result.timed_out && !exited) { while (waitpid(pid,&status,0) < 0 && errno == EINTR) {} exited = true; }
+    if(std::chrono::steady_clock::now()-last_output>=std::chrono::milliseconds(100))flush();
   }
+  flush(true);
   result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   return result;
 }
@@ -205,6 +215,7 @@ static Json boolean() { return {{"type","boolean"}}; }
 Json Tools::definitions() {
   Json tools = Json::array();
   auto add = [&](std::string name,std::string desc,Json props,Json req){ tools.push_back(function_tool(std::move(name),std::move(desc),std::move(props),std::move(req))); };
+  add("report_progress","Publish concise public commentary before actions and after discoveries. Do not expose internal reasoning or claim unverified completion.",{{"text",str()}},{"text"});
   for (auto* name : {"remember","know","know_how","recall_artifact","inspect_self"})
     add(name,"Retrieve persistent " + std::string(name) + " evidence. One deep recall escalation is available.",{{"query",str()},{"depth",{{"type","string"},{"enum",{"normal","deep"}}}}},{"query"});
   add("inspect_open_loops","Retrieve unresolved work",Json::object(),{});
@@ -322,9 +333,21 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   Id started = now();
   Id run = p_.db->exec("INSERT INTO tool_runs(session_id,task_id,tool,arguments_json,started_at,status) VALUES(?,?,?,?,?,'running')",{p_.session,p_.task ? Json(p_.task) : Json(),name,args.dump(),started});
   p_.db->event("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}},p_.session,p_.task);
-  if (emit) emit("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}});
+  if (emit && name!="report_progress") emit("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}});
+  auto previous_output=std::move(output_);
+  struct Restore {Emit& target;Emit previous;~Restore(){target=std::move(previous);}} restore{output_,std::move(previous_output)};
+  output_=[&,run](const std::string& stream,const Json& data){
+    auto payload=data;payload["run_id"]=run;payload["stream"]=stream;
+    p_.db->event("tool.output",payload,p_.session,p_.task);if(emit)emit("tool.output",payload);
+  };
   Json result;
-  try { result = dispatch(name,args); } catch (const std::exception& e) { result = {{"error",e.what()}}; }
+  try { result = dispatch(name,args); }
+  catch(const TurnCancelled&) {
+    p_.db->exec("UPDATE tool_runs SET status='cancelled',duration_ms=?,error_type='user_stop' WHERE id=?",{now()-started,run});
+    p_.db->event("tool.cancelled",{{"run_id",run},{"tool",name}},p_.session,p_.task);
+    if(emit)emit("tool.cancelled",{{"run_id",run},{"tool",name}});
+    throw;
+  } catch (const std::exception& e) { result = {{"error",e.what()}}; }
   bool failed = result.contains("error") || (result.contains("exit_code") && result["exit_code"] != 0);
   p_.db->exec("UPDATE internal_state SET frustration=max(0,min(1,frustration+?)),confidence=max(0.05,min(0.95,confidence+?)),engagement=min(1,engagement+0.02),satisfaction=max(0,min(1,satisfaction+?)),updated_at=? WHERE id=1",{failed ? 0.15 : -0.03,failed ? -0.08 : 0.02,failed ? -0.1 : 0.03,now()});
   auto type = failed ? "tool.failed" : "tool.completed";
@@ -332,12 +355,13 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
     {now()-started,failed ? "failed" : "completed",result.value("exit_code",Json()),result.value("stdout_size",result.value("stdout",std::string()).size()),result.value("stderr_size",result.value("stderr",std::string()).size()),failed ? Json(result.value("error",std::string("nonzero_exit"))) : Json(),digest(result.dump()),run});
   Id ev = p_.db->event(type,{{"run_id",run},{"tool",name},{"result",result}},p_.session,p_.task);
   result["source_event_id"] = ev;
-  if (p_.task) memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
-  if (emit) emit(type,{{"run_id",run},{"tool",name},{"result",result}});
+  if (p_.task && name!="report_progress") memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
+  if (emit && name!="report_progress") emit(type,{{"run_id",run},{"tool",name},{"result",result}});
   return result;
 }
 Json Tools::dispatch(const std::string& name,const Json& a) {
   auto db = p_.db.get();
+  if(name=="report_progress") {if(trim(a["text"].get<std::string>()).empty())throw std::runtime_error("Progress text cannot be empty");return {{"published",true}};}
   auto source = [&](Id event,bool user_only = false) {
     auto rows = db->query("SELECT * FROM events WHERE id=? AND session_id=?",{event,p_.session});
     if (rows.empty() || (user_only ? rows[0]["type"] != "user.message" : rows[0]["type"] != "user.message" && rows[0]["type"] != "tool.completed" && rows[0]["type"] != "tool.failed"))
@@ -404,7 +428,8 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     auto before = snapshot(!unrestricted);
     auto scratch=host ? fs::temp_directory_path()/("saga-host-"+uuid()) : p_.directory/"cache/scratch";
     struct Cleanup { fs::path path; ~Cleanup() { if (!path.empty()) { std::error_code ec; fs::remove_all(path,ec); } } } cleanup{host ? scratch : fs::path()};
-    auto r = run_process(p_.project_root,scratch,{"/bin/sh","-c",a["command"]},std::clamp(a.value("timeout_seconds",30),1,120),host,p_.private_roots,p_.host_environment,unrestricted,service_);
+    auto r = run_process(p_.project_root,scratch,{"/bin/sh","-c",a["command"]},std::clamp(a.value("timeout_seconds",30),1,120),host,p_.private_roots,p_.host_environment,unrestricted,service_,[&](auto stream,auto text){if(output_)output_(std::string(stream),{{"content",std::string(text)}});});
+    if(output_ && (r.stdout_truncated || r.stderr_truncated))output_("notice",{{"content","Output truncated at the capture limit."}});
     auto after = snapshot(false); size_t tracked = 0;
     auto task = db->query("SELECT title FROM tasks WHERE id=?",{p_.task});
     auto description = task.empty() ? "File observed after shell action" : task[0]["title"].get<std::string>();

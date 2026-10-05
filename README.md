@@ -67,7 +67,9 @@ formatting, then the completed response is parsed from its original Markdown.
 Ambiguous constructs can change appearance as more text arrives; stored messages
 are never modified. Unchanged bubbles are cached; resizing rebuilds layout.
 Strikes use a combining stroke through the text, and italic appearance depends
-on terminal support. `/help`, `/status`, `/permissions` and inspection commands
+on terminal support. Public `report_progress` commentary streams separately from completion claims; commands stream bounded stdout/stderr while running. Empty model replies get one recovery attempt and then a visible error, never an empty bubble. `/steer PROMPT` queues instructions for the next model call in the same session, after the current command and approval finish. `/stop`, Ctrl+C or Esc interrupt active work and cancel queued steering while preserving completed changes.
+
+`/help`, `/status`, `/permissions` and inspection commands
 remain available while the agent waits for the model, streams a reply, runs a tool
 or waits for approval. This includes `/memory`, `/know`, `/praxis`, `/artifacts`,
 `/journal`, `/goals`, `/tasks`, `/self`, `/project`, `/state`, and `/name` or `/soul`

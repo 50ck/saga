@@ -114,6 +114,7 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
     std::string body;
     std::exception_ptr error;
     StreamCallback callback;
+    std::function<void()> control;
     bool done = false;
     SseParser parser;
     explicit State(StreamCallback callback_arg) : callback(std::move(callback_arg)), parser([this](std::string_view data){
@@ -122,6 +123,7 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
       callback(Json::parse(data));
     }) {}
   } state(cb);
+  state.control=control_;
   auto write_cb = +[](char* bytes, size_t size, size_t count, void* data)->size_t {
     auto& state_ref = *static_cast<State*>(data); size_t n = size*count;
     try {
@@ -134,11 +136,11 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
   auto set = [&](CURLoption option,auto value){ if (curl_easy_setopt(curl.get(),option,value) != CURLE_OK) throw std::runtime_error("Cannot configure HTTP request"); };
   set(CURLOPT_URL,url.c_str()); set(CURLOPT_HTTPHEADER,headers.get());
   set(CURLOPT_WRITEFUNCTION,write_cb); set(CURLOPT_WRITEDATA,&state);
-  if (cb) {
+  if (cb || control_) {
     // Service local controls even when inference has not sent any SSE bytes yet.
     auto progress = +[](void* data,curl_off_t,curl_off_t,curl_off_t,curl_off_t)->int {
       auto& state_ref=*static_cast<State*>(data);
-      try { state_ref.callback(Json::object()); return 0; }
+      try { if(state_ref.control)state_ref.control(); if(state_ref.callback)state_ref.callback(Json::object()); return 0; }
       catch (...) { state_ref.error=std::current_exception(); return 1; }
     };
     set(CURLOPT_NOPROGRESS,0L); set(CURLOPT_XFERINFOFUNCTION,progress); set(CURLOPT_XFERINFODATA,&state);

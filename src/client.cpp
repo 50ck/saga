@@ -151,7 +151,8 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   if (name == "help") { auto help=command_help(arg); if (callback) callback("help",{{"content",help}}); else {for(auto& line:markdown_lines(help,100))std::cout<<chat_utf8(line.text)<<'\n';} return Action::Continue; }
   if (name == "new") { auto r=client.request("command",{{"name","new"}},callback); if (callback) {callback("session.reset",Json::object());if(r.contains("status"))callback("agent.status",r["status"]);} return Action::NewSession; }
   Json args = Json::object();
-  if (name == "memory" || name == "know" || name == "praxis" || name == "artifacts") {
+  if (name == "steer") {args["content"]=arg;}
+  else if (name == "memory" || name == "know" || name == "praxis" || name == "artifacts") {
     args = {{"query",arg},{"kind",name == "know" ? "know" : name == "praxis" ? "know_how" : name == "artifacts" ? "recall_artifact" : "remember"},{"deep",true}}; name = "memory";
   } else if (name == "name" && !arg.empty()) args = {{"name",arg}};
   else if (name == "soul" && !arg.empty()) args = {{"content",read_file(fs::path(arg).is_absolute() ? fs::path(arg) : cwd / arg,32768)}};
@@ -176,7 +177,9 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
         << "\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations."
         << "\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS)."
         << "\nUse /permissions NUMBER. Sandbox actions stay automatic. Unrestricted host uses your OS user privileges; Saga storage is also accessible.\n";
-    } else if (callback) callback("result",result);
+    } else if (name == "steer") {if(callback && result.value("queued",false))callback("result","Steering queued for the next model call after the current command/approval finishes.");}
+    else if (name == "stop") {if(callback)callback("result",result.value("stopping",false)?"Stopping…":"No active turn.");}
+    else if (callback) callback("result",result);
     else if (!client.json_output) std::cout << display_text(result.dump(2)) << '\n';
   };
   Json payload={{"name",name},{"arguments",args}};

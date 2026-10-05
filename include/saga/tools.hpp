@@ -12,13 +12,14 @@ struct ProcessResult {
 };
 bool shell_sandbox_available();
 ProcessResult run_process(const fs::path& cwd, const fs::path& scratch, const std::vector<std::string>& argv, int timeout_seconds = 30,
-                          bool host = false,const std::vector<fs::path>& private_roots = {},const Json& environment = Json::object(),bool unrestricted = false,const std::function<void()>& service = {});
+                          bool host = false,const std::vector<fs::path>& private_roots = {},const Json& environment = Json::object(),bool unrestricted = false,const std::function<void()>& service = {},const std::function<void(std::string_view,std::string_view)>& output = {});
 using Approve = std::function<bool(const std::string&,const Json&)>;
 class Tools {
   PersonaContext& p_;
   Memory& memory_;
   Approve approve_;
   std::function<void()> service_;
+  Emit output_;
   fs::path safe_path(const std::string& path, bool write) const;
   Json dispatch(const std::string& name, const Json& args);
 public:

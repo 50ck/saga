@@ -18,6 +18,8 @@ namespace saga {
 std::string command_help(std::string_view query) {
   struct Help { const char* name; const char* args; const char* section; const char* description; const char* examples; };
   static constexpr Help commands[]={
+    {"steer","PROMPT","Session commands","Queue instructions for the next model call in this conversation, after the current command and pending approval finish.","/steer Add tests before changing the UI"},
+    {"stop","","Session commands","Stop active work and cancel queued steering. Completed edits remain. Ctrl+C or Esc also stop active work.","/stop"},
     {"new","","Session commands","Close this session, save its diary and begin a fresh conversation with the same persona.","/new"},
     {"persona","","Session commands","Save the current session and return to the persona selector.","/persona"},
     {"model","","Session commands","Close the session and configure the endpoint/model used by Saga. Memories remain intact.","/model"},
@@ -108,20 +110,37 @@ void ChatView::event(const std::string& type,const Json& p) {
   if (type == "session.started") { name=p.value("name",name); model=p.value("model",model); context=p.value("context_length",context); }
   else if (type == "assistant.delta") partial += p.value("content","");
   else if(type=="help")entries.push_back({"Saga",p.at("content").get<std::string>(),false,0,0,{},true,true});
-  else if (type == "assistant.completed") { entries.push_back({name,p.value("content",""),false,0,0,{},true}); partial.clear(); }
+  else if (type == "assistant.completed") { auto text=p.value("content","");if(!trim(text).empty())entries.push_back({name,text,false,0,0,{},true});else entries.push_back({"Saga","The model returned an empty response."});partial.clear(); }
+  else if(type=="progress.updated") {
+    auto id=p.at("message_id").get<std::string>();auto it=std::find_if(entries.begin(),entries.end(),[&](auto& entry){return entry.message_id==id;});
+    if(it==entries.end()){ChatEntry entry{name,"",false,0,0,{},true};entry.message_id=id;entries.push_back(std::move(entry));it=std::prev(entries.end());}
+    it->text=p.value("text","");it->streaming=!p.value("complete",false);if(p.value("interrupted",false))it->text+="\n*Interrupted.*";
+  } else if(type=="operation.preparing") {operation=p.value("tool","");phase="prepare_operation";}
+  else if(type=="tool.output") {
+    auto id="output:"+std::to_string(p.value("run_id",0LL))+":"+p.value("stream","");
+    auto it=std::find_if(entries.begin(),entries.end(),[&](auto& entry){return entry.message_id==id;});
+    if(it==entries.end()){ChatEntry entry{p.value("stream","Output"),""};entry.message_id=id;entries.push_back(std::move(entry));it=std::prev(entries.end());}
+    if(it->text.size()<512*1024)it->text+=display_text(p.value("content",""));
+  } else if(type=="turn.cancelled") {
+    approval_id.clear();generating=false;phase="wait";
+    if(!partial.empty())entries.push_back({name,std::exchange(partial,""),false,0,0,{},true});
+    entries.push_back({"Saga",p.value("message","Stopped. Completed work is preserved.")});
+  }
   else if (type == "tool.started") {
+    phase="act";generating=false;
     if (!partial.empty()) { entries.push_back({name,std::exchange(partial,""),false,0,0,{},true}); }
     auto tool=p.value("tool",""); auto args=p.value("arguments",Json::object());
     std::string text=name+(tool == "shell_exec" ? " is opening a terminal..." : " is using "+tool+"...");
     if (tool != "shell_exec" && args.contains("path")) text += "\n"+args.at("path").get<std::string>();
     entries.push_back({"",text,true,p.value("run_id",0LL),now(),tool == "shell_exec" ? args.value("command","") : ""});
-  } else if (type == "tool.completed" || type == "tool.failed") {
+  } else if (type == "tool.completed" || type == "tool.failed" || type=="tool.cancelled") {
     auto run=p.value("run_id",0LL);
     for (auto it=entries.rbegin(); it!=entries.rend(); ++it) if (it->activity && it->run == run && it->started) {
       std::ostringstream s; s << std::fixed << std::setprecision(1) << (now()-it->started)/1000.0 << "s";
       auto& text=it->command.empty() ? it->text : it->command;
-      text += "  "+s.str()+(type == "tool.failed" ? " · failed" : ""); it->started=0; break;
+      text += "  "+s.str()+(type == "tool.failed" ? " · failed" : type=="tool.cancelled"?" · cancelled":""); it->started=0; break;
     }
+    if(!std::any_of(entries.begin(),entries.end(),[](auto& entry){return entry.activity && entry.started;}))phase="respond";
     if (type == "tool.failed") {
       auto result=p.value("result",Json::object());
       auto error=result.value("error","");
@@ -277,7 +296,7 @@ std::vector<ChatLine> ChatView::styled_lines(int width) const {
       result.push_back({top,{{0,top.size(),color}}});
       std::vector<ChatLine> literal;
       if (entry.markdown) {
-        bool streaming=index>entries.size();
+        bool streaming=entry.streaming || index>entries.size();
         if(cache.text != entry.text || cache.width != width-4 || cache.streaming!=streaming) { cache.lines=markdown_lines(entry.text,width-4,streaming); cache.text=entry.text; cache.width=width-4; cache.streaming=streaming; }
       } else if(!entry.spans.empty()) {
         auto body=chat_wide(entry.text);size_t offset=0;
@@ -322,6 +341,7 @@ std::string ChatView::report() const {
 std::wstring ChatView::activity(bool busy) const {
   if(!approval_id.empty())return L"Awaiting approval: y / n · Esc declines";
   if(!busy)return {};
+  if(phase=="prepare_operation")return chat_wide(name+" is preparing "+operation+"...");
   if(generating)return chat_wide(name+(generated_tokens ? " is typing..." : " is preparing context..."));
   return chat_wide(name+(phase=="act" ? " is running a tool..." : phase=="verify" ? " is verifying..." : phase=="reflect" ? " is saving memory..." : " is preparing context..."));
 }
@@ -414,6 +434,11 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
     }
     wint_t key=0; int kind=wget_wch(stdscr,&key);
     if (kind == ERR) continue;
+    if(busy && kind!=KEY_CODE_YES && (key==3 || key==27)) {
+      if(selecting){selecting=false;terminal.mouse(true);redraw=true;}
+      try {if(live_submit)live_submit("/stop",enqueue);}catch(const std::exception& e){view.event("command.error",{{"message",e.what()}});}
+      continue;
+    }
     if((kind==KEY_CODE_YES && key==KEY_F(2)) || (selecting && key==27)) {
       selecting=!selecting;terminal.mouse(!selecting);redraw=true;continue;
     }

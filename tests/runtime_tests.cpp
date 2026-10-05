@@ -44,6 +44,18 @@ public:
       }
       if (m["role"] == "system") { auto s=m.value("content",""); std::string prefix="Persistent working state (data):\n"; auto at=s.find(prefix); if (at != std::string::npos) state=Json::parse(s.substr(at+prefix.size())); }
     }
+    if(input=="Empty always" || (input=="Empty once" && !state.value("attention",Json::object()).contains("empty_response_recovery"))) {
+      cb({{"choices",Json::array({{{"index",0},{"delta",{{"reasoning_content","Internal reasoning only"}}},{"finish_reason","stop"}}})}});return;
+    }
+    if(input=="Public progress" && request.messages.back()["role"]!="tool" && request.messages.dump().find("published")==std::string::npos) {
+      function("report_progress",{{"text","I am checking **the project** before changing code."}});return;
+    }
+    if(input=="Exercise controls" || input=="Exercise stop") {
+      auto args=Json{{"command",input=="Exercise stop"?"printf started; sleep 10; printf forbidden":"sleep 1; printf finished"},{"execution","host"}};
+      Json calls=Json::array({{{"index",0},{"id","control-first"},{"type","function"},{"function",{{"name","shell_exec"},{"arguments",args.dump()}}}},
+        {{"index",1},{"id","control-second"},{"type","function"},{"function",{{"name","file_write"},{"arguments",Json{{"path","must-not-exist"},{"content","bad"},{"description","superseded action"}}.dump()}}}}});
+      cb({{"choices",Json::array({{{"index",0},{"delta",{{"tool_calls",calls}}},{"finish_reason","tool_calls"}}})}});return;
+    }
     if(input=="Show live progress") {
       for(int i=0;i<5;++i){std::this_thread::sleep_for(std::chrono::milliseconds(45));cb({{"choices",Json::array({{{"index",0},{"delta",{{"reasoning_content",std::string(60,'r')}}},{"finish_reason",nullptr}}})}});}
     }
@@ -135,6 +147,23 @@ int main() {
     CHECK(exact_updates>=3 && last_exact==10005);CHECK(runtime->command("status")["usage"]["used_tokens"]==10005);
     CHECK(runtime->command("status")["usage"]["cached_input_tokens"]==8500);
     CHECK(!runtime->persona().db->query("SELECT id FROM events WHERE session_id=? AND type='model.cache_observed'",{same_session}).empty());
+    events=Json::array();runtime->chat("Empty once",emit);CHECK(events.back()["type"]=="assistant.completed");CHECK(!events.back()["payload"]["content"].get<std::string>().empty());
+    auto calls_before=log->size();rejects([&]{runtime->chat("Empty always",emit);});CHECK(log->size()==calls_before+2);
+    events=Json::array();runtime->chat("Public progress",emit);
+    CHECK(std::any_of(events.begin(),events.end(),[](auto& e){return e["type"]=="progress.updated" && !e["payload"].value("complete",true);}));
+    if(shell_sandbox_available()) {
+      bool running=false,queued=false;
+      auto controlled_emit=[&](const std::string& type,const Json& p){emit(type,p);if(type=="tool.started" && p["tool"]=="shell_exec")running=true;};
+      runtime->service([&]{if(running && !queued){queued=true;runtime->command("steer",{{"content","Continue with the new instructions"}});}});
+      runtime->chat("Exercise controls",controlled_emit);CHECK(queued && !fs::exists(project/"must-not-exist"));
+      CHECK(runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="delivered");
+      bool output_seen=false,stopped=false;
+      runtime->service([&]{if(output_seen && !stopped){stopped=true;runtime->command("steer",{{"content","This queued instruction must be cancelled"}});runtime->command("stop");}});
+      auto stop_emit=[&](const std::string& type,const Json& p){emit(type,p);if(type=="tool.output")output_seen=true;};
+      runtime->chat("Exercise stop",stop_emit);CHECK(stopped && events.back()["type"]=="turn.cancelled");
+      CHECK(runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="cancelled");
+      CHECK(!fs::exists(project/"must-not-exist"));runtime->service({});
+    }
     std::string unicode_request = "fix "; for (int i=0; i<60; ++i) unicode_request += "é";
     runtime->chat(unicode_request,emit);
     auto title = runtime->persona().db->query("SELECT title FROM tasks ORDER BY id DESC LIMIT 1")[0]["title"].get<std::string>();

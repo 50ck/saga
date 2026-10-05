@@ -124,6 +124,8 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
                 return granted;
               }
               live_command(*reply);
+              try { runtime->check_cancelled(); }
+              catch(const TurnCancelled&) { emit("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","user_stop"}});throw; }
             }
             emit("approval.resolved",{{"approval_id",approval_id},{"approved",false},{"reason","expired"}});
             return false;

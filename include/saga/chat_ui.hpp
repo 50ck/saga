@@ -23,6 +23,8 @@ struct ChatEntry {
   bool markdown=false;
   bool help=false;
   std::vector<ChatSpan> spans{};
+  std::string message_id{};
+  bool streaming=false;
 };
 struct ChatView {
   std::string name,model,task,partial,approval_id,approval_request_id;
@@ -32,7 +34,7 @@ struct ChatView {
   bool approximate = true;
   bool permission_menu = false;
   size_t compactions = 0;
-  std::string phase = "respond";
+  std::string phase = "respond",operation;
   Json agent_status = Json::object();
   std::vector<ChatEntry> entries;
   struct MarkdownCache { std::string text; int width=0; bool streaming=false; std::vector<ChatLine> lines; };
