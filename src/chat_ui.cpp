@@ -107,6 +107,7 @@ std::vector<std::wstring> chat_wrap(std::wstring_view text,int width) {
   return lines;
 }
 void ChatView::event(const std::string& type,const Json& p) {
+  if(!approval_id.empty() && approval.value("kind","")=="edit" && (type=="help" || type=="result" || type=="command.error" || type=="permissions.menu"))approval_hidden=true;
   if (type == "session.started") { name=p.value("name",name); model=p.value("model",model); context=p.value("context_length",context); }
   else if (type == "assistant.delta") partial += p.value("content","");
   else if(type=="help")entries.push_back({"Saga",p.at("content").get<std::string>(),false,0,0,{},true,true});
@@ -164,7 +165,7 @@ void ChatView::event(const std::string& type,const Json& p) {
     if (p.contains("active_task")) { task=p["active_task"].empty() ? "" : p["active_task"][0].value("title",""); agent_status["task"]=p["active_task"]; }
   } else if (type == "approval.requested") {
     approval_id=p.at("approval_id"); approval_request_id=p.at("_request_id");
-    approval=p.at("arguments");approval_expanded=false;approval_scroll=0;approval_focus=0;
+    approval=p.at("arguments");approval_hidden=false;approval_expanded=false;approval_scroll=0;approval_focus=0;
     if(approval.value("kind","")=="edit"){phase="approval";return;}
     auto prefix="Approve "+p.at("tool").get<std::string>()+":\n";
     auto arguments=p.at("arguments").dump(2);
@@ -286,7 +287,7 @@ void ChatView::activate(const std::string& target) {
   for(auto& entry:entries)if(entry.diff && target=="diff:"+entry.message_id){entry.expanded=!entry.expanded;return;}
 }
 std::vector<ChatLine> ChatView::approval_lines(int width,int height) const {
-  if(approval_id.empty() || approval.value("kind","")!="edit" || width<12 || height<15)return {};
+  if(approval_hidden || approval_id.empty() || approval.value("kind","")!="edit" || width<12 || height<15)return {};
   auto body=diff_lines(approval.value("diff",""),width-4);size_t room=static_cast<size_t>(std::max(1,height-13));
   if(!approval_expanded)room=std::min<size_t>(10,room);
   size_t begin=approval_expanded?std::min(approval_scroll,body.size()>room?body.size()-room:0):0,end=std::min(body.size(),begin+room);
@@ -384,6 +385,7 @@ std::string ChatView::report() const {
   return format_agent_status(data);
 }
 std::wstring ChatView::activity(bool busy) const {
+  if(approval_hidden && !approval_id.empty())return L"Approval pending · Tab returns to diff · y/n decides · Esc stops";
   if(!approval_id.empty())return L"Awaiting approval: y / n · Tab/Enter selects · Esc stops";
   if(!busy && !activity_started)return {};
   if(phase=="prepare_operation")return chat_wide(name+" is preparing "+operation+"...");
@@ -528,14 +530,14 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
         MEVENT mouse{};
         if (getmouse(&mouse) != ERR) {
           if(!selecting && (mouse.bstate & BUTTON1_CLICKED))for(auto& [row,target]:targets)if(row==mouse.y){if(target=="approval:yes")respond(true);else if(target=="approval:no")respond(false);else activate(target);redraw=true;break;}
-          bool popup=!view.approval_id.empty() && view.approval.value("kind","")=="edit";
+          bool popup=!view.approval_hidden && !view.approval_id.empty() && view.approval.value("kind","")=="edit";
           if(popup) {if(view.approval_expanded){if(mouse.bstate & BUTTON4_PRESSED)view.approval_scroll=view.approval_scroll>3?view.approval_scroll-3:0;if(mouse.bstate & BUTTON5_PRESSED)view.approval_scroll+=3;}}
           else {if(mouse.bstate & BUTTON4_PRESSED)scroll+=3;if(mouse.bstate & BUTTON5_PRESSED)scroll=scroll>3?scroll-3:0;}
           redraw=true;
         }
         continue;
       }
-      if((key==KEY_PPAGE || key==KEY_NPAGE) && !view.approval_id.empty() && view.approval.value("kind","")=="edit") {view.approval_expanded=true;if(key==KEY_NPAGE)view.approval_scroll+=static_cast<size_t>(std::max(1,height-13));else view.approval_scroll=view.approval_scroll>static_cast<size_t>(std::max(1,height-13))?view.approval_scroll-static_cast<size_t>(std::max(1,height-13)):0;redraw=true;continue;}
+      if((key==KEY_PPAGE || key==KEY_NPAGE) && !view.approval_hidden && !view.approval_id.empty() && view.approval.value("kind","")=="edit") {view.approval_expanded=true;if(key==KEY_NPAGE)view.approval_scroll+=static_cast<size_t>(std::max(1,height-13));else view.approval_scroll=view.approval_scroll>static_cast<size_t>(std::max(1,height-13))?view.approval_scroll-static_cast<size_t>(std::max(1,height-13)):0;redraw=true;continue;}
       if (key == KEY_PPAGE) { scroll += static_cast<size_t>(std::max(1,height-6));redraw=true;continue; }
       if (key == KEY_NPAGE) { size_t page=static_cast<size_t>(std::max(1,height-6)); scroll=scroll > page ? scroll-page : 0;redraw=true;continue; }
       if(selecting)continue;
@@ -553,8 +555,8 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
       else if (!working) action=ChatAction::Exit;
       continue;
     }
-    if(key==9 && !view.approval_id.empty() && view.approval.value("kind","")=="edit") {view.approval_focus=(view.approval_focus+1)%3;redraw=true;continue;}
-    if((key==10 || key==13) && input.empty() && !view.approval_id.empty() && view.approval.value("kind","")=="edit") {if(view.approval_focus==2)view.activate("approval:toggle");else respond(view.approval_focus==0);redraw=true;continue;}
+    if(key==9 && !view.approval_id.empty() && view.approval.value("kind","")=="edit") {if(view.approval_hidden)view.approval_hidden=false;else view.approval_focus=(view.approval_focus+1)%3;redraw=true;continue;}
+    if((key==10 || key==13) && input.empty() && !view.approval_id.empty() && view.approval.value("kind","")=="edit") {if(view.approval_hidden)view.approval_hidden=false;else if(view.approval_focus==2)view.activate("approval:toggle");else respond(view.approval_focus==0);redraw=true;continue;}
     if (key == 127 || key == 8) { if (cursor) input.erase(--cursor,1); continue; }
     if (key == 21) { input.clear(); cursor=0; continue; }
     if (key != 10 && key != 13) { if (key >= 32 && input.size() < 65536) input.insert(cursor++,1,static_cast<wchar_t>(key)); continue; }

@@ -172,6 +172,12 @@ try:
     assert b'Approve file edit' in output and b'See more' in output
     assert b'38;5;114m+new' in output and b'38;5;174m-old' in output
     assert b'new 15' not in output, 'proposal did not start collapsed'
+    before_inspection=len(output)
+    os.write(fd,b'/status\r')
+    collect(.3)
+    assert b'LIVE_INSPECTION_VISIBLE' in output[before_inspection:]
+    os.write(fd,b'\t')
+    collect(.2)
     # 17-row popup centered in the 23-row chat area; third button is row 19.
     before_click=len(output)
     click(6, 19)
@@ -190,7 +196,7 @@ try:
     assert b'DIFF_ACCEPTED' in output
     # The applied diff follows the user bubble and approval marker.
     before_click=len(output)
-    click(6, 18)
+    click(6, 23)
     collect(.3)
     resize(35,100)
     collect(.2)

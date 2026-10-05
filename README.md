@@ -178,7 +178,9 @@ up to 512 KiB are supported. In modes 1/3, a yellow approval popup shows the com
 proposed diff before any write, initially collapsed to ten rendered rows. Click
 **See more/See less**, or use Tab and Enter. Use the mouse wheel or Page Up/Down to
 scroll an expanded proposal. Approve/Reject also accept the existing `y`/`n` input.
-Saga rechecks the original hash and path after approval. A changed file is left
+Inspection commands temporarily reveal the transcript beneath a pending review;
+Tab returns to its popup without approving it. Saga rechecks the original hash
+and path after approval. A changed file is left
 untouched and requires a fresh proposal. Artifact versions are recorded only after
 the write. In modes 2/4, edits are automatic and their transcript diffs also start
 collapsed to ten rows, with clickable expansion. Additions are green; deletions

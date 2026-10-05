@@ -25,6 +25,7 @@ int main(int argc,char** argv) {
     }
     if(argc==2 && std::string(argv[1])=="--diff-demo") {
       std::atomic_int decision=0;std::atomic_bool stopped=false;int turns=0;
+      std::string full_diff="--- a/example.c\n+++ b/example.c\n@@ -1,16 +1,16 @@\n";for(int i=0;i<16;++i)full_diff+="-old "+std::to_string(i)+"\n+new "+std::to_string(i)+"\n";
       auto action=chat_ui(view,[&](const std::string& input,Emit emit){
         if(input=="cancel") {
           emit("turn.started",{{"session_id",1}});
@@ -33,15 +34,14 @@ int main(int argc,char** argv) {
           CHECK(stopped);
           emit("turn.cancelled",{{"message","STOPPED_COPY_WORK"}});emit("turn.finished",Json::object());return;
         }
-        ++turns;decision=0;std::string diff="--- a/example.c\n+++ b/example.c\n@@ -1,16 +1,16 @@\n";
-        for(int i=0;i<16;++i)diff+="-old "+std::to_string(i)+"\n+new "+std::to_string(i)+"\n";
+        ++turns;decision=0;auto diff=full_diff;
         emit("approval.requested",{{"approval_id","diff-approval"},{"_request_id","diff-request"},{"tool","file_edit"},{"arguments",{{"kind","edit"},{"proposal_id","diff-"+std::to_string(turns)},{"path","example.c"},{"diff",diff},{"added",16},{"removed",16}}}});
         for(int i=0;i<100 && !decision;++i)std::this_thread::sleep_for(std::chrono::milliseconds(50));
         CHECK(decision);
         emit("approval.resolved",{{"approved",decision==1}});
-        if(decision==1)emit("edit.applied",{{"proposal_id","diff-"+std::to_string(turns)},{"path","example.c"},{"diff",diff},{"added",16},{"removed",16}});
+        if(decision==1)emit("edit.applied",{{"event_id",turns},{"proposal_id","diff-"+std::to_string(turns)},{"path","example.c"},{"diff",diff},{"added",16},{"removed",16}});
         emit("notification",{{"description",decision==1?"DIFF_ACCEPTED":"DIFF_REJECTED"}});
-      },[]{std::this_thread::sleep_for(std::chrono::milliseconds(10));return std::optional<Json>{};},[&](const Json& frame){decision=frame["payload"]["approved"].get<bool>()?1:2;},[&](const std::string& command,Emit emit){CHECK(command=="/stop");stopped=true;emit("result","Stopping");});
+      },[]{std::this_thread::sleep_for(std::chrono::milliseconds(10));return std::optional<Json>{};},[&](const Json& frame){decision=frame["payload"]["approved"].get<bool>()?1:2;},[&](const std::string& command,Emit emit){if(command.starts_with("/diff "))emit("diff.loaded",{{"event_id",std::stoll(command.substr(6))},{"diff",full_diff}});else if(command=="/status")emit("result","LIVE_INSPECTION_VISIBLE");else {CHECK(command=="/stop");stopped=true;emit("result","Stopping");}});
       CHECK(action==ChatAction::Exit && turns==2 && stopped);std::cout<<"DIFF_EXIT_OK\n";return 0;
     }
     if (argc == 2 && std::string(argv[1]) == "--demo") {
@@ -156,7 +156,7 @@ int main(int argc,char** argv) {
     ChatView diffs;std::string diff="--- a/x.c\n+++ b/x.c\n@@ -1 +1 @@\n-old\n";for(int i=0;i<30;++i)diff+="+new line "+std::to_string(i)+"\n";
     Json edit={{"kind","edit"},{"proposal_id","proposed"},{"path","x.c"},{"diff",diff},{"added",30},{"removed",1}};
     diffs.event("approval.requested",{{"approval_id","edit-nonce"},{"_request_id","edit-request"},{"tool","file_edit"},{"arguments",edit}});
-    CHECK(diffs.entries.empty());auto popup=diffs.approval_lines(80,40);CHECK(popup.size()==17);
+    CHECK(diffs.entries.empty());diffs.event("result","Live inspection");CHECK(diffs.approval_hidden && diffs.approval_lines(80,40).empty());diffs.approval_hidden=false;auto popup=diffs.approval_lines(80,40);CHECK(popup.size()==17);
     CHECK(std::none_of(popup.begin(),popup.end(),[](auto& line){return line.text.find(L"new line 29")!=std::wstring::npos;}));
     CHECK(std::count_if(popup.begin(),popup.end(),[](auto& line){return !line.target.empty();})==3);
     diffs.activate("approval:toggle");CHECK(diffs.approval_expanded);diffs.approval_scroll=100;

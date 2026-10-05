@@ -40,7 +40,7 @@ struct ChatView {
   std::string phase = "respond",operation;
   Json agent_status = Json::object();
   Json approval = Json::object();
-  bool approval_expanded=false;
+  bool approval_expanded=false,approval_hidden=false;
   size_t approval_scroll=0;
   unsigned approval_focus=0;
   Id activity_started=0;
