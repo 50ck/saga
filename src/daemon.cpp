@@ -120,7 +120,8 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
           if (runtime) { runtime->close("persona_switch",emit); runtime.reset(); }
           Config c; { std::lock_guard lock(config_mutex); c = Config::load(paths); }
           c.validate();
-          auto context = std::make_unique<PersonaContext>(paths,registry.select(payload.at("uuid")),payload.at("cwd").get<std::string>());
+          auto metadata=registry.select(payload.at("uuid"));
+          auto context = std::make_unique<PersonaContext>(paths,metadata,payload.at("cwd").get<std::string>());
           auto host_environment=payload.value("host_environment",Json::object());
           if (!host_environment.is_object() || host_environment.dump().size() > 32768) throw std::runtime_error("Invalid host environment");
           context->host_environment=std::move(host_environment);
@@ -152,8 +153,33 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
         }
         else if (type == "chat") { if (!runtime) throw std::runtime_error("Select a persona first"); runtime->chat(payload.at("content"),emit,payload.value("user_message_id",id)); emit("result",{{"ok",true}}); }
         else if (type == "command") {
-          if (!runtime) throw std::runtime_error("Select a persona first");
           auto name = payload.at("name").get<std::string>(); auto args = payload.value("arguments",Json::object());
+          if(name=="erase") {
+            auto target=registry.resolve(args.value("persona",""));
+            auto target_id=target.at("uuid").get<std::string>();
+            bool current=runtime && runtime->persona().id==target_id;
+            bool owns_recording=recorder && recorder->context().value("persona_id","")==target_id;
+            std::optional<DebugOptions> options;
+            if(recorder){recorder->flush();options=recorder->options();}
+            bool detached=false;
+            auto detach=[&]{
+              if(current)runtime->discard_for_erase();
+              if(owns_recording){recording.bind(nullptr);recorder.reset();}
+              if(current)runtime.reset();
+              detached=true;
+            };
+            try {
+              registry.erase(target_id,current?runtime->persona().lock_fd:-1,detach,
+                             options?std::vector<fs::path>{options->directory}:std::vector<fs::path>{});
+            } catch(...) {
+              if(detached && current)emit("persona.erased",{{"current",true},{"complete",false}});
+              throw;
+            }
+            if(owns_recording && options){recorder=std::make_unique<DebugLogger>(*options);recording.bind(recorder.get());}
+            emit("result",{{"erased",true},{"current",current}});
+            continue;
+          }
+          if (!runtime) throw std::runtime_error("Select a persona first");
           if (name == "name" && args.contains("name")) registry.rename(runtime->persona().id,args.at("name"));
           emit("result",runtime->command(name,args,emit));
         }

@@ -26,6 +26,7 @@ std::string command_help(std::string_view query) {
     {"exit","","Session commands","Save the session and leave Saga. The daemon retains the persona's state.","/exit"},
     {"name","[new name]","Identity","Show the persona name, or deliberately change its display name.","/name\n/name Researcher"},
     {"soul","[file]","Identity","Show SOUL.md. With a file path, replace the identity seed with that file's contents; this is a user edit.","/soul\n/soul /home/me/SOUL.md"},
+    {"erase","PERSONA_NAME_OR_UUID","Identity","Permanently erase exactly one persona, including its identity, memories, conversations, tasks, private artifacts, caches and diagnostic recordings. Names must match exactly; use a UUID for duplicate names. Close other attached sessions first. Erasing the active persona returns to the selector. Workspace project files remain intact.","/erase noa\n/erase Research Assistant"},
     {"self","","Identity","Inspect evidence-backed self-beliefs, developed traits and relationship preferences.","/self"},
     {"memory","[query]","Memory and knowledge","Search autobiographical episodes and journals, including deep recall of previous work.","/memory the page we made\n/memory X11 DPI"},
     {"know","[query]","Memory and knowledge","Search semantic facts with their confidence and provenance; deep search can include historical facts.","/know operating system"},
@@ -123,6 +124,7 @@ void ChatView::event(const std::string& type,const Json& p) {
   }
   else if (type == "assistant.delta") partial += p.value("content","");
   else if(type=="help")entries.push_back({"Saga",p.at("content").get<std::string>(),false,0,0,{},true,true});
+  else if(type=="persona.erased")entries.push_back({"Saga",p.value("complete",true)?"Persona erased.":"Persona deletion is incomplete. Return to the selector and retry /erase with its UUID."});
   else if (type == "assistant.completed") { auto text=p.value("content","");if(!trim(text).empty())entries.push_back({name,text,false,0,0,{},true});else entries.push_back({"Saga","The model returned an empty response."});partial.clear(); }
   else if(type=="progress.updated") {
     auto id=p.at("message_id").get<std::string>();auto it=std::find_if(entries.begin(),entries.end(),[&](auto& entry){return entry.message_id==id;});
@@ -533,7 +535,11 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
   while (action == ChatAction::Continue) {
     std::vector<std::pair<std::string,Json>> events;
     if(!selecting){std::lock_guard lock(mutex);events.swap(pending);output_bytes=0;output_overflow=false;}
-    for (auto& [type,p] : events) view.event(type,p);
+    for (auto& [type,p] : events) {
+      if(type=="persona.erased" && p.value("current",false))action=ChatAction::Erased;
+      else view.event(type,p);
+    }
+    if(action==ChatAction::Erased)continue;
     winsize size{};if(ioctl(STDOUT_FILENO,TIOCGWINSZ,&size)==0 && size.ws_row && size.ws_col && (getmaxy(stdscr)!=size.ws_row || getmaxx(stdscr)!=size.ws_col))resizeterm(size.ws_row,size.ws_col);
     int height=getmaxy(stdscr),width=getmaxx(stdscr);bool working=busy || view.activity_started;
     if(height!=previous_height || width!=previous_width){clearok(stdscr,true);previous_height=height;previous_width=width;redraw=true;}

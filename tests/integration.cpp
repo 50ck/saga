@@ -282,6 +282,31 @@ void end_to_end(MockModel& mock,const std::string& daemon,const std::string& cli
   CHECK(cli_output.find("Ask for unrestricted host operations")!=std::string::npos);
   CHECK(cli_output.find("Unrestricted host without approval (DANGEROUS)")!=std::string::npos);
   bool saw_no_key=false; for (auto& request:mock.requests()) if (request["headers"].get<std::string>().find("Authorization:")==std::string::npos) saw_no_key=true; CHECK(saw_no_key);
+  {
+    Client deleting{Channel::connect(env.paths.socket()),false};
+    deleting.request("persona.activate",{{"uuid",b["uuid"]},{"cwd",env.project.string()}});
+    auto session=deleting.request("command",{{"name","status"}})["session_id"];
+    rejects([&]{local_command(deleting,"/erase",env.project,[](auto&,auto&){});});
+    rejects([&]{local_command(deleting,"/erase Other profile",env.project,{},true);});
+    CHECK(local_command(deleting,"/erase "+a["uuid"].get<std::string>(),env.project,[](auto&,auto&){})==Action::Continue);
+    CHECK(deleting.request("command",{{"name","status"}})["session_id"]==session);
+    bool erased_event=false;
+    CHECK(local_command(deleting,"/erase Identity B",env.project,[&](const std::string& type,const Json& payload){if(type=="persona.erased")erased_event=payload.value("current",false);})==Action::Erased);
+    CHECK(erased_event && deleting.request("personas.list").empty());
+    CHECK(!fs::exists(env.paths.persona(a["uuid"].get<std::string>())) && !fs::exists(env.paths.persona(b["uuid"].get<std::string>())));
+    CHECK(read_file(env.project/"artifact.txt")=="persistent identity artifact\n");
+  }
+  auto current=again.request("personas.create",{{"name","CLI erase fixture"}});
+  auto survivor=again.request("personas.create",{{"name","CLI survivor fixture"}});
+  CHECK(pipe(pipe_fd)==0);cli=fork();CHECK(cli>=0);
+  if(!cli){chdir(env.project.c_str());dup2(pipe_fd[0],0);close(pipe_fd[0]);close(pipe_fd[1]);int out=open((env.root/"erase-cli.out").c_str(),O_CREAT|O_WRONLY|O_TRUNC,0600);dup2(out,1);dup2(out,2);close(out);auto id=current["uuid"].get<std::string>();execl(client.c_str(),client.c_str(),"--batch",id.c_str(),"--no-tui",static_cast<char*>(nullptr));_exit(127);}
+  close(pipe_fd[0]);std::string erase_input="/erase CLI erase fixture\n1\n/erase CLI survivor fixture\nq\n";
+  CHECK(write(pipe_fd[1],erase_input.data(),erase_input.size())==static_cast<ssize_t>(erase_input.size()));close(pipe_fd[1]);
+  CHECK(waitpid(cli,&status,0)==cli);CHECK(WIFEXITED(status) && WEXITSTATUS(status)==0);
+  auto erase_output=read_file(env.root/"erase-cli.out");CHECK(erase_output.find("Persona erased.")!=std::string::npos && erase_output.find("Select the persona.")!=std::string::npos && erase_output.find("CLI survivor fixture")!=std::string::npos);
+  CHECK(erase_output.find("Create your first persona.")==std::string::npos);
+  CHECK(!fs::exists(env.paths.persona(current["uuid"].get<std::string>())) && !fs::exists(env.paths.persona(survivor["uuid"].get<std::string>())));
+  CHECK(again.request("personas.list").empty());
 }
 }
 #ifndef SAGA_INTEGRATION_NO_MAIN

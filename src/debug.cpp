@@ -247,6 +247,18 @@ void DebugLogger::open_session(std::string_view persona,Id id,const Json& fields
   started_=std::chrono::steady_clock::now();sampled_=started_;
   stopping_=false;failed_=false;sequence_=0;part_=0;part_bytes_=0;written_=0;bytes_=0;errors_=0;sidecar_bytes_=0;dropped_=0;reported_drops_=0;ring_.clear();previous_context_=Json::object();context_=redact_.apply(fields);context_["session_id"]=id;context_["persona_name"]=persona;
   manifest_={{"format_version",1},{"debug_profile",debug_profile_name(options_.profile)},{"redaction_enabled",!options_.allow_secrets},{"build",build_metadata()},{"context",redact_.apply(context_)},{"start_time",timestamp()},{"log_files",Json::array({filename})},{"sidecars",Json::array()}};
+  // Register exact bundle ownership before recording persona payloads. This
+  // survives renames, custom --debug-dir locations, rotation and crashes.
+  atomic_write(bundle_/"manifest.json",manifest_.dump(2));
+  if(fields.contains("persona_directory")) {
+    fs::path directory=fields.at("persona_directory").get<std::string>();
+    auto catalog=directory/"diagnostic-bundles.json";
+    if(fs::is_symlink(catalog))throw std::runtime_error("Refusing aliased diagnostic ownership catalog");
+    auto entries=fs::exists(catalog)?Json::parse(read_file(catalog,16*1024*1024)):Json::array();
+    if(!entries.is_array())throw std::runtime_error("Invalid diagnostic ownership catalog");
+    entries.push_back(fs::canonical(bundle_).string());
+    atomic_write(catalog,entries.dump());
+  }
   writer_=std::jthread([this]{run();});
   // Enqueue directly while holding the initialization lock to make the header first.
   Json header=context_;header.update({{"ts",timestamp()},{"mono_ns",std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()},{"seq",++sequence_},{"level","debug"},{"severity","INFO"},{"component","debug"},{"event","debug.session_started"},{"debug_profile",debug_profile_name(options_.profile)},{"file_path",log_.string()},{"redaction_enabled",!options_.allow_secrets},{"allow_secrets",options_.allow_secrets}});

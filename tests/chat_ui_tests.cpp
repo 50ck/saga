@@ -10,6 +10,15 @@ int main(int argc,char** argv) {
   std::setlocale(LC_ALL,"C.UTF-8");
   try {
     ChatView view; view.name="Persona 東京"; view.model="Long-local-model-name-for-status-testing"; view.context=65536;
+    if(argc==2 && std::string(argv[1])=="--erase-demo") {
+      auto action=chat_ui(view,[](const std::string& input,Emit emit){
+        CHECK(input=="/erase Persona 東京");emit("persona.erased",{{"erased",true},{"current",true}});
+      },[]{return std::optional<Json>{};},[](const Json&){CHECK(false);});
+      CHECK(action==ChatAction::Erased);std::cout<<"ERASE_SELECTOR_OK\n";return 0;
+    }
+    CHECK(command_help("erase").find("Permanently erase exactly one persona")!=std::string::npos);
+    ChatView erased_other;erased_other.event("persona.erased",{{"erased",true},{"current",false}});
+    CHECK(erased_other.entries.back().text=="Persona erased.");
     if (argc == 2 && std::string(argv[1]) == "--mouse-demo") {
       std::string history="HISTORY_OLDEST\n";
       for(int i=0;i<60;++i) history += "History line "+std::to_string(i)+"\n";

@@ -7,7 +7,8 @@
 #include <sys/stat.h>
 
 namespace saga {
-Database::Database(const fs::path& path):path_(path) {
+Database::Database(const fs::path& path,bool diagnostics):path_(path),diagnostics_(diagnostics) {
+  DebugScope recording(diagnostics_ ? debug_logger() : nullptr);
   if (fs::is_symlink(path)) throw std::runtime_error("Refusing symlink database");
   if (sqlite3_open_v2(path.c_str(), &handle_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr) != SQLITE_OK) {
     std::string err = handle_ ? sqlite3_errmsg(handle_) : "Cannot open database";
@@ -28,6 +29,7 @@ void Database::sql(std::string_view text) {
   }
 }
 Json Database::query(std::string_view sql_text, const std::vector<Json>& params) {
+  DebugScope recording(diagnostics_ ? debug_logger() : nullptr);
   TraceSpan span("database","query",{{"database",path_.string()}});
   if(auto log=debug_logger();log && log->enabled(DebugProfile::Forensic))trace("database","database.statement",{{"database",path_.string()},{"statement",sql_text},{"parameters",params}},DebugProfile::Forensic);
   sqlite3_stmt* raw = nullptr;
@@ -64,11 +66,12 @@ Json Database::query(std::string_view sql_text, const std::vector<Json>& params)
   return rows;
 }
 void Database::diagnostic(std::string type,const Json& fields) {
-  if(!debug_logger())return;
+  if(!diagnostics_ || !debug_logger())return;
   if(recording_transaction_)pending_diagnostics_.emplace_back(std::move(type),fields);
   else debug_logger()->observe(type,fields);
 }
 Id Database::exec(std::string_view statement, const std::vector<Json>& params) {
+  DebugScope recording(diagnostics_ ? debug_logger() : nullptr);
   if(!debug_logger()){query(statement,params);return sqlite3_last_insert_rowid(handle_);}
   auto text=lower(std::string(statement));std::string operation;
   if(text.starts_with("insert"))operation="INSERT";else if(text.starts_with("update"))operation="UPDATE";else if(text.starts_with("delete"))operation="DELETE";
@@ -87,6 +90,7 @@ Id Database::exec(std::string_view statement, const std::vector<Json>& params) {
 }
 int Database::changes() const { return sqlite3_changes(handle_); }
 void Database::transaction(const std::function<void()>& operation) {
+  DebugScope recording(diagnostics_ ? debug_logger() : nullptr);
   TraceSpan span("database","transaction",{{"database",path_.string()}});
   sql("BEGIN IMMEDIATE");recording_transaction_=true;pending_diagnostics_.clear();
   trace("database","database.transaction.started",{{"database",path_.string()}},DebugProfile::Trace);

@@ -82,8 +82,12 @@ int main() {
         auto started=client.receive(1000); CHECK(started && (*started)["type"]=="tool.started" && (*started)["request_id"]==running_id);
         auto status=request(client,"command",{{"name","status"}}); CHECK(status["permissions"]["mode"]=="host_always");
         CHECK(request(client,"command",{{"name","permissions"},{"arguments",{{"mode","host_ask"}}}})["mode"]=="host_ask");
+        CHECK(request(client,"command",{{"name","erase"},{"arguments",{{"persona",own_id}}}}).contains("error"));
+        CHECK(fs::exists(paths.persona(own_id)/"agent.db"));
         bool finished=false;
-        for (int n=0;n<20;++n) { auto frame=client.receive(1000); CHECK(frame); CHECK((*frame)["request_id"]==running_id); if ((*frame)["type"]=="result") {CHECK((*frame)["payload"]["stdout"]=="running");finished=true;break;} }
+        // A silent command may legitimately take slightly over its one-second
+        // sleep under load. Keep a bounded wait, without requiring a heartbeat.
+        for (int n=0;n<20;++n) { auto frame=client.receive(1000); if(!frame)continue; CHECK((*frame)["request_id"]==running_id); if ((*frame)["type"]=="result") {CHECK((*frame)["payload"]["stdout"]=="running");finished=true;break;} }
         CHECK(finished);
         // Stop resolves a pending approval, kills no unstarted action, and retains the session.
         auto blocked_id=uuid();client.send({{"type","command"},{"request_id",blocked_id},{"payload",{{"name","tool"},{"arguments",{{"name","shell_exec"},{"arguments",{{"command","touch must-not-run"},{"execution","host"}}}}}}}});

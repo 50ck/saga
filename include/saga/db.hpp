@@ -5,11 +5,12 @@ namespace saga {
 class Database {
   sqlite3* handle_ = nullptr;
   fs::path path_;
+  bool diagnostics_;
   bool recording_transaction_=false;
   std::vector<std::pair<std::string,Json>> pending_diagnostics_;
   void diagnostic(std::string,const Json&);
 public:
-  explicit Database(const fs::path& path);
+  explicit Database(const fs::path& path,bool diagnostics=true);
   ~Database();
   Database(const Database&) = delete;
   Database& operator=(const Database&) = delete;

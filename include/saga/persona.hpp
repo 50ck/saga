@@ -11,6 +11,10 @@ public:
   Json create(std::string name = "Assistant", std::string soul = std::string(default_soul));
   Json select(const std::string& id);
   void rename(const std::string& id,const std::string& name);
+  Json resolve(const std::string& selector);
+  // Caller detaches an owned runtime only after validation and exclusive locking.
+  void erase(const std::string& id,int owned_lock=-1,
+             const std::function<void()>& detach={},const std::vector<fs::path>& debug_directories={});
 };
 struct PersonaContext {
   std::string id, name;

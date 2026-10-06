@@ -120,6 +120,7 @@ model, increase this advanced setting in `config.toml`; backend setup preserves 
 | `/compact` | Save typed cognition and a handoff, then rebuild working context |
 | `/new` | Close/consolidate this session and start another |
 | `/persona` | Close the session and return to the selector |
+| `/erase NAME_OR_UUID` | Permanently erase one persona and all its private data; return to the selector when erasing the active persona |
 | `/model` | Close the session and configure the global backend |
 | `/name`, `/name NEW NAME` | Show or deliberately change your persona's display name |
 | `/soul`, `/soul FILE` | Show the seed or deliberately replace it with your file |
@@ -230,6 +231,25 @@ Unset config/data/state variables use standard home fallbacks. An unavailable
 runtime directory uses `/tmp/saga-<uid>/saga/`. Directories use 0700; configuration,
 databases, locks, logs and sockets use 0600. The registry contains only selection
 metadata. Each persona has an exclusive context lock and an independent database.
+
+`/erase noa` removes exactly the persona named `noa`. Names with spaces work
+without quotes (`/erase Research Assistant`); duplicate names require the UUID
+from the persona registry. This is irreversible and does not ask the model for
+permission. It deletes SOUL, all memories and their original sources, sessions,
+conversations, goals, tasks, learned state, private artifacts, caches, database
+side files, and owned diagnostic bundles, including custom `--debug-dir`
+locations registered by this version. Other personas, global configuration and
+workspace/project files stay intact. An attached session in another client
+prevents deletion; finish or stop active work before using the command.
+
+Diagnostic ownership is recorded by UUID in each persona's
+`diagnostic-bundles.json`, independently of its display name. Existing bundles
+in the default log directory and the current custom log directory are also
+discovered through their manifests. Old, unregistered recordings in other
+custom directories, exported copies and backups cannot be located automatically.
+Deletion is filesystem removal, not secure erasure of storage or backups.
+Interrupted deletion leaves a registry tombstone that prevents selection or
+maintenance of a partly deleted identity; retry `/erase UUID` to finish cleanup.
 
 Databases use WAL, foreign keys, full synchronization, atomic migrations and
 explicit schema versions. Version 2 adds project-scoped facts; version 3 adds

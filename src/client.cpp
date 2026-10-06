@@ -150,6 +150,24 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   if (name == "persona") return Action::Selector;
   if (name == "model") return Action::ModelSetup;
   if (name == "help") { auto help=command_help(arg); if (callback) callback("help",{{"content",help}}); else {for(auto& line:markdown_lines(help,100))std::cout<<chat_utf8(line.text)<<'\n';} return Action::Continue; }
+  if(name=="erase") {
+    if(live)throw std::runtime_error("Wait for the current turn before erasing a persona");
+    bool detached=false;
+    auto events=[&](const std::string& type,const Json& payload){
+      if(type=="persona.erased" && payload.value("current",false))detached=true;
+      if(callback)callback(type,payload);
+    };
+    Json result;
+    try{result=client.request("command",{{"name","erase"},{"arguments",{{"persona",arg}}}},events);}
+    catch(const std::exception& error){
+      if(!detached)throw;
+      if(callback)callback("error",{{"message",error.what()}});else std::cerr<<"Saga: "<<error.what()<<'\n';
+      return Action::Erased;
+    }
+    if(callback)callback("persona.erased",result);
+    else if(!client.json_output)std::cout<<"Persona erased.\n";
+    return result.value("current",false)?Action::Erased:Action::Continue;
+  }
   if (name == "new") { auto r=client.request("command",{{"name","new"}},callback); if (callback) {callback("session.reset",Json::object());if(r.contains("status"))callback("agent.status",r["status"]);} return Action::NewSession; }
   Json args = Json::object();
   if(name=="diff") {args["event_id"]=std::stoll(arg);}
@@ -261,6 +279,7 @@ int main(int argc,char** argv) {
       client.request(request.at("type"),request.value("payload",Json::object()));return 0;
     }
     auto cwd = fs::current_path();
+    bool erased=false;
     while (true) {
       Json metadata;
       if (!batch.empty()) {
@@ -268,7 +287,7 @@ int main(int argc,char** argv) {
         metadata = {{"uuid",batch},{"display_name",""}};
       } else {
         auto list = client.request("personas.list");
-        if (list.empty()) metadata = create_persona(client,true,full_screen);
+        if (list.empty() && !erased) metadata = create_persona(client,true,full_screen);
         else {
           std::vector<std::string> entries; for (auto& p : list) entries.push_back(p["display_name"]);
           entries.push_back("+ Create persona..."); auto selected = select_menu("Select the persona.",entries,full_screen);
@@ -277,6 +296,7 @@ int main(int argc,char** argv) {
         }
         if (metadata.is_null()) break;
       }
+      erased=false;
       auto backend = client.request("backend.status");
       if (!backend["configured"].get<bool>()) setup(client,full_screen);
       bool use_tui = full_screen && isatty(0) && isatty(1);
@@ -291,6 +311,7 @@ int main(int argc,char** argv) {
       else action = line_chat(client,cwd);
       client.request("session.close",{{"reason",action == Action::Selector ? "persona_switch" : "user_exit"}});
       if (action == Action::ModelSetup) setup(client,full_screen);
+      if (action == Action::Erased) {batch.clear();erased=true;}
       if (action == Action::Exit || !batch.empty()) break;
     }
     return 0;

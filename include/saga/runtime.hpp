@@ -56,6 +56,7 @@ public:
   void chat(std::string input,Emit emit,std::string user_message_id = {});
   Json command(std::string name,const Json& args = Json::object(),Emit emit = {});
   void close(std::string reason,Emit emit = {});
+  void discard_for_erase();
   void tick(Emit emit = {},bool use_model = true);
   PersonaContext& persona() { return *p_; }
   void service(std::function<void()> callback);

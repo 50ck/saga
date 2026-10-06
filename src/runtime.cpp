@@ -244,6 +244,10 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
 Runtime::Runtime(std::unique_ptr<PersonaContext> p,Config c,std::unique_ptr<ModelBackend> backend,Approve approve,WebTransport transport)
   : p_(std::move(p)),config_(std::move(c)),backend_(std::move(backend)),memory_(*p_,config_),tools_(*p_,memory_,std::move(approve),config_,std::move(transport)),context_(*p_,memory_,config_) {}
 Runtime::~Runtime() { if (!closed_ && p_->session) { try { close("client_disconnect"); } catch (...) {} } }
+void Runtime::discard_for_erase() {
+  if(active_)throw std::runtime_error("Wait for the current turn before erasing this persona");
+  closed_=true; // Do not consolidate or create fresh memories while deleting an identity.
+}
 void Runtime::mode(CognitiveMode m,Emit emit) { current_mode_=m; if (emit) emit("cognitive.mode",{{"mode",mode_name(m)}}); p_->db->event("cognitive.mode",{{"mode",mode_name(m)}},p_->session,p_->task); }
 void Runtime::start(Emit emit) {
   config_.validate();
@@ -260,7 +264,7 @@ void Runtime::start(Emit emit) {
   });
   if(auto log=debug_logger()) {
     log->secret(config_.api_key);
-    log->session(p_->name,p_->session,{{"persona_id",p_->id},{"conversation_id",p_->session},{"workspace",p_->project_root.string()},{"project_id",p_->project},{"model",config_.model},{"endpoint",config_.endpoint}});
+    log->session(p_->name,p_->session,{{"persona_id",p_->id},{"persona_directory",p_->directory.string()},{"conversation_id",p_->session},{"workspace",p_->project_root.string()},{"project_id",p_->project},{"model",config_.model},{"endpoint",config_.endpoint}});
     trace("session","session.started",{{"session_id",p_->session}});
     trace("persona","persona.selected",{{"persona_id",p_->id},{"name",p_->name},{"directory",p_->directory.string()},{"soul_path",(p_->directory/"SOUL.md").string()},{"soul_bytes",p_->soul.size()},{"soul_sha256",debug_sha256(p_->soul)},{"soul_tokens_estimate",estimate_tokens(p_->soul)}});
     trace("persona","persona.snapshot",{{"content",p_->soul}},DebugProfile::Forensic);

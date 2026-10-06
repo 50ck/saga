@@ -1,7 +1,7 @@
 #pragma once
 #include <saga/common.hpp>
 namespace saga {
-enum class ChatAction { Continue, Selector, ModelSetup, Exit, NewSession };
+enum class ChatAction { Continue, Selector, ModelSetup, Exit, NewSession, Erased };
 enum class ChatColor : short { Default, Approval, Saga, Activity, Prompt, Command, String, Option, Variable, Operator, Comment, InlineCode, CodeBlock, Link, Heading, CodeFocus, Addition, Deletion };
 enum ChatStyle : unsigned { Bold=1, Italic=2, Underline=4, Strike=8 };
 struct ChatSpan { size_t start,length; ChatColor color; unsigned style=0; };
