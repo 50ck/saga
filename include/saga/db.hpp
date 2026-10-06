@@ -4,6 +4,10 @@ struct sqlite3;
 namespace saga {
 class Database {
   sqlite3* handle_ = nullptr;
+  fs::path path_;
+  bool recording_transaction_=false;
+  std::vector<std::pair<std::string,Json>> pending_diagnostics_;
+  void diagnostic(std::string,const Json&);
 public:
   explicit Database(const fs::path& path);
   ~Database();

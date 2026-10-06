@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/model.hpp>
 #include <curl/curl.h>
 #include <algorithm>
@@ -60,6 +61,7 @@ void OpenAIStreamAdapter::feed(const Json& chunk) {
     bool full=!choice.contains("delta");
     auto delta=full ? choice.value("message",Json::object()) : choice["delta"];
     if(!delta.is_object())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model delta");
+    trace("sse","stream.parsed",{{"parser","openai_chat_completions"},{"choice_index",choice.value("index",0)},{"has_reasoning",delta.contains("reasoning_content") || delta.contains("reasoning")},{"has_content",delta.contains("content")},{"has_tool_delta",delta.contains("tool_calls")},{"has_finish_reason",choice.contains("finish_reason") && !choice["finish_reason"].is_null()},{"has_usage",chunk.contains("usage")}},DebugProfile::Trace,"TRACE",false);
     // Full messages are normalized as snapshots. The state owner reconciles
     // them against its canonical buffers instead of duplicating those buffers.
     {
@@ -103,6 +105,7 @@ void OpenAIStreamAdapter::feed(const Json& chunk) {
     if(choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
       if(!choice["finish_reason"].is_string())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid finish reason");
       auto reason=choice["finish_reason"].get<std::string>();
+      trace("provider","provider.finish",{{"raw_finish_reason",reason}},DebugProfile::Debug);
       finish_=reason=="stop"?FinishReason::Stop:reason=="tool_calls" || reason=="function_call"?FinishReason::ToolCall:reason=="length"?FinishReason::Length:reason=="content_filter"?FinishReason::ContentFilter:FinishReason::Unknown;
     }
   }
@@ -143,9 +146,18 @@ OpenAICompatibleBackend::OpenAICompatibleBackend(Config c) : config_(std::move(c
   static std::once_flag init;
   std::call_once(init,[]{ if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) throw std::runtime_error("libcurl initialization failed"); });
   auto urls = normalize(config_.endpoint); base_ = urls.first; api_ = urls.second;
+  if(debug_logger())debug_logger()->secret(config_.api_key);
+  trace("provider","provider.configured",{{"kind","openai-compatible"},{"endpoint",config_.endpoint},{"api_path",api_},{"authentication_present",!config_.api_key.empty()}},DebugProfile::Debug);
   if (config_.api_key.find_first_of("\r\n") != std::string::npos) throw std::runtime_error("Invalid API key");
 }
 Json OpenAICompatibleBackend::request(std::string_view method, const std::string& url, const Json& body, StreamCallback cb) {
+  auto logger=debug_logger();
+  auto request_id=logger ? "http_"+logger->next_span() : std::string();
+  trace_request_id_=request_id;
+  TraceContext request_context({{"request_id",request_id}});
+  TraceSpan operation("http","provider_request",{{"method",method},{"url",url}},DebugProfile::Wire);
+  trace("http","http.request.started",{{"method",method},{"url",url},{"tls",url.starts_with("https:")},{"headers",{{"Content-Type","application/json"},{"Accept","application/json, text/event-stream"},{"Authorization",config_.api_key.empty()?"absent":"Bearer "+config_.api_key}}}},DebugProfile::Wire);
+  if(logger && logger->enabled(DebugProfile::Wire))trace("http","http.request.body",{{"payload",body}},DebugProfile::Wire);
   std::unique_ptr<CURL,decltype(&curl_easy_cleanup)> curl(curl_easy_init(),curl_easy_cleanup);
   if (!curl) throw std::runtime_error("Cannot create HTTP connection");
   curl_slist* raw_headers = nullptr;
@@ -154,7 +166,10 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
   if (!config_.api_key.empty()) raw_headers = curl_slist_append(raw_headers,("Authorization: Bearer " + config_.api_key).c_str());
   std::unique_ptr<curl_slist,decltype(&curl_slist_free_all)> headers(raw_headers,curl_slist_free_all);
   struct State {
-    std::string body;
+    std::string body,wire;
+    Json headers=Json::object();
+    size_t chunk_index=0,wire_bytes=0;
+    bool record_wire=false,wire_truncated=false;
     std::exception_ptr error;
     StreamCallback callback;
     std::function<void()> control;
@@ -171,11 +186,22 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
       callback(chunk);
     }) {}
   } state(cb);
+  state.record_wire=logger && logger->enabled(DebugProfile::Wire);
+  struct WireCapture {
+    State& state;
+    ~WireCapture(){if(state.record_wire)trace("sse","stream.raw_complete",{{"payload",state.wire},{"received_bytes",state.wire_bytes},{"chunks",state.chunk_index},{"truncated",state.wire_truncated},{"representation","redacted_transport_text"}},DebugProfile::Wire);}
+  } capture{state};
   state.control=control_;state.handle=curl.get();state.idle_timeout=config_.timeout_seconds;
   auto write_cb = +[](char* bytes, size_t size, size_t count, void* data)->size_t {
     auto& state_ref = *static_cast<State*>(data); size_t n = size*count;
     try {
       state_ref.last_activity=std::chrono::steady_clock::now();
+      if(state_ref.record_wire){
+        trace("sse","stream.raw_chunk",{{"stream_seq",++state_ref.chunk_index},{"offset",state_ref.wire_bytes},{"bytes",n}},DebugProfile::Wire,"TRACE",true);
+        if(state_ref.wire_bytes==0)trace("http","http.response.first_byte",Json::object(),DebugProfile::Wire);
+        state_ref.wire_bytes+=n;
+        auto available=16*1024*1024-state_ref.wire.size();state_ref.wire.append(bytes,std::min(n,available));if(n>available)state_ref.wire_truncated=true;
+      }
       long status=0;curl_easy_getinfo(state_ref.handle,CURLINFO_RESPONSE_CODE,&status);
       if (state_ref.body.size()+n > 16*1024*1024) throw std::runtime_error("HTTP response exceeds limit");
       if(!state_ref.callback || status>=300)state_ref.body.append(bytes,n);
@@ -186,6 +212,16 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
   auto set = [&](CURLoption option,auto value){ if (curl_easy_setopt(curl.get(),option,value) != CURLE_OK) throw std::runtime_error("Cannot configure HTTP request"); };
   set(CURLOPT_URL,url.c_str()); set(CURLOPT_HTTPHEADER,headers.get());
   set(CURLOPT_WRITEFUNCTION,write_cb); set(CURLOPT_WRITEDATA,&state);
+  set(CURLOPT_HEADERDATA,&state);
+  set(CURLOPT_HEADERFUNCTION,+[](char* bytes,size_t size,size_t count,void* data)->size_t {
+    auto& s=*static_cast<State*>(data);auto n=size*count;
+    try{std::string_view line(bytes,n);auto colon=line.find(':');
+      if(line.starts_with("HTTP/"))s.headers=Json::object();
+      if(colon!=std::string_view::npos)s.headers[lower(std::string(line.substr(0,colon)))]=trim(line.substr(colon+1));
+      if(trim(line).empty())trace("http","http.response.headers",{{"headers",s.headers}},DebugProfile::Wire);
+      return n;
+    }catch(...){s.error=std::current_exception();return 0;}
+  });
   if (cb || control_) {
     // Service local controls even when inference has not sent any SSE bytes yet.
     auto progress = +[](void* data,curl_off_t,curl_off_t,curl_off_t,curl_off_t)->int {
@@ -209,7 +245,11 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
   std::string serialized;
   if (method == "POST") { serialized = body.dump(); set(CURLOPT_POST,1L); set(CURLOPT_POSTFIELDS,serialized.data()); set(CURLOPT_POSTFIELDSIZE,static_cast<long>(serialized.size())); }
   auto rc = curl_easy_perform(curl.get());
-  if (state.error) std::rethrow_exception(state.error);
+  long observed_status=0;curl_easy_getinfo(curl.get(),CURLINFO_RESPONSE_CODE,&observed_status);
+  Json timeline={{"status",observed_status},{"curl_code",static_cast<int>(rc)}};
+  for(auto [info,name]:{std::pair{CURLINFO_NAMELOOKUP_TIME,"dns_seconds"},{CURLINFO_CONNECT_TIME,"connect_seconds"},{CURLINFO_APPCONNECT_TIME,"tls_seconds"},{CURLINFO_STARTTRANSFER_TIME,"first_byte_seconds"},{CURLINFO_TOTAL_TIME,"total_seconds"}}){double seconds=0;if(curl_easy_getinfo(curl.get(),info,&seconds)==CURLE_OK)timeline[name]=seconds;}
+  trace("http","http.response.completed",timeline,DebugProfile::Wire,rc==CURLE_OK?"INFO":"ERROR");
+  if(state.error){trace("sse","stream.interrupted",{{"received_bytes",state.wire_bytes},{"terminal_seen",state.finished}},DebugProfile::Debug,"WARN");std::rethrow_exception(state.error);}
   if (rc == CURLE_OPERATION_TIMEDOUT) throw ProviderError(ProviderErrorKind::Timeout,"Model request timed out (idle/response limit " + std::to_string(timeout) + "s, connection limit 10s)",true);
   if (rc != CURLE_OK) throw ProviderError(ProviderErrorKind::Connection,std::string("Model connection failed: ")+curl_easy_strerror(rc),true);
   long status = 0; curl_easy_getinfo(curl.get(),CURLINFO_RESPONSE_CODE,&status);
@@ -232,7 +272,9 @@ static std::optional<std::uint64_t> context_metadata(const Json& value) {
   return {};
 }
 std::vector<ModelInfo> OpenAICompatibleBackend::models() {
+  trace("provider","model.discovery.started");
   auto r = request("GET",api_ + "/models");
+  trace("provider","model.discovery.response",{{"metadata",r}},DebugProfile::Trace);
   std::vector<ModelInfo> out;
   if (!r.contains("data") || !r["data"].is_array()) throw std::runtime_error("Invalid /v1/models response");
   for (auto& m : r["data"]) {
@@ -242,6 +284,7 @@ std::vector<ModelInfo> OpenAICompatibleBackend::models() {
     if(info.id==config_.model && m.contains("max_output_tokens") && m["max_output_tokens"].is_number_unsigned())output_limit_=m["max_output_tokens"].get<std::uint64_t>();
     out.push_back(std::move(info));
   }
+  trace("provider","model.discovery.candidates",{{"configured_model",config_.model},{"available",r}},DebugProfile::Trace);
   if (out.empty()) throw std::runtime_error("Endpoint exposes no models");
   return out;
 }
@@ -251,15 +294,19 @@ ModelInfo OpenAICompatibleBackend::discover() {
   if (config_.model.empty() && list.size() == 1) it = list.begin();
   if (it == list.end()) throw std::runtime_error("Select one of the endpoint's models");
   auto info = *it;
+  auto selection_reason=config_.model.empty()?"only_available_model":"configured_model";
+  std::string context_source=info.context_length?"model_metadata":"unavailable";
   if (!info.context_length) {
     try {
       auto props = request("GET",base_ + "/props");
       info.context_length = context_metadata(props);
+      if(info.context_length)context_source="provider_props";
       if (props.contains("default_generation_settings")) llama_cpp_ = true;
     } catch (const std::exception&) { /* optional endpoint */ }
   }
   config_.model = info.id;
   if (config_.context_length == 0 && info.context_length) config_.context_length = *info.context_length;
+  trace("provider","model.selected",{{"model",info.id},{"selection_reason",selection_reason},{"context_window",config_.context_length},{"reported_context_window",info.context_length?Json(*info.context_length):Json()},{"metadata_source",context_source}},DebugProfile::Debug);
   discovered_ = true;
   return info;
 }
@@ -283,7 +330,7 @@ CapabilityReport OpenAICompatibleBackend::probe(Emit progress) {
   status("completion","Testing basic completion");
   auto basic = request("POST",api_ + "/chat/completions",body);
   report.connected = true;
-  GenerationState full; OpenAIStreamAdapter basic_adapter([&](auto& e){full.accept(e);});basic_adapter.feed(basic);basic_adapter.finish(); report.completion = !trim(full.content).empty();
+  GenerationState full;{TraceContext normalized({{"request_id",trace_request_id_}});OpenAIStreamAdapter basic_adapter([&](auto& e){full.accept(e);});basic_adapter.feed(basic);basic_adapter.finish();}report.completion = !trim(full.content).empty();
   if (!report.completion) throw std::runtime_error("Incompatible backend: completion probe returned no answer");
   status("completion","Basic completion",true);
   body["messages"][0]["content"] = "Invoke saga_probe with ok=true.";
@@ -291,7 +338,7 @@ CapabilityReport OpenAICompatibleBackend::probe(Emit progress) {
   body["tool_choice"] = "required";
   body["max_tokens"] = llama_cpp_ ? 64 : 512;
   status("tools","Testing function calling");
-  GenerationState tool;OpenAIStreamAdapter tool_adapter([&](auto& e){tool.accept(e);});tool_adapter.feed(request("POST",api_ + "/chat/completions",body));tool_adapter.finish();
+  GenerationState tool;auto tool_response=request("POST",api_+"/chat/completions",body);{TraceContext normalized({{"request_id",trace_request_id_}});OpenAIStreamAdapter tool_adapter([&](auto& e){tool.accept(e);});tool_adapter.feed(tool_response);tool_adapter.finish();}
   if (tool.calls.size() == 1) {
     auto call = tool.message()["tool_calls"][0];
     auto args = Json::parse(call["function"]["arguments"].get<std::string>());
@@ -347,6 +394,7 @@ void OpenAICompatibleBackend::stream_chat(const ChatRequest& r,StreamCallback cb
   try { request("POST",api_ + "/chat/completions",body,wrapped); }
   catch (const std::exception& e) {
     if (!emitted && std::string(e.what()) == "Model HTTP status 400") {
+      trace("provider","provider.request.compatibility_fallback",{{"reason","optional_request_fields_rejected"},{"http_status",400}},DebugProfile::Debug,"WARN");
       body.erase("stream_options");body.erase("timings_per_token");body.erase("return_progress");body.erase("cache_prompt");
       if(body.contains("chat_template_kwargs")){body["chat_template_kwargs"].erase("preserve_thinking");if(body["chat_template_kwargs"].empty())body.erase("chat_template_kwargs");}
       request("POST",api_ + "/chat/completions",body,wrapped);
@@ -379,11 +427,16 @@ void OpenAICompatibleBackend::generate(const ChatRequest& r,ProviderCallback cb)
       cb({ProviderEventKind::Warning,ended?"Requested end of reasoning":"Reasoning hard budget reached; preserving the active stream",{{"tokens_estimate",tokens},{"control_requested",ended}}});
     }
   });
-  try {stream_chat(r,[&](const Json& chunk){adapter.feed(chunk);});}
+  std::string stream_request_id;
+  try {stream_chat(r,[&](const Json& chunk){
+    if(auto logger=debug_logger())stream_request_id=logger->context().value("request_id",std::string());
+    try{adapter.feed(chunk);}catch(const ProviderError& error){trace("sse","stream.parse_error",{{"message",error.what()},{"recoverable",error.transient}},DebugProfile::Debug,"ERROR");throw;}
+  });}
   catch(const ProviderError& error) {
     if(!adapter.has_finish() || (error.kind!=ProviderErrorKind::Connection && error.kind!=ProviderErrorKind::Interrupted))throw;
     cb({ProviderEventKind::Warning,"Transport ended after a valid terminal marker; retaining the generation"});
   }
+  TraceContext completed({{"request_id",stream_request_id.empty()?trace_request_id_:stream_request_id}});
   adapter.finish();
 }
 }

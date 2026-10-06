@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/ipc.hpp>
 #include <saga/model.hpp>
 #include <saga/chat_ui.hpp>
@@ -231,26 +232,34 @@ int main(int argc,char** argv) {
   try {
     if (!std::setlocale(LC_ALL,"")) std::setlocale(LC_ALL,"C.UTF-8");
     if (MB_CUR_MAX == 1) std::setlocale(LC_CTYPE,"C.UTF-8");
-    bool full_screen = true, json_output = false; std::string batch;
+    bool full_screen = true, json_output = false,request_mode=false; std::string batch;DebugOptions debug;
     for (int i = 1; i < argc; ++i) {
       std::string arg(argv[i]);
-      if (arg == "--help") { std::cout << "Saga — local-first persistent cognitive agents\nUsage: saga [--no-tui] [--json] [--batch UUID]\n       saga --request (one JSON control request from stdin)\n       saga --version\nSelect a persona at every interactive start. Use /help for commands.\n"; return 0; }
+      if(debug_argument(argc,argv,i,debug))continue;
+      if (arg == "--help") { std::cout << "Saga — local-first persistent cognitive agents\nUsage: saga [--no-tui] [--json] [--batch UUID] [--debug [LEVEL]]\nDebug levels: off, debug, trace, wire, forensic.\nOptions: --debug-dir PATH --debug-components LIST --debug-exclude LIST\n         --debug-rotate-size 64M --debug-keep N --debug-allow-secrets\n       saga --request (one JSON control request from stdin)\n       saga --version\nSelect a persona at every interactive start. Use /help for commands.\n"; return 0; }
       if (arg == "--version") { std::cout << "Saga 0.1.0\n"; return 0; }
       if (arg == "--no-tui") full_screen = false;
       else if (arg == "--json") { json_output = true; full_screen = false; }
       else if (arg == "--batch" && i+1 < argc) { batch = argv[++i]; full_screen = false; }
-      else if (arg != "--request") throw std::runtime_error("Unknown argument: " + arg);
+      else if(arg=="--request")request_mode=true;
+      else throw std::runtime_error("Unknown argument: " + arg);
     }
     auto paths = Paths::environment(); paths.create();
     auto exe = fs::canonical("/proc/self/exe").parent_path() / "sagad";
     start_daemon(paths,exe);
     Client client{Channel::connect(paths.socket()),json_output};
-    if (argc == 2 && std::string(argv[1]) == "--request") {
-      auto line = prompt(""); auto request = Json::parse(line); client.json_output = true;
-      client.request(request.at("type"),request.value("payload",Json::object())); return 0;
-    }
     if(client.request("ping").value("context_revision",0)<runtime_context_revision)
       throw std::runtime_error("The running sagad predates this client's runtime updates. Close existing Saga sessions, run 'pkill -TERM -x sagad', then reopen Saga to load the updated daemon.");
+    if(debug.specified) {
+      debug=DebugOptions::from_json(debug.json(),paths);
+      if(debug.allow_secrets)std::cerr<<"Saga warning: diagnostic secret redaction is DISABLED. Logs may contain credentials and private content.\n";
+      auto recording=client.request("debug.configure",debug.json());
+      if(debug.profile!=DebugProfile::Off)std::cerr<<"Saga diagnostic recording: "<<recording.value("path","")<<'\n';
+    }
+    if(request_mode) {
+      auto line=prompt("");auto request=Json::parse(line);client.json_output=true;
+      client.request(request.at("type"),request.value("payload",Json::object()));return 0;
+    }
     auto cwd = fs::current_path();
     while (true) {
       Json metadata;

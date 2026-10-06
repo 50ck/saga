@@ -624,3 +624,7 @@ not claimed. Generic discussion pages retain source paragraphs unless reliable
 author/reply structure is supplied by a platform API. Extraction weights are
 heuristics calibrated against the synthetic corpus, not guarantees for every
 site layout. Conservative token estimates may reduce context utilization.
+
+Diagnostic flight recording is available with `saga --debug debug|trace|wire|forensic`.
+See [runtime diagnostics](docs/diagnostics.md) for profiles, private JSONL files,
+redaction, context/memory provenance and crash guarantees.

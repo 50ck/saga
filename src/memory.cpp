@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/memory.hpp>
 #include <saga/web.hpp>
 #include <algorithm>
@@ -45,6 +46,8 @@ Json Memory::recall(const std::string &kind,Id id,Id offset,Id limit) {
   return {{"memory_ref",memory_reference(rows[0],kind)},{"retrieval_actions",memory_actions(rows[0],kind)},{"content",text.substr(begin,end-begin)},{"offset",begin},{"next_offset",end},{"total_bytes",text.size()},{"complete",end==text.size()},{"hash",digest(text)},{"historical",true},{"untrusted",true}};
 }
 Json Memory::search(std::string kind, std::string query, bool deep) {
+  TraceSpan span("memory","recall",{{"kind",kind},{"depth",deep?"deep":"normal"}});
+  trace("memory","memory.search.started",{{"query",query},{"kind",kind},{"database",(p_.directory/"agent.db").string()},{"limit",deep?16:8}},DebugProfile::Trace);
   if (query.size() > 4096) throw std::runtime_error("Memory query exceeds limit");
   auto ws = words(query);
   std::set<Id> entity_ids;
@@ -72,10 +75,10 @@ Json Memory::search(std::string kind, std::string query, bool deep) {
     auto goals = p_.db->query("SELECT description FROM goals WHERE status='active' AND (project_id IS NULL OR project_id=?)",{p_.project});
     for (auto row : rows) {
       Id id = row["id"];
-      if (!seen.insert(id).second) continue;
-      if (type == "praxis" && (row["status"] == "deprecated" || (!row["project_id"].is_null() && row["project_id"] != p_.project))) continue;
-      if (type == "fact" && !deep && !row["valid_to"].is_null()) continue;
-      if (type == "fact" && !deep && !row["project_id"].is_null() && row["project_id"] != p_.project) continue;
+      if (!seen.insert(id).second){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","duplicate_retrieval_candidate"}},DebugProfile::Trace);continue;}
+      if (type == "praxis" && (row["status"] == "deprecated" || (!row["project_id"].is_null() && row["project_id"] != p_.project))){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","deprecated_or_different_project"}},DebugProfile::Trace);continue;}
+      if (type == "fact" && !deep && !row["valid_to"].is_null()){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","superseded_fact"}},DebugProfile::Trace);continue;}
+      if (type == "fact" && !deep && !row["project_id"].is_null() && row["project_id"] != p_.project){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","different_project"}},DebugProfile::Trace);continue;}
       double entity_overlap = 0;
       if (type == "episode" || type == "fact" || type == "artifact") {
         auto links = p_.db->query("SELECT entity_id FROM " + type + "_entities WHERE " + type + "_id=?",{id});
@@ -126,6 +129,10 @@ Json Memory::search(std::string kind, std::string query, bool deep) {
   else if (kind == "inspect_open_loops") return p_.db->query("SELECT * FROM open_loops WHERE state='open' AND (project_id IS NULL OR project_id=?) ORDER BY priority DESC LIMIT 20",{p_.project});
   else throw std::runtime_error("Unknown memory kind");
   std::sort(results.begin(),results.end(),[](const Json& a,const Json& b){ return a["score"].get<double>() > b["score"].get<double>(); });
+  if(auto log=debug_logger();log && log->enabled(DebugProfile::Trace)) {
+    Json candidates=Json::array();for(size_t i=0;i<results.size();++i){auto& row=results[i];candidates.push_back({{"memory_id",row["id"]},{"memory_type",row["memory_type"]},{"ranking",row["ranking"]},{"score",row["score"]},{"tokens_estimate",estimate_tokens(row.dump())},{"included",i<(deep?16U:8U)},{"reason",i<(deep?16U:8U)?"retrieval_rank":"result_limit"}});}
+    trace("memory","memory.selection",{{"candidates",candidates},{"matched_words",ws}},DebugProfile::Trace);
+  }
   while (results.size() > (deep ? 16U : 8U)) results.erase(results.end()-1);
   for (auto& row : results) if (row["memory_type"] == "episode") p_.db->exec("UPDATE episodes SET recall_count=recall_count+1,last_recalled_at=?,accessibility=min(1,accessibility+0.1) WHERE id=?",{now(),row["id"]});
   for(auto &row:results) {
@@ -136,6 +143,7 @@ Json Memory::search(std::string kind, std::string query, bool deep) {
   Json diagnostic = {{"query",query},{"depth",deep ? "deep" : "normal"},{"kind",kind},{"results",results}};
   p_.db->exec("INSERT INTO retrieval_diagnostics(query,depth,kind,results_json,created_at) VALUES(?,?,?,?,?)",{query,diagnostic["depth"],kind,results.dump(),now()});
   p_.db->event("memory.recalled",diagnostic,p_.session,p_.task);
+  trace("memory","memory.search.completed",{{"matches",results.size()},{"kind",kind}},DebugProfile::Trace);
   return {{"results",results},{"weak_match",results.empty() || results[0]["ranking"]["lexical"].get<double>() < 0.3},{"deep_recall_available",!deep}};
 }
 Id Memory::episode(const Json& d, Id session) {
@@ -164,6 +172,8 @@ double Memory::confidence(std::string type,Id id,double prior) {
   return std::clamp(result,0.05,0.95);
 }
 Id Memory::fact(const std::string& subject,const std::string& predicate,const std::string& object,Id source,bool correction,Id project) {
+  TraceSpan span("memory","learn_fact",{{"source_event_id",source}});
+  trace("memory","memory.write_candidate",{{"subject",subject},{"predicate",predicate},{"object",object},{"source_event_id",source},{"project_id",project}},DebugProfile::Forensic);
   for (auto& s : {subject,predicate,object}) if (s.empty() || s.size() > 4096) throw std::runtime_error("Invalid fact");
   if (project && p_.db->query("SELECT id FROM projects WHERE id=?",{project}).empty()) throw std::runtime_error("Unknown knowledge scope");
   Id result = 0;
@@ -174,6 +184,7 @@ Id Memory::fact(const std::string& subject,const std::string& predicate,const st
     bool document=origin[0]["type"]=="tool.completed" && Json::parse(origin[0]["payload_json"].get<std::string>()).value("tool","")=="web_read";
     bool explicit_user = origin[0]["type"] == "user.message" && lower(origin[0]["payload_json"].get<std::string>()).find(lower(object)) != std::string::npos;
     if (correction && !explicit_user) throw std::runtime_error("Correction requires a user message");
+    trace("memory","memory.dedup.result",{{"source_event_id",source},{"existing_memories",existing},{"decision",existing.empty()?"insert":existing[0]["object"]==object?"merge_evidence":"supersede"}},DebugProfile::Trace);
     if (!existing.empty() && existing[0]["object"] == object) {
       result = existing[0]["id"];
       auto ev = evidence("fact",result,explicit_user ? "user stated" : document ? "documentation" : "inferred",true,source,1,explicit_user ? 0.95 : 0.3);
@@ -206,7 +217,7 @@ Id Memory::candidate(const Json& d,Id source) {
   if (origin.empty()) throw std::runtime_error("Praxis candidate requires provenance");
   Id project = d.value("project_id",p_.project);
   auto duplicates = p_.db->query("SELECT id FROM praxis WHERE name=? AND scope=? AND coalesce(project_id,0)=? AND status!='deprecated'",{d.at("name"),d.value("scope","global"),d.value("scope","global") == "project" ? project : 0});
-  if (!duplicates.empty()) return duplicates[0]["id"];
+  if (!duplicates.empty()){trace("memory","memory.write_rejected",{{"reason","duplicate_praxis"},{"existing_memory_id",duplicates[0]["id"]}},DebugProfile::Debug);return duplicates[0]["id"];}
   Id id = p_.db->exec("INSERT INTO praxis(name,scope,project_id,domain,trigger,procedure,rationale,limitations,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
     {d.at("name"),d.value("scope","global"),d.value("scope","global") == "project" ? Json(project) : Json(),d.value("domain","general"),d.at("trigger"),d.at("procedure"),d.at("rationale"),d.value("limitations",""),now(),now()});
   p_.db->exec("INSERT INTO praxis_evidence(praxis_id,session_id,outcome,notes,source_event_id,created_at) VALUES(?,?,'candidate','Unvalidated lesson; no successful use counted',?,?)",{id,origin[0]["session_id"],source,now()});
@@ -310,6 +321,8 @@ Json Memory::checkpoint(std::string reason,Id through,const Json& working) {
     // The checkpoint references typed records; the original records are never flattened or deleted.
     snapshot["cognitive_records"][table]=db.query(std::string("SELECT id FROM ")+table);
   }
+  trace("context","context.compaction.started",{{"reason",reason},{"through_message_id",through},{"previous_checkpoint_id",previous.value("checkpoint_id",0LL)}},DebugProfile::Debug);
+  auto before_rows=debug_logger()?db.query("SELECT id,role,token_count FROM messages WHERE session_id=? AND id>?",{p_.session,previous.value("through_message_id",0LL)}):Json::array();
   Id id=0;
   db.transaction([&]{
     id=db.exec("INSERT INTO context_checkpoints(session_id,through_message_id,reason,state_json,created_at) VALUES(?,?,?,?,?)",{p_.session,through,reason,snapshot.dump(),now()});
@@ -318,6 +331,12 @@ Json Memory::checkpoint(std::string reason,Id through,const Json& working) {
       {"summary","I saved my working state before compacting context. The objective and unresolved checks remain active."},
       {"content",context.dump()},{"outcome","in_progress"},{"salience",0.6}},p_.session);
   });
+  if(debug_logger()) {
+    size_t tokens_before=previous.empty()?0:estimate_tokens(previous.dump()),tokens_after=estimate_tokens(handoff().dump());Json removed=Json::array(),preserved=Json::array();
+    for(auto& row:before_rows){tokens_before+=row["token_count"].get<size_t>();(row["id"].get<Id>()<=through?removed:preserved).push_back(row["id"]);if(row["id"].get<Id>()>through)tokens_after+=row["token_count"].get<size_t>();}
+    trace("context","context.reset",{{"reason",reason},{"initiator",reason=="user_request"?"operator":"runtime"},{"old_context_id","checkpoint_"+std::to_string(previous.value("checkpoint_id",0LL))},{"new_context_id","checkpoint_"+std::to_string(id)},{"tokens_before",tokens_before},{"tokens_after_estimate",tokens_after},{"token_accounting","Dialogue and handoff estimates; excludes system, schemas and live state"},{"messages_before",before_rows.size()},{"messages_removed",removed},{"messages_preserved",preserved},{"what_was_preserved",{"objective","checks","research","typed_record_references","recent_dialogue_excerpts","latest_user_request_excerpt"}},{"what_was_dropped","Older full messages leave prompt selection; source records remain in SQLite"}},DebugProfile::Debug);
+    trace("context","context.checkpoint.snapshot",{{"checkpoint_id",id},{"payload",snapshot}},DebugProfile::Forensic);
+  }
   return handoff();
 }
 void Memory::maintain() {

@@ -58,7 +58,7 @@ public:
 };
 class OpenAICompatibleBackend : public ModelBackend {
   Config config_;
-  std::string base_, api_;
+  std::string base_, api_,trace_request_id_;
   bool discovered_ = false, llama_cpp_ = false;
   std::optional<std::uint64_t> output_limit_;
   ProviderCapabilities capabilities_;

@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/search.hpp>
 #include <curl/curl.h>
 #if __has_include(<curl/urlapi.h>)
@@ -31,6 +32,7 @@ void SearchContext::check() const {
 }
 void SearchContext::event(const std::string &type, Json data) const {
   data["query_id"]=query_id;
+  trace("search",type,data,DebugProfile::Trace);
   if(emit) emit(type,data);
 }
 SearchRateLimiter::SearchRateLimiter(SearchDuration interval, SearchDuration backoff)
@@ -206,7 +208,9 @@ Json SearchOrchestrator::search(const SearchRequest &request,SearchContext conte
     auto cursor=search_detail::cursor(request.cursor);
     candidates={cursor.value("engine",std::string("duckduckgo"))};
   }
-  context.event("search.requested");Json failures=Json::array();std::set<std::string> attempted;
+  TraceContext search_context({{"search_id",context.query_id}});
+  TraceSpan search_span("search","web_search",{{"query",request.query}});
+  context.event("search.requested",{{"query",request.query},{"fallback_order",candidates},{"limit",request.limit}});Json failures=Json::array();std::set<std::string> attempted;
   for(auto &id:candidates) {
     if(!attempted.insert(id).second || attempted.size()>static_cast<size_t>(config_.search_max_engine_attempts))continue;
     context.check();auto &engine=registry_.get(id);
@@ -225,7 +229,7 @@ Json SearchOrchestrator::search(const SearchRequest &request,SearchContext conte
       db_.sql("DELETE FROM search_result_cache WHERE cache_key IN (SELECT cache_key FROM search_result_cache ORDER BY expires_at DESC LIMIT -1 OFFSET 256)");
       context.event("search.completed",{{"engine",id},{"cache_hit",false},{"results",result["results"].size()},{"latency_ms",std::chrono::duration_cast<SearchDuration>(context.clock.time()-start).count()}});
       return result;
-    }catch(const TurnCancelled &){throw;}
+    }catch(const TurnCancelled &){context.event("search.cancelled");throw;}
      catch(const SearchError &error){
       if(error.code==SearchErrorCode::PaginationUnavailable || !request.cursor.empty())throw;
       failures.push_back({{"engine",id},{"reason",search_error_name(error.code)}});

@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include "internal.hpp"
 #include <algorithm>
 #include <bit>
@@ -129,6 +130,8 @@ WebResponse WebAcquisitionEngine::fetch(const std::string &target, bool cache) {
   return response;
 }
 AcquisitionResult WebAcquisitionEngine::acquire(const AcquisitionRequest &request) {
+  TraceSpan acquisition("reader","web_acquisition",{{"url",request.url}});
+  trace("reader","reader.fetch_started",{{"url",request.url},{"query",request.focus_query?Json(*request.focus_query):Json()}},DebugProfile::Trace);
   auto budget = request.max_output_tokens ? request.max_output_tokens : limits_.max_rendered_tokens;
   budget = std::min(budget, limits_.max_rendered_tokens);
   if (request.focus_query && request.focus_query->size() > 8192)
@@ -353,6 +356,7 @@ AcquisitionResult WebAcquisitionEngine::acquire(const AcquisitionRequest &reques
       rendered = render(selected, budget);
   }
   info.rendered_tokens = estimate_tokens(rendered);
+  trace("reader","reader.parse_completed",{{"url",response.url},{"diagnostics",info.json()},{"provenance",document_json(document)["source"]}},DebugProfile::Trace);
   return {std::move(document), std::move(rendered), std::move(info)};
 }
 } // namespace saga::web

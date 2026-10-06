@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/tools.hpp>
 #include <saga/edit.hpp>
 #include <saga/web/acquisition.hpp>
@@ -346,17 +347,22 @@ Json Tools::environment() {
   return result;
 }
 Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
+  TraceSpan operation("tool",name,{{"tool",name}},DebugProfile::Debug);
+  TraceContext tool_context({{"tool_call_id",p_.tool_call},{"task_id",p_.task},{"turn_id",p_.turn},{"generation_id",p_.generation}});
+  trace("tool","tool.call.started",{{"tool",name},{"arguments",args}},DebugProfile::Trace);
   if (service_) service_(); // Apply queued permissions before the action gate.
   auto definitions_list = definitions();
   auto it = std::find_if(definitions_list.begin(),definitions_list.end(),[&](auto& d){ return d["function"]["name"] == name; });
-  if (it == definitions_list.end()) return {{"error","Unknown tool"}};
-  try { validate(args,(*it)["function"]["parameters"]); } catch (const std::exception& e) { return {{"error",e.what()}}; }
+  if (it == definitions_list.end()) {trace("tool","tool.arguments.validated",{{"tool",name},{"valid",false},{"error","Unknown tool"}},DebugProfile::Debug,"WARN");return {{"error","Unknown tool"}};}
+  try { validate(args,(*it)["function"]["parameters"]); } catch (const std::exception& e) {trace("tool","tool.arguments.validated",{{"tool",name},{"valid",false},{"error",e.what()}},DebugProfile::Debug,"WARN");return {{"error",e.what()}}; }
+  trace("tool","tool.arguments.validated",{{"tool",name},{"valid",true},{"schema_version",1}},DebugProfile::Trace);
   bool identified=execution_depth_==0 && !p_.turn.empty() && !p_.tool_call.empty();
   if(identified) {
     auto previous=p_.db->query("SELECT tool_runs.* FROM tool_runs JOIN tool_dispatch_keys ON tool_dispatch_keys.run_id=tool_runs.id WHERE tool_dispatch_keys.turn_id=? AND tool_dispatch_keys.tool_call_id=?",{p_.turn,p_.tool_call});
+    trace("tool","idempotency.check",{{"tool",name},{"duplicate_suppressed",!previous.empty()}},DebugProfile::Debug);
     if(!previous.empty()) {
       auto& row=previous[0];
-      if(row["tool"]!=name || row["arguments_json"]!=args.dump())return {{"error","Tool call ID reused for a different action"},{"error_type","ToolCallConflict"}};
+      if(row["tool"]!=name || row["arguments_json"]!=args.dump()){trace("runtime","runtime.invariant_violation",{{"invariant","tool_call_action_identity"},{"tool_call_id",p_.tool_call},{"run_id",row["id"]}},DebugProfile::Debug,"ERROR");return {{"error","Tool call ID reused for a different action"},{"error_type","ToolCallConflict"}};}
       if(row["result_json"].is_null())return {{"error","Previous execution has no durable result; inspect its state before any new action"},{"error_type","ToolExecutionUncertain"}};
       if(emit)emit("tool.replayed",{{"run_id",row["id"]},{"tool",name},{"cached",true}});
       return Json::parse(row["result_json"].get<std::string>());
@@ -367,6 +373,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   Id started = now();
   Id run = p_.db->exec("INSERT INTO tool_runs(session_id,task_id,tool,arguments_json,started_at,status) VALUES(?,?,?,?,?,'running')",{p_.session,p_.task ? Json(p_.task) : Json(),name,args.dump(),started});
   p_.db->exec("UPDATE tool_runs SET turn_id=?,generation_id=?,tool_call_id=? WHERE id=?",{p_.turn.empty()?Json():Json(p_.turn),p_.generation?Json(p_.generation):Json(),identified?Json(p_.tool_call):Json(),run});
+  TraceContext execution_context({{"tool_execution_id",run}});
   if(identified)p_.db->exec("INSERT INTO tool_dispatch_keys(turn_id,tool_call_id,run_id) VALUES(?,?,?)",{p_.turn,p_.tool_call,run});
   p_.db->event("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}},p_.session,p_.task);
   if (emit && name!="report_progress") emit("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}});
@@ -395,11 +402,11 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   auto type = failed ? "tool.failed" : "tool.completed";
   p_.db->exec("UPDATE tool_runs SET duration_ms=?,status=?,exit_code=?,stdout_size=?,stderr_size=?,error_type=?,result_hash=? WHERE id=?",
     {now()-started,failed ? "failed" : "completed",result.value("exit_code",Json()),result.value("stdout_size",result.value("stdout",std::string()).size()),result.value("stderr_size",result.value("stderr",std::string()).size()),failed ? Json(result.value("error",std::string("nonzero_exit"))) : Json(),digest(result.dump()),run});
-  Id ev = p_.db->event(type,{{"run_id",run},{"tool",name},{"result",result}},p_.session,p_.task);
+  Id ev = p_.db->event(type,{{"run_id",run},{"tool",name},{"result",result},{"duration_ms",now()-started}},p_.session,p_.task);
   result["source_event_id"] = ev;
   p_.db->exec("UPDATE tool_runs SET result_json=? WHERE id=?",{result.dump(),run});
   if (p_.task && name!="report_progress" && !name.starts_with("web_") && !name.starts_with("research_")) memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
-  if (emit && name!="report_progress") emit(type,{{"run_id",run},{"tool",name},{"result",result}});
+  if (emit && name!="report_progress") emit(type,{{"run_id",run},{"tool",name},{"result",result},{"duration_ms",now()-started}});
   return result;
 }
 Json Tools::dispatch(const std::string& name,const Json& a) {
@@ -481,6 +488,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
   if (name == "observe_environment") return environment();
   if (name == "file_read") {
     auto path = safe_path(a["path"],false); auto contents = read_file(path,512*1024);
+    trace("filesystem","fs.read",{{"path",path.string()},{"bytes",contents.size()}},DebugProfile::Forensic);
     bool binary = contents.find('\0') != std::string::npos;
     if (!binary) { try { Json(contents).dump(); } catch (const Json::exception&) { binary = true; } }
     return {{"path",path.string()},{"content",binary ? base64(contents) : contents},{"encoding",binary ? "base64" : "utf-8"},{"bytes",contents.size()},{"hash",digest(contents)}};
@@ -514,6 +522,8 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if(safe_path(a["path"],true)!=path || fs::exists(path)!=existed || (existed && digest(read_file(path,512*1024))!=digest(old))){event("edit.conflict",proposal);return {{"error","File changed while approval was pending; no changes applied. Read it and propose a fresh edit."}};}
     auto mode=existed ? fs::status(path).permissions() : fs::perms::owner_read|fs::perms::owner_write;
     fs::create_directories(path.parent_path());atomic_write(path,content);fs::permissions(path,mode & fs::perms::all);
+    trace("filesystem","fs.written",{{"path",path.string()},{"bytes",content.size()},{"old_hash",digest(old)},{"new_hash",digest(content)},{"created",!existed}},DebugProfile::Debug);
+    trace("filesystem","fs.diff",proposal,DebugProfile::Forensic);
     memory_.artifact(path,a["description"],content);
     if(events_)events_("edit.applied",proposal);
     return {{"path",path.string()},{"bytes",content.size()},{"hash",digest(content)},{"added",diff.added},{"removed",diff.removed},{"proposal_id",proposal["proposal_id"]}};
@@ -554,10 +564,12 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
         event("task.rescoped",{{"previous_task_id",previous},{"task_id",p_.task},{"project_id",project}});
       }
     }
+    auto previous_workspace=p_.project_root;
     p_.project=project;p_.project_root=path;
     db->exec("UPDATE projects SET last_seen_at=? WHERE id=?",{now(),project});
     db->exec("UPDATE sessions SET project_id=? WHERE id=?",{project,p_.session});
     db->exec("UPDATE continuity_state SET active_project_id=?,updated_at=? WHERE id=1",{project,now()});
+    trace("project","workspace.transition",{{"old",previous_workspace.string()},{"new",path.string()},{"trigger","project_open"},{"user_message_redispatched",false}});
     Json result={{"path",path.string()},{"project_id",project},{"task_id",p_.task}};if(events_)events_("workspace.changed",result);return result;
   }
   if (name == "shell_exec") {

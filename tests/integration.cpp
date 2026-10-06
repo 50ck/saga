@@ -284,6 +284,7 @@ void end_to_end(MockModel& mock,const std::string& daemon,const std::string& cli
   bool saw_no_key=false; for (auto& request:mock.requests()) if (request["headers"].get<std::string>().find("Authorization:")==std::string::npos) saw_no_key=true; CHECK(saw_no_key);
 }
 }
+#ifndef SAGA_INTEGRATION_NO_MAIN
 int main(int argc,char** argv) {
   int probe = socket(AF_INET,SOCK_STREAM | SOCK_CLOEXEC,0);
   if (probe < 0 && (errno == EPERM || errno == EACCES)) { std::cout << "SKIP HTTP/daemon integration: environment denies local TCP sockets\n"; return 77; }
@@ -291,3 +292,5 @@ int main(int argc,char** argv) {
   try { CHECK(argc==3); MockModel mock; model_contracts(mock);http_continuation(mock); std::cout << "PASS HTTP probes, context detection, SSE fragments, API keys, usage fallback and interrupted streams\n"; end_to_end(mock,fs::canonical(argv[1]).string(),fs::canonical(argv[2]).string()); std::cout << "PASS daemon and CLI: creation, setup, tools, approvals, proof gates, journals, switching, isolation and restart recall\n"; return 0; }
   catch (const std::exception& e) { std::cerr << "FAIL integration: " << e.what() << '\n'; return 1; }
 }
+
+#endif

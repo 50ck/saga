@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/ipc.hpp>
 #include <saga/runtime.hpp>
 #include <atomic>
@@ -15,10 +16,14 @@
 using namespace saga;
 namespace {
 volatile sig_atomic_t stopping = 0;
-void stop(int) { stopping = 1; }
+void stop(int signal) { stopping = signal; }
+DebugOptions daemon_debug;
 std::mutex config_mutex;
 void serve_connected(int fd,Paths paths,bool authenticate = false) {
   Channel channel(fd);
+  std::unique_ptr<DebugLogger> recorder;
+  if(daemon_debug.profile!=DebugProfile::Off)recorder=std::make_unique<DebugLogger>(daemon_debug);
+  DebugScope recording(recorder.get());
   std::unique_ptr<Runtime> runtime;
   std::string id;
   Emit emit = [&](const std::string& event,const Json& data){ channel.send({{"type",event},{"request_id",id},{"payload",data}}); };
@@ -37,6 +42,8 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
     }
   };
   auto service = [&] {
+    if(recorder)recorder->sample();
+    if(stopping && runtime){trace("shutdown","signal.received",{{"signal",static_cast<int>(stopping)}},DebugProfile::Debug,"WARN");runtime->command("stop",Json::object());}
     // Keep cognition on one thread; handle only controls that cannot replace it.
     for (int n=0; n<16; ++n) {
       auto message=channel.receive(0); if (!message) break;
@@ -64,7 +71,15 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
       auto type = message.value("type",""); auto payload = message.value("payload",Json::object());
       if (id.empty() || id.size() > 128 || !payload.is_object()) throw std::runtime_error("Invalid control request");
       try {
-        if (type == "ping") emit("result",{{"runtime","Saga"},{"version","0.1.0"},{"context_revision",runtime_context_revision}});
+        if(recorder)recorder->context({{"ipc_request_id",id}});
+        if(type=="debug.configure") {
+          if(runtime)throw std::runtime_error("Configure diagnostics before activating a persona");
+          auto options=DebugOptions::from_json(payload,paths);recording.bind(nullptr);recorder.reset();
+          if(options.profile!=DebugProfile::Off){recorder=std::make_unique<DebugLogger>(options);install_debug_crash_handlers();}
+          recording.bind(recorder.get());
+          emit("result",{{"profile",debug_profile_name(options.profile)},{"path",recorder?recorder->path().string():std::string()}});
+        }
+        else if (type == "ping") emit("result",{{"runtime","Saga"},{"version","0.1.0"},{"context_revision",runtime_context_revision}});
         else if (type == "personas.list") { if (runtime) throw std::runtime_error("Return to the persona selector first"); emit("result",registry.list()); }
         else if (type == "personas.create") { if (runtime) throw std::runtime_error("Return to the persona selector first"); emit("result",registry.create(payload.value("name","Assistant"),payload.value("soul",std::string(default_soul)))); }
         else if (type == "backend.status") {
@@ -144,12 +159,12 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
         }
         else if (type == "session.close") { if (runtime) { runtime->close(payload.value("reason","user_exit"),emit); runtime.reset(); } emit("result",{{"closed",true}}); }
         else throw std::runtime_error("Unknown protocol request");
-      } catch (const std::exception& e) { emit("error",{{"message",e.what()}}); }
+      } catch (const std::exception& e) {trace("runtime","runtime.error",{{"message",e.what()},{"operation",type},{"recoverable",true}},DebugProfile::Debug,"ERROR");emit("error",{{"message",e.what()}}); }
     }
-  } catch (const std::exception&) {
-    // Connection failure is lifecycle input, not a reason to log conversation data.
-  }
-  if (runtime) { try { runtime->close(stopping ? "daemon_shutdown" : "client_disconnect"); } catch (const std::exception&) {} }
+  } catch (const std::exception& error) {trace("network","connection.closed",{{"reason",error.what()}},DebugProfile::Debug,"WARN");}
+  trace("shutdown","shutdown.started",{{"signal",static_cast<int>(stopping)}});
+  if (runtime) { try { runtime->close(stopping ? "daemon_shutdown" : "client_disconnect"); } catch (const std::exception& error) {trace("shutdown","shutdown.error",{{"message",error.what()}},DebugProfile::Debug,"ERROR");} }
+  trace("shutdown","shutdown.completed");
 }
 void serve(int fd,Paths paths) {
   ucred cred{}; socklen_t length = sizeof cred;
@@ -161,7 +176,10 @@ int main(int argc,char** argv) {
   if (argc > 1 && std::string(argv[1]) == "--help") { std::cout << "sagad — Saga persistent cognitive runtime\nRuns in foreground on the private XDG Unix socket.\n"; return 0; }
   if (argc > 1 && std::string(argv[1]) == "--version") { std::cout << "Saga 0.1.0\n"; return 0; }
   try {
+    for(int i=1;i<argc;++i)if(!debug_argument(argc,argv,i,daemon_debug))throw std::runtime_error("Unknown sagad argument");
     umask(0077); auto paths = Paths::environment(); paths.create();
+    daemon_debug=DebugOptions::from_json(daemon_debug.json(),paths);
+    if(daemon_debug.profile!=DebugProfile::Off)install_debug_crash_handlers();
     int lock_fd = open((paths.runtime / "sagad.lock").c_str(),O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,0600);
     if (lock_fd < 0 || flock(lock_fd,LOCK_EX | LOCK_NB)) throw std::runtime_error("sagad is already running");
     // Initialize WAL and the registry schema before connection workers race to open it.

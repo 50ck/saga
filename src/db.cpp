@@ -1,11 +1,13 @@
 #include <saga/db.hpp>
+#include <saga/debug.hpp>
 #include <sqlite3.h>
 #include <tuple>
+#include <cstring>
 #include <schema.hpp>
 #include <sys/stat.h>
 
 namespace saga {
-Database::Database(const fs::path& path) {
+Database::Database(const fs::path& path):path_(path) {
   if (fs::is_symlink(path)) throw std::runtime_error("Refusing symlink database");
   if (sqlite3_open_v2(path.c_str(), &handle_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nullptr) != SQLITE_OK) {
     std::string err = handle_ ? sqlite3_errmsg(handle_) : "Cannot open database";
@@ -15,6 +17,7 @@ Database::Database(const fs::path& path) {
   chmod(path.c_str(),0600);
   sqlite3_busy_timeout(handle_,5000);
   sql("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;");
+  trace("database","database.opened",{{"path",path_.string()},{"backend","sqlite"},{"journal_mode","WAL"},{"synchronous","FULL"}},DebugProfile::Debug);
 }
 Database::~Database() { if (handle_) sqlite3_close_v2(handle_); }
 void Database::sql(std::string_view text) {
@@ -25,6 +28,8 @@ void Database::sql(std::string_view text) {
   }
 }
 Json Database::query(std::string_view sql_text, const std::vector<Json>& params) {
+  TraceSpan span("database","query",{{"database",path_.string()}});
+  if(auto log=debug_logger();log && log->enabled(DebugProfile::Forensic))trace("database","database.statement",{{"database",path_.string()},{"statement",sql_text},{"parameters",params}},DebugProfile::Forensic);
   sqlite3_stmt* raw = nullptr;
   if (sqlite3_prepare_v2(handle_,sql_text.data(),static_cast<int>(sql_text.size()),&raw,nullptr) != SQLITE_OK)
     throw std::runtime_error(sqlite3_errmsg(handle_));
@@ -58,16 +63,50 @@ Json Database::query(std::string_view sql_text, const std::vector<Json>& params)
   if (rc != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(handle_));
   return rows;
 }
-Id Database::exec(std::string_view statement, const std::vector<Json>& params) { query(statement,params); return sqlite3_last_insert_rowid(handle_); }
+void Database::diagnostic(std::string type,const Json& fields) {
+  if(!debug_logger())return;
+  if(recording_transaction_)pending_diagnostics_.emplace_back(std::move(type),fields);
+  else debug_logger()->observe(type,fields);
+}
+Id Database::exec(std::string_view statement, const std::vector<Json>& params) {
+  if(!debug_logger()){query(statement,params);return sqlite3_last_insert_rowid(handle_);}
+  auto text=lower(std::string(statement));std::string operation;
+  if(text.starts_with("insert"))operation="INSERT";else if(text.starts_with("update"))operation="UPDATE";else if(text.starts_with("delete"))operation="DELETE";
+  std::string table;
+  for(auto candidate:{"facts","episodes","praxis","beliefs","intentions","goals","memory_artifacts","entity_mentions","artifacts","journal_entries","self_beliefs","developed_traits","relationship_beliefs","commitments","open_loops"}) {
+    auto at=text.find(candidate);if(at!=std::string::npos && (at==0 || text[at-1]==' ') && (at+std::strlen(candidate)==text.size() || text[at+std::strlen(candidate)]==' ' || text[at+std::strlen(candidate)]=='(')){table=candidate;break;}
+  }
+  auto logger=debug_logger();auto op=logger && !table.empty() && !operation.empty()?logger->next_span():std::string();
+  if(operation=="INSERT" && (text.find("on conflict")!=std::string::npos || text.find("or ignore")!=std::string::npos))operation="INSERT_OR_UPDATE_OR_IGNORE";
+  Json fields={{"memory_op_id",op},{"database",path_.string()},{"backend","sqlite"},{"table",table},{"operation",operation}};
+  if(!op.empty()){trace("memory","memory.write.started",fields);trace("memory","memory.write_candidate",{{"memory_op_id",op},{"candidate",params},{"statement",statement}},DebugProfile::Forensic);}
+  try{query(statement,params);}catch(...){if(!op.empty())trace("memory","memory.write.failed",fields,DebugProfile::Debug,"ERROR");throw;}
+  auto row=sqlite3_last_insert_rowid(handle_);
+  if(!op.empty()) {fields["last_insert_row_id"]=row;fields["rows_affected"]=changes();if(operation=="INSERT")fields["row_id"]=row;else if(text.find("where id=?")!=std::string::npos && !params.empty() && params.back().is_number_integer())fields["row_id"]=params.back();diagnostic("memory.write.committed",fields);}
+  return row;
+}
 int Database::changes() const { return sqlite3_changes(handle_); }
 void Database::transaction(const std::function<void()>& operation) {
-  sql("BEGIN IMMEDIATE");
-  try { operation(); sql("COMMIT"); } catch (...) { sql("ROLLBACK"); throw; }
+  TraceSpan span("database","transaction",{{"database",path_.string()}});
+  sql("BEGIN IMMEDIATE");recording_transaction_=true;pending_diagnostics_.clear();
+  trace("database","database.transaction.started",{{"database",path_.string()}},DebugProfile::Trace);
+  try {
+    operation();sql("COMMIT");recording_transaction_=false;
+    for(auto& [type,data]:pending_diagnostics_)if(debug_logger())debug_logger()->observe(type,data);
+    pending_diagnostics_.clear();trace("database","database.transaction.committed",{{"database",path_.string()}},DebugProfile::Trace);
+  } catch (...) {
+    sql("ROLLBACK");recording_transaction_=false;
+    for(auto& [type,data]:pending_diagnostics_)if(type=="memory.write.committed")trace("memory","memory.write.rolled_back",data,DebugProfile::Debug,"WARN");
+    pending_diagnostics_.clear();trace("database","database.transaction.rollback",{{"database",path_.string()}},DebugProfile::Trace,"WARN");throw;
+  }
 }
 void Database::migrate() {
+  TraceSpan migration("database","migration");
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
+  trace("database","database.schema",{{"database",path_.string()},{"schema_version",version},{"target_version",12}},DebugProfile::Debug);
   if (version > 12) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if(version<12)trace("database","database.migration_started",{{"database",path_.string()},{"from_version",version},{"target_version",12}});
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -171,9 +210,12 @@ void Database::migrate() {
     UPDATE schema_version SET version=12;
   )SQL");});
 
+  if(version<12)trace("database","database.migration_completed",{{"database",path_.string()},{"from_version",version},{"schema_version",12}});
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {
-  return exec("INSERT INTO events(ts,session_id,task_id,type,payload_json) VALUES(?,?,?,?,?)",
+  auto id=exec("INSERT INTO events(ts,session_id,task_id,type,payload_json) VALUES(?,?,?,?,?)",
     {now(),session ? Json(session) : Json(),task ? Json(task) : Json(),type,payload.dump()});
+  if(debug_logger()){Json fields=payload;if(!fields.is_object())fields={{"payload",fields}};fields["event_id"]=id;fields["session_id"]=session;fields["task_id"]=task;diagnostic(std::string(type),fields);}
+  return id;
 }
 }

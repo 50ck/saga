@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/search.hpp>
 #include "../web/internal.hpp"
 #include <algorithm>
@@ -77,7 +78,7 @@ struct FourGetSearchEngine::State {
     clock_bound=true;
   }
   void refresh(const SearchContext &context) {
-    if(directory_updated && context.clock.time()<directory_refresh)return;
+    if(directory_updated && context.clock.time()<directory_refresh){context.event("search.directory_cache_hit",{{"engine","fourget"},{"instances",instances.size()}});return;}
     if(directory_updated && context.clock.time()>=directory_stale) {
       std::erase_if(instances,[](auto &entry){return !entry.second.manual;});directory_updated=0;
     }
@@ -203,6 +204,10 @@ Json FourGetSearchEngine::run(const SearchRequest &request,const SearchContext &
   std::stable_sort(candidates.begin(),candidates.end(),[&](auto *a,auto *b){
     auto score=[&](auto *instance){return instance->score(state_->preferred==instance->origin)+(instance->manual && state_->config.fourget_prefer_manual ? 150.0 : 0.0);};return score(a)>score(b);
   });
+  if(auto logger=debug_logger();logger && logger->enabled(DebugProfile::Trace)) {
+    Json ranking=Json::array();for(auto* candidate:candidates){auto data=candidate->json();data["score"]=candidate->score(state_->preferred==candidate->origin);ranking.push_back(data);}
+    context.event("search.instance_ranking",{{"engine","fourget"},{"candidates",ranking},{"preferred",state_->preferred}});
+  }
   size_t attempts=0;std::set<std::string> attempted;
   for(auto *instance:candidates) {
     if(!attempted.insert(instance->origin).second || ++attempts>static_cast<size_t>(state_->config.fourget_max_instance_attempts))break;

@@ -83,3 +83,10 @@ struct curl_sockaddr { int family, socktype, protocol; unsigned addrlen; struct 
 #define CURLOPT_ACCEPT_ENCODING 10102
 #define CURLOPT_OPENSOCKETFUNCTION 20163
 #define CURLOPT_OPENSOCKETDATA 10164
+
+// CURLINFO_DOUBLE + the offsets defined by curl's public curl.h.
+#define CURLINFO_TOTAL_TIME 0x300003
+#define CURLINFO_NAMELOOKUP_TIME 0x300004
+#define CURLINFO_CONNECT_TIME 0x300005
+#define CURLINFO_STARTTRANSFER_TIME 0x300011
+#define CURLINFO_APPCONNECT_TIME 0x300021

@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <saga/runtime.hpp>
 #include <thread>
 #include <algorithm>
@@ -82,6 +83,8 @@ Do not use or expose a user's personal email in Git commits, tags, patches, logs
 Current context is limited working attention, not the whole mind. Continue from persisted summaries when cognitive load is high. Older completed tool exchanges may be archived; use recall_observation with their source event IDs when their full evidence is needed. Runtime attention updates are data snapshots appended by Saga, not new requests from the user. Their newer task, checks and attention values supersede the wake snapshot; continue the actual user's request.)PROMPT";
 }
 ChatRequest ContextBuilder::build(const Json& attention,const std::function<void()>& before_compact) {
+  TraceSpan context_span("context","context_build");
+  trace("context","context.build.started",{{"context_window",config_.context_length},{"available_input_budget",config_.input_budget()},{"output_reserve",config_.generation_reserve}});
   ChatRequest r; r.max_tokens = config_.generation_reserve; r.tools = Tools::definitions();
   size_t budget = config_.input_budget();
   std::string identity = core_prompt() + "\n\nSearch strategy:\n" + make_search_engine(config_.search_engines.empty() ? config_.search_engine : config_.search_engines.front())->guidance() + "\n\nIdentity name: " + p_.name + "\nSOUL:\n" + p_.soul;
@@ -201,6 +204,14 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
     selected.push_back(groups[i]); used += cost;
   }
   for (size_t i=selected.size(); i<groups.size(); ++i) for (auto& message : groups[i]) discarded_through=std::max(discarded_through,message["_saga_message_id"].get<Id>());
+  if(auto log=debug_logger();log && log->enabled(DebugProfile::Trace)) {
+    Json provenance=Json::array();for(size_t group=0;group<groups.size();++group)for(auto& message:groups[group])provenance.push_back({{"message_id",message["_saga_message_id"]},{"source_type",message.value("role","")},{"included",group<selected.size()},{"reason",group<selected.size()?"whole_turn_group":"context_budget"},{"tokens_estimate",estimate_tokens(message.dump())}});
+    trace("context","context.message_selection",{{"messages",provenance}},DebugProfile::Trace);
+    Json parts={{"system_prompt",estimate_tokens(core_prompt())},{"soul",estimate_tokens(p_.soul)}};
+    for(auto& [key,value]:wake_state_.items())parts["wake."+key]=estimate_tokens(value.dump());
+    for(auto& [key,value]:state.items())parts["live."+key]=estimate_tokens(value.dump());
+    trace("context","context.semantic_components",{{"tokens_estimate",parts},{"accounting","Inclusive content estimates; serialized message accounting is authoritative"}},DebugProfile::Trace);
+  }
   for (auto it = selected.rbegin(); it != selected.rend(); ++it) for (auto message : *it) { message.erase("_saga_message_id"); r.messages.push_back(std::move(message)); }
   while (estimate_tokens(r.messages.dump()) + estimate_tokens(r.tools.dump()) > budget) {
     size_t first = 0;
@@ -222,6 +233,12 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
     p_.db->exec("UPDATE internal_state SET cognitive_load=min(1,?*1.0/?),updated_at=? WHERE id=1",{used,budget,now()});
   }
   if (discarded_through > cutoff) { if (before_compact) before_compact(); memory_.checkpoint("context_budget",discarded_through,state.value("working_summary",Json::object())); return build(attention,before_compact); }
+  if(auto log=debug_logger();log && log->enabled(DebugProfile::Trace)) {
+    auto accounting=debug_context_accounting(r.messages,r.tools);accounting["available_input_budget"]=budget;accounting["used_input_tokens"]=actual;
+    accounting["cutoff_message_id"]=cutoff;accounting["preserved_turn_groups"]=selected.size();accounting["candidate_turn_groups"]=groups.size();
+    trace("context","context.build.completed",accounting,DebugProfile::Trace);
+    trace("context","context.provenance",{{"wake",wake_state_},{"live_state",state}},DebugProfile::Forensic);
+  }
   return r;
 }
 Runtime::Runtime(std::unique_ptr<PersonaContext> p,Config c,std::unique_ptr<ModelBackend> backend,Approve approve,WebTransport transport)
@@ -241,6 +258,14 @@ void Runtime::start(Emit emit) {
     if (!prior.empty() && prior[0]["environment_json"] != environment.dump()) p_->db->event("environment.changed",{{"before",Json::parse(prior[0]["environment_json"].get<std::string>())},{"after",environment}},p_->session);
     p_->db->event("environment.observed",environment,p_->session);
   });
+  if(auto log=debug_logger()) {
+    log->secret(config_.api_key);
+    log->session(p_->name,p_->session,{{"persona_id",p_->id},{"conversation_id",p_->session},{"workspace",p_->project_root.string()},{"project_id",p_->project},{"model",config_.model},{"endpoint",config_.endpoint}});
+    trace("session","session.started",{{"session_id",p_->session}});
+    trace("persona","persona.selected",{{"persona_id",p_->id},{"name",p_->name},{"directory",p_->directory.string()},{"soul_path",(p_->directory/"SOUL.md").string()},{"soul_bytes",p_->soul.size()},{"soul_sha256",debug_sha256(p_->soul)},{"soul_tokens_estimate",estimate_tokens(p_->soul)}});
+    trace("persona","persona.snapshot",{{"content",p_->soul}},DebugProfile::Forensic);
+    trace("runtime","config.effective",{{"model",{{"value",config_.model},{"source","config_file"}}},{"context_window",{{"value",config_.context_length},{"source","configured_or_detected"}}},{"generation_reserve",config_.generation_reserve},{"default_max_output_tokens",config_.default_max_output_tokens},{"hard_max_output_tokens",config_.hard_max_output_tokens},{"safety_margin",config_.safety_margin},{"reasoning_budget",config_.reasoning_budget},{"memory_database",(p_->directory/"agent.db").string()},{"workspace",p_->project_root.string()},{"search_engines",config_.search_engines}});
+  }
   // Waking is local: model-assisted reflection belongs to detached maintenance.
   for (auto& session : p_->db->query("SELECT id FROM sessions WHERE status='needs_consolidation' AND id!=? ORDER BY id LIMIT 4",{p_->session})) consolidate(session["id"],false);
   memory_.maintain(); continuity();
@@ -252,17 +277,21 @@ void Runtime::start(Emit emit) {
 void Runtime::journal(std::string type,Json payload,Emit emit,bool durable) {
   payload["session_id"]=p_->session;payload["generation_id"]=p_->generation;payload["timestamp"]=now();
   if(turn_){payload["user_message_id"]=turn_->user_message_id;payload["turn_id"]=turn_->id;payload["sequence_number"]=++turn_->sequence;}
+  if(auto log=debug_logger())log->context({{"session_id",p_->session},{"turn_id",p_->turn},{"generation_id",p_->generation},{"task_id",p_->task},{"tool_call_id",p_->tool_call}});
   if(durable)p_->db->event(type,payload,p_->session,p_->task);
+  else if(debug_logger())debug_logger()->observe(type,payload);
   if(emit)emit(type,payload);
 }
 void Runtime::phase(TurnPhase next,Emit emit) {
   if(!turn_ || turn_->phase==next)return;
-  turn_->phase=next;
+  auto previous=turn_->phase;turn_->phase=next;
   p_->db->exec("UPDATE turns SET phase=? WHERE id=?",{turn_phase_name(next),turn_->id});
-  journal("turn.phase",{{"phase",turn_phase_name(next)}},emit);
+  journal("turn.phase",{{"from",turn_phase_name(previous)},{"to",turn_phase_name(next)},{"phase",turn_phase_name(next)}},emit);
+  trace("tui","tui.state_changed",{{"activity",turn_phase_name(next)}},DebugProfile::Trace);
 }
 GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emit emit) {
   if(!backend_)throw std::runtime_error("No model backend configured");
+  TraceSpan generation_span("generation",purpose,Json::object(),DebugProfile::Debug);
   backend_->prepare();
   size_t estimated=estimate_tokens(request.messages.dump())+estimate_tokens(request.tools.dump());
   if(estimated>config_.input_budget())throw std::runtime_error("Model request exceeds input budget");
@@ -284,6 +313,13 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
   if(turn_)++turn_->generations;
   phase(TurnPhase::Waiting,emit);
   journal("generation.started",{{"purpose",purpose},{"model",config_.model},{"provider_streaming",true},{"context_window",config_.context_length},{"safety_margin",config_.safety_margin},{"hard_max_output_tokens",config_.hard_max_output_tokens},{"provider_max_output_tokens",backend_->max_output_tokens()?Json(*backend_->max_output_tokens()):Json()},{"input_tokens_estimate",estimated},{"requested_max_output_tokens",requested},{"effective_max_output_tokens",request.max_tokens},{"source_of_limit",purpose=="chat" ? "default_or_continuation_budget_clamped_to_context_provider_and_hard_limit" : "internal_cognition_budget"}},emit);
+  if(auto log=debug_logger()) {
+    auto capabilities=backend_->capabilities();
+    trace("provider","provider.capabilities.detected",{{"streaming",capabilities.streaming},{"reasoning",capabilities.reasoning},{"tool_calls",capabilities.tool_calls},{"usage_in_stream",capabilities.usage_in_stream},{"native_commentary",capabilities.native_commentary},{"reasoning_control",capabilities.reasoning_control},{"source","adapter"}});
+    Json accounting;accounting["context_window"]=config_.context_length;accounting["requested_max_output"]=requested;accounting["effective_max_output"]=request.max_tokens;accounting["context_utilization_percent"]=100.0*estimated/config_.context_length;accounting["remaining_tokens"]=available;accounting["context_id"]="ctx_"+std::to_string(id);
+    if(log->enabled(DebugProfile::Trace))log->record_context(request.messages,request.tools,accounting);
+    if(log->enabled(DebugProfile::Forensic))trace("prompt","prompt.snapshot",{{"context_id","ctx_"+std::to_string(id)},{"payload",{{"messages",request.messages},{"tools",request.tools},{"forced_tool",request.forced_tool?Json(*request.forced_tool):Json()},{"max_tokens",request.max_tokens}}}},DebugProfile::Forensic);
+  }
   std::map<int,std::string> progress_text,preparing;
   std::map<ProviderEventKind,std::string> pending;
   std::map<int,Json> pending_tools;
@@ -322,7 +358,9 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
   try {
     backend_->generate(request,[&](const ProviderEvent& event){
       check_control();
+      if(auto log=debug_logger())log->sample();
       if(event.kind==ProviderEventKind::Heartbeat)return;
+      trace("provider","provider.event.normalized",{{"kind",static_cast<int>(event.kind)},{"text_bytes",event.text.size()},{"data_keys",event.data.is_object()?event.data.size():0}},DebugProfile::Trace,"TRACE",false);
       size_t before_text=event.kind==ProviderEventKind::Reasoning?generation.reasoning.size():event.kind==ProviderEventKind::Commentary?generation.commentary.size():generation.content.size();
       std::map<std::string,size_t> before_tool;
       if(event.kind==ProviderEventKind::ToolDelta){auto it=generation.calls.find(event.data.at("index").get<int>());if(it!=generation.calls.end())for(auto key:{"name","arguments"})before_tool[key]=it->second["function"][key].get_ref<const std::string&>().size();}
@@ -378,6 +416,9 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
     terminal_recorded=true;
     journal("generation.completed",{{"status",generation_status_name(generation.status)},{"finish_reason",finish_name(generation.finish_reason)},{"output_tokens",usage_["output_tokens"]},{"reasoning_chars",generation.reasoning.size()},{"public_chars",generation.content.size()},{"tool_calls",generation.calls.size()}},emit);
     if(turn_){turn_->input_tokens+=usage_["input_tokens"].get<std::uint64_t>();turn_->output_tokens+=usage_["output_tokens"].get<std::uint64_t>();}
+    trace("generation","generation.classified",{{"classification",generation_status_name(generation.status)},{"normalized_finish_reason",finish_name(generation.finish_reason)},{"input_estimate",estimated},{"reported_input_tokens",generation.input_tokens?Json(*generation.input_tokens):Json()},{"time_to_first_delta_ms",generation.first_delta_at?Json(generation.first_delta_at-start):Json()}});
+    if(generation.status==GenerationStatus::OutputLimit)trace("generation","generation.output_limit",{{"requested_output",requested},{"effective_output",request.max_tokens},{"actual_output",usage_["output_tokens"]},{"reasoning_tokens",generation.reasoning_tokens?Json(*generation.reasoning_tokens):Json()},{"public_chars",generation.content.size()}});
+    if(auto log=debug_logger();log && log->enabled(DebugProfile::Forensic))trace("generation","generation.output.snapshot",{{"reasoning",generation.reasoning},{"content",generation.content},{"commentary",generation.commentary},{"tool_calls",generation.checkpoint()["tool_calls"]}},DebugProfile::Forensic);
     last_generation_=generation;return generation;
   } catch (...) {
     auto error=std::current_exception();GenerationStatus status=GenerationStatus::TransportError;
@@ -390,11 +431,14 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
     p_->db->exec("UPDATE model_calls SET status=?,duration_ms=?,error=? WHERE id=?",{status==GenerationStatus::Cancelled?"cancelled":"failed",now()-start,generation_status_name(status),id});
     if(!generation.reasoning.empty())journal("model.reasoning_observed",{{"model_call_id",id},{"content",generation.reasoning},{"interrupted",true}});
     if(!terminal_recorded)journal("generation.interrupted",{{"status",generation_status_name(generation.status)},{"error_type",generation_status_name(status)},{"reasoning_chars",generation.reasoning.size()},{"public_chars",generation.content.size()}},emit);
+    trace("generation","generation.classified",{{"classification",generation_status_name(generation.status)},{"normalized_finish_reason",finish_name(generation.finish_reason)},{"error_type",generation_status_name(status)},{"interrupted",true}});
+    if(auto log=debug_logger();log && log->enabled(DebugProfile::Forensic))trace("generation","generation.output.snapshot",{{"reasoning",generation.reasoning},{"content",generation.content},{"commentary",generation.commentary},{"tool_calls",generation.checkpoint()["tool_calls"]},{"interrupted",true}},DebugProfile::Forensic);
     if(turn_){turn_->input_tokens+=usage_["input_tokens"].get<std::uint64_t>();turn_->output_tokens+=usage_["output_tokens"].get<std::uint64_t>();}
     std::rethrow_exception(error);
   }
 }
 Json Runtime::structured(std::string name,std::string prompt,Json props,Json req,Emit emit) {
+  TraceSpan span("cognition",name,{{"trigger","internal_runtime"}},DebugProfile::Debug);
   ChatRequest r;
   r.messages = Json::array({{{"role","system"},{"content",ContextBuilder::core_prompt()}},{{"role","user"},{"content",std::move(prompt)}}});
   r.tools = Json::array({function_tool(name,"Submit validated internal cognition",props,req)}); r.forced_tool = name;
@@ -465,6 +509,7 @@ void Runtime::finish_turn(TurnStatus status,Emit emit) {
   metrics["input_tokens"]=turn_->input_tokens;metrics["output_tokens"]=turn_->output_tokens;
   metrics["tool_duration_ms"]=p_->db->query("SELECT coalesce(sum(duration_ms),0) AS n FROM tool_runs WHERE turn_id=?",{turn_->id})[0]["n"];
   if(status!=TurnStatus::Cancelled)journal(std::string("turn.")+name,metrics,emit);
+  trace("runtime","runtime.decision",{{"decision",status==TurnStatus::Completed?"finish_turn":status==TurnStatus::Cancelled?"cancel_turn":"fail_turn"},{"reason",name}});
   journal("turn.finished",{{"failed",status==TurnStatus::Failed},{"stopped",status==TurnStatus::Cancelled}},emit);
 }
 void Runtime::chat(std::string input,Emit emit,std::string user_message_id) {
@@ -472,12 +517,18 @@ void Runtime::chat(std::string input,Emit emit,std::string user_message_id) {
   if(user_message_id.size()>128 || user_message_id.find_first_of("\r\n")!=std::string::npos)throw std::runtime_error("Invalid user message ID");
   auto existing=p_->db->query("SELECT id,status,user_content_hash FROM turns WHERE session_id=? AND user_message_id=?",{p_->session,user_message_id});
   if(!existing.empty()) {
-    if(existing[0]["user_content_hash"]!=digest(input))throw std::runtime_error("User message ID belongs to different content");
+    trace("runtime","idempotency.check",{{"user_message_id",user_message_id},{"turn_id",existing[0]["id"]},{"duplicate_suppressed",true}});
+    if(existing[0]["user_content_hash"]!=digest(input)){trace("runtime","runtime.invariant_violation",{{"invariant","user_message_id_content_identity"},{"user_message_id",user_message_id},{"turn_id",existing[0]["id"]}},DebugProfile::Debug,"ERROR");throw std::runtime_error("User message ID belongs to different content");}
     if(emit)emit("turn.duplicate",{{"turn_id",existing[0]["id"]},{"user_message_id",user_message_id},{"status",existing[0]["status"]},{"replayed",false}});
     return;
   }
   if(active_)throw std::runtime_error("A turn is already active");
   active_=true;cancelled_=false;turn_=TurnState{uuid(),std::move(user_message_id)};p_->turn=turn_->id;p_->generation=0;
+  TraceContext turn_context({{"turn_id",turn_->id},{"user_message_id",turn_->user_message_id},{"generation_id",0},{"tool_call_id",""}});
+  TraceSpan turn_span("turn","agent_turn",Json::object(),DebugProfile::Debug);
+  trace("user_message","user_message.received",{{"user_message_id",turn_->user_message_id},{"bytes",input.size()},{"tokens_estimate",estimate_tokens(input)},{"workspace",p_->project_root.string()}});
+  trace("user_message","user_message.snapshot",{{"content",input}},DebugProfile::Forensic);
+  trace("user_message","user_message.dispatched",{{"user_message_id",turn_->user_message_id},{"turn_id",turn_->id}});
   struct Reset {Runtime& r;~Reset(){r.active_=false;r.cancelled_=false;r.p_->turn.clear();r.p_->tool_call.clear();r.p_->generation=0;r.turn_.reset();}} reset{*this};
   p_->db->exec("INSERT INTO turns(id,session_id,user_message_id,user_content_hash,status,phase,started_at) VALUES(?,?,?,?,'active','waiting_for_model',?)",{turn_->id,p_->session,turn_->user_message_id,digest(input),now()});
   // Existing tool events are retained; each UI event carries turn provenance.
@@ -519,7 +570,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
     p_->db->exec("UPDATE continuity_state SET last_user_topic=?,updated_at=? WHERE id=1",{utf8_excerpt(input,512),now()});
   });
   Json attention = {{"user_source_event_id",user_event}};
-  auto route = ExecutiveController::route(input); mode(route,emit);
+  auto route = ExecutiveController::route(input);trace("cognition","cognition.routed",{{"module",mode_name(route)},{"trigger","operator_request"}},DebugProfile::Trace);mode(route,emit);
   bool task_work = route == CognitiveMode::Plan;
   if (route == CognitiveMode::Recall) {
     auto recall = memory_.search("remember",input);
@@ -566,6 +617,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
       catch(const ProviderError& error) {
         if(!error.transient || attempt>=config_.max_generation_retries)throw;
         ++turn_->retries;
+        trace("runtime","runtime.decision",{{"decision","retry"},{"reason",error.what()},{"retry_of",last_generation_.id},{"attempt",attempt+1},{"max_attempts",config_.max_generation_retries+1},{"backoff_ms",100*(attempt+1)},{"policy","transient_provider_error"}});
         journal("generation.retry",{{"previous_generation_id",last_generation_.id},{"reason",error.what()},{"attempt",attempt+1},{"maximum_retries",config_.max_generation_retries}},emit);
         if(!last_generation_.content.empty())emit("assistant.segment.completed",{{"content",last_generation_.content},{"interrupted",true}});
         // Retain the failed segment in the journal; incomplete tool calls never
@@ -581,6 +633,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
       if(!completion.content.empty())emit("assistant.segment.completed",{{"content",completion.content},{"interrupted",true}});
       if(turn_->continuations>=static_cast<unsigned>(config_.max_continuations))throw std::runtime_error("Generation continuation budget exhausted. Reasoning, partial output and unfinished work are preserved.");
       ++turn_->continuations;
+      trace("runtime","runtime.decision",{{"decision","continue_generation"},{"reason",generation_status_name(completion.status)},{"continuation_of",completion.id},{"policy","preserve_valid_incomplete_generation"}});
       Json incomplete=Json::array();for(auto& [index,tool]:completion.calls)incomplete.push_back({{"index",index},{"call",tool}});
       attention["generation_continuation"]={{"generation_id",completion.id},{"reason",generation_status_name(completion.status)},{"incomplete_tool_calls",incomplete},{"instruction","Continue this same operator turn from the preserved assistant reasoning and output. Produce the next action or public answer; do not restart the task or repeat completed tools. Reissue any incomplete tool call as complete valid JSON; it has not executed."}};
       journal("generation.continuation",{{"previous_generation_id",completion.id},{"reason",generation_status_name(completion.status)},{"continuation",turn_->continuations}},emit);
@@ -589,6 +642,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
     if(completion.status==GenerationStatus::ProviderError)throw ProviderError(ProviderErrorKind::Semantic,"Provider stopped generation through content filtering");
     auto message = completion.message();
     if (completion.status==GenerationStatus::Empty) {
+      trace("runtime","runtime.decision",{{"decision",recovered_empty?"fail_turn":"continue_generation"},{"reason","genuinely_empty_completion"},{"policy","one_empty_recovery"}});
       p_->db->event("model.empty_completion",{{"finish_reason",finish_name(completion.finish_reason)}},p_->session,p_->task);
       if (recovered_empty) throw std::runtime_error("The provider returned two genuinely empty generations. Unfinished work is preserved.");
       recovered_empty=true; emit("notification",{{"description","The provider completed an empty generation. Requesting a public response or action once."}});
@@ -597,6 +651,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
       continue;
     }
     if (!completion.calls.empty()) {
+      trace("runtime","runtime.decision",{{"decision","execute_tool"},{"reason","validated_tool_calls"},{"count",completion.calls.size()}});
       store(message,"assistant"); p_->db->event("assistant.message",message,p_->session,p_->task);
       if(!completion.content.empty())emit("assistant.segment.completed",{{"content",completion.content},{"commentary",true}});
       for (size_t i=0;i<message["tool_calls"].size();++i) {
@@ -776,7 +831,7 @@ void Runtime::extract_memory(Id session,bool final,Emit emit) {
   } catch (const TurnCancelled&) { throw; } catch (const std::exception&) { p_->db->event("memory.extraction_deferred",{{"source_session",session}},session); }
 }
 Json Runtime::command(std::string name,const Json& a,Emit emit) {
-  if(name=="stop") {cancelled_=active_;return {{"stopping",active_}};}
+  if(name=="stop") {trace("runtime","cancellation.requested",{{"active_turn",active_},{"provider_cancel_requested",active_},{"tool_cancel_requested",active_}},DebugProfile::Debug,"WARN");cancelled_=active_;return {{"stopping",active_}};}
   if(name=="steer") {
     auto content=trim(a.at("content").get<std::string>());
     if(content.empty() || content.size()>256*1024)throw std::runtime_error("Steering requires 1–262144 bytes");

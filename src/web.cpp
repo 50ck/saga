@@ -1,3 +1,4 @@
+#include <saga/debug.hpp>
 #include <curl/curl.h>
 #include <saga/web.hpp>
 #include <saga/search.hpp>
@@ -134,6 +135,7 @@ WebResponse fetch_public_web(const std::string &target, const std::string &form,
 }
 WebResponse fetch_web_http(const std::string &target, const std::string &form,
                            const std::function<void()> &service, const WebHttpOptions &options) {
+  TraceSpan operation("http","web_request",{{"url",target}},DebugProfile::Wire);
   static std::once_flag initialized;
   std::call_once(initialized, [] {
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
@@ -148,6 +150,7 @@ WebResponse fetch_web_http(const std::string &target, const std::string &form,
   for (int redirect = 0; redirect <= options.max_redirects; ++redirect) {
     if (service)
       service();
+    trace("http","http.request.started",{{"url",url},{"redirect",redirect},{"method",body.empty()?"GET":"POST"},{"payload",body}},DebugProfile::Wire);
     struct State {
       WebResponse response;
       std::string failure;
@@ -299,6 +302,8 @@ WebResponse fetch_web_http(const std::string &target, const std::string &form,
                                              curl_easy_strerror(message->data.result)
                                        : "Web transfer did not finish");
     curl_easy_getinfo(easy.get(), CURLINFO_RESPONSE_CODE, &state.response.status);
+    trace("http","http.response.completed",{{"url",url},{"status",state.response.status},{"headers",state.response.headers},{"bytes",state.response.body.size()}},DebugProfile::Wire);
+    if(auto logger=debug_logger();logger && logger->enabled(DebugProfile::Wire))trace("http","http.response.body",{{"payload",state.response.body}},DebugProfile::Wire);
     if (state.response.status >= 300 && state.response.status < 400 &&
         !state.response.location.empty()) {
       auto next = web_url(state.response.location, url, options.allow_private_network);

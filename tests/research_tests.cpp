@@ -2,6 +2,8 @@
 #include "mock_model.hpp"
 #include <saga/runtime.hpp>
 #include <saga/search.hpp>
+#include <saga/debug.hpp>
+#include <fstream>
 using namespace saga;
 namespace {
 WebResponse response(const std::string &url,std::string body,long status=200){WebResponse r;r.url=url;r.content_type=body.starts_with('{') ? "application/json":"text/html";r.body=std::move(body);r.status=status;return r;}
@@ -54,7 +56,8 @@ public:
   }
 };
 void complete_regression() {
-  Fixture fixture;Registry registry(fixture.paths);Config config;config.endpoint="http://example.invalid";config.model="fixture";config.context_length=65536;
+  Fixture fixture;DebugOptions options;options.profile=DebugProfile::Trace;options.directory=fixture.root/"diagnostics";DebugLogger recorder(options);DebugScope scope(&recorder);
+  Registry registry(fixture.paths);Config config;config.endpoint="http://example.invalid";config.model="fixture";config.context_length=65536;
   int ddg=0,directory=0,probes=0,api=0,reads=0;
   auto transport=[&](const std::string &url,const std::string &,const std::function<void()> &control){
     if(control)control();
@@ -87,6 +90,9 @@ void complete_regression() {
   CHECK(generation_after_tool && thought_after_tool);
   auto before=db.query("SELECT id FROM tool_runs").size();runtime.chat(input,emit,"one-human-message");CHECK(db.query("SELECT id FROM tool_runs").size()==before);
   for(auto &event:events)if(event["type"]=="research.warning")CHECK(event["payload"]["content"].get<std::string>().find(input)==std::string::npos);
+  recorder.flush();std::ifstream log(recorder.path());std::string line;size_t fallbacks=0;bool resolved=false,reader=false;
+  while(std::getline(log,line)){auto record=Json::parse(line);if(record["event"]=="search.fallback"){++fallbacks;CHECK(record.contains("search_id"));}resolved|=record["event"]=="research.resolved";reader|=record["event"]=="reader.parse_completed";}
+  CHECK(fallbacks==1 && resolved && reader);
 }
 void failure_is_not_verification() {
   Fixture f;Registry registry(f.paths);PersonaContext p(f.paths,registry.create("Claim fixture",""),f.root/"project");Config config;
