@@ -275,7 +275,7 @@ Json Memory::wake() {
     {"unfinished",p_.db->query("SELECT id,title,status FROM tasks WHERE status IN ('planned','active','blocked','verifying') AND (project_id IS NULL OR project_id=?) LIMIT 12",{p_.project})},
     {"commitments",p_.db->query("SELECT description,due_condition FROM commitments WHERE status='active' ORDER BY priority DESC LIMIT 8")},
     {"goals",p_.db->query("SELECT * FROM goals WHERE status='active' AND (project_id IS NULL OR project_id=?) ORDER BY priority DESC LIMIT 8",{p_.project})},
-    {"research",p_.db->query("SELECT id,task_id,substr(question,1,512) AS question,required,status,substr(conclusion,1,1024) AS conclusion FROM research_questions WHERE status IN ('pending','unverified','contradicted') AND (task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE project_id=?)) ORDER BY id DESC LIMIT 12",{p_.project})},{"open_loops",search("inspect_open_loops","")},{"self",self()},{"project",project_context()}};
+    {"research",p_.db->query("SELECT id,task_id,substr(question,1,512) AS question,required,status,substr(conclusion,1,1024) AS conclusion FROM research_questions WHERE superseded_by IS NULL AND status IN ('pending','unverified','contradicted') AND (task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE project_id=?)) ORDER BY id DESC LIMIT 12",{p_.project})},{"open_loops",search("inspect_open_loops","")},{"self",self()},{"project",project_context()}};
 }
 Json Memory::handoff() {
   auto rows=p_.db->query("SELECT id,through_message_id,state_json FROM context_checkpoints WHERE session_id=? ORDER BY id DESC LIMIT 1",{p_.session});

@@ -616,9 +616,8 @@ void research_projection() {
         0);
     collected += excerpt["content"].get<std::string>();
     complete = excerpt["complete"];
-    auto next = excerpt["next_offset"].get<Id>();
-    CHECK(complete || next > offset);
-    offset = next;
+    if(complete)CHECK(excerpt["next_offset"].is_null());
+    else {auto next=excerpt["next_offset"].get<Id>();CHECK(next>offset);offset=next;}
   }
   CHECK(complete);
   for (int i = 0; i < 20; ++i)

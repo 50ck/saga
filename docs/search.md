@@ -155,13 +155,13 @@ association is explicit. Goal-level attempts are recorded for each selected clai
 without asserting that any of them has been verified. `research_attempts` stores outcomes separately from claim
 status and source snapshots. A failed backend or search never evaluates a claim,
 invalidates previously fetched evidence or marks every outstanding goal unverified.
-Supported/contradicted conclusions require exact quotes from immutable fetched
-documents; search snippets cannot serve as evidence. Evaluation remains the agent's
+Supported/contradicted conclusions require immutable passage references (or exact
+quotes from immutable fetched documents); search snippets cannot serve as evidence. Evaluation remains the agent's
 responsibility, recorded through `research_resolve` per claim. This validates
 provenance and quoted passages, not mathematical truth or source authority.
 
-Required claims need an associated search/read attempt before an explicit
-unverified resolution. Disabled network access is reported separately. Reversible
+Required claims need an associated search/read attempt or a validated documentary
+citation before an explicit unverified resolution. Disabled network access is reported separately. Reversible
 low-risk work may proceed after disclosed uncertainty; required unverified claims
 still prevent verified completion. Optional claims do not impose that gate. Normal
 warnings contain short claim descriptions, never the entire operator request.
@@ -226,3 +226,65 @@ work/tool observations. `recall_observation` remains compatible with its narrowe
 observation contract and returns a recovery action when given a message event.
 Episode, session and event IDs are never silently interchanged. Historical payloads
 are untrusted data, not new user turns. Recall does not execute archived tools.
+
+
+## Passage citations and claim assessment
+
+`web_read` and `web_fetch` return `passages` with immutable `passage_id`, original
+`block_id` and a short preview. Cite those IDs with a relation (`supports`,
+`contradicts`, `partial` or `background`); no quotation transcription is needed.
+`web_read(passage_id)` rereads the exact stored selection without network traffic,
+including when `/web off` is set. Selected table rows and code windows are stored
+with their canonical block representation and hash, even when their rendering is
+not a contiguous substring of the complete document. Table row indices and the
+original block hash preserve the selection provenance; partial blocks are labeled.
+Refresh creates a new source;
+existing sources and passages cannot be overwritten or deleted through SQL.
+The compact catalog lists at most 32 blocks; `passage_catalog_complete=false`
+means a more focused read is needed for omitted references. `research_status`
+and persistent runtime context keep recent passage IDs available after compaction.
+
+A focused read's content, passages and reduction metadata come from the same
+selection. It returns `focused=true`, the actual query and `next_offset=null`:
+query retrieval is not sequential pagination. Unfocused canonical offsets count
+rendered body blocks, excluding the provenance header. They advance only at block
+boundaries; `total_bytes` uses the same coordinate system. Older plaintext
+snapshots retain UTF-8 byte pagination. Empty/end selections have no next cursor.
+
+For supported/contradicted resolutions, `assessment` repeats the exact original
+`proposition`, declares full `coverage` and provides a concise `rationale`.
+Citation identity is deterministic; whether a passage entails that proposition
+is explicitly recorded as `semantic_validation=agent_assessed`. Saga cannot prove
+arbitrary natural-language entailment. It rejects absent evidence, mismatched
+propositions, partial coverage and citation relations conflicting with the status.
+Partial or conflicting findings remain unverified and do not clear required gates.
+Claims should be small questions or hypotheses; avoid compound propositions where
+only one component is evidenced. Required obligations cover critical knowledge
+gaps, not every stable auxiliary library fact.
+
+`research_revise` creates a pending replacement when the original proposition was
+wrong. The original text, assessment and citations remain in the audit record;
+only the replacement participates in active goal and completion checks. Required
+status and goal scope carry forward. A corrected conclusion cannot silently prove
+an unchanged false proposition. Revisions require a different concise question
+and an explicit reason, and cannot turn the operator's entire prompt into a claim.
+
+Legacy `source_id` plus exact `quote` remains supported. Fabricated, combined or
+paraphrased quotes fail without fuzzy matching. `ResearchEvidenceError` returns
+the claim, citation index and a concrete reread/recovery action. Search snippets
+and cognitive-tool acknowledgements remain ineligible. For local documentation,
+`event_id` plus an exact quote may reference a completed UTF-8 `file_read` snapshot
+(e.g. project documentation or a vendored header). This proves documentary
+observations, never a successful build or execution; execution checks retain their
+separate observation requirements and existing filesystem permissions.
+
+Schema 12 preserves legacy conclusions and evidence, labels their assessment
+unreviewed and changes legacy supported/contradicted claims to unverified. They
+must be explicitly reassessed before serving as verified completion obligations.
+It does not delete evidence or automatically replay past tools.
+
+Under context-budget pressure, the provider context retains the latest runtime
+attention snapshot and drops superseded snapshots before archiving any completed
+tool exchanges. Otherwise attention updates remain append-only for prompt/KV cache
+reuse. Older snapshots remain in the event/message audit trail. User messages and assistant/tool history remain intact. This prevents a
+long research turn from accumulating dozens of repeated claim/evidence catalogs.

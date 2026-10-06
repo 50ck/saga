@@ -56,16 +56,71 @@ void storage() {
   auto session=persona.db->exec("INSERT INTO sessions(started_at,status) VALUES(?,'active')",{now()});
   int network=0;WebResearch web(*persona.db,config,[&](const std::string& url,const std::string&,const std::function<void()>& service){++network;if(service)service();auto response=page(url.find("duckduckgo")!=std::string::npos ? search_html : "<main><h1>Modern rules</h1><p>Rotation is clockwise.</p></main>");response.url=url;return response;});
   web.begin_turn(session,0);auto search=web.dispatch("web_search",{{"query","rules"}},session,0);auto snippet=search["results"][0]["source_id"];
-  auto q=web.question("How does rotation work?",true,session,0);rejects([&]{web.dispatch("research_resolve",{{"id",q},{"status","supported"},{"conclusion","Clockwise"},{"sources",Json::array({{{"source_id",snippet},{"quote","Version 2 rotation rules."}}})}},session,0);});
+  auto q=web.question("How does rotation work?",true,session,0);rejects([&]{web.dispatch("research_resolve",{{"id",q},{"status","supported"},{"assessment",{{"proposition","How does rotation work?"},{"coverage","full"},{"rationale","The selected passage documents the rotation direction."}}},{"conclusion","Clockwise"},{"sources",Json::array({{{"source_id",snippet},{"quote","Version 2 rotation rules."},{"relation","supports"}}})}},session,0);});
   auto doc=web.dispatch("web_read",{{"source_id",snippet}},session,0);auto id=doc["source_id"];CHECK(doc["kind"]=="document");CHECK(doc["content"].get<std::string>().find("Rotation is clockwise.")!=std::string::npos);
-  web.dispatch("research_resolve",{{"id",q},{"status","supported"},{"conclusion","Clockwise"},{"sources",Json::array({{{"source_id",id},{"quote","Rotation is clockwise."}}})}},session,0);CHECK(web.unresolved_required(session,0).empty());
-  rejects([&]{web.dispatch("research_resolve",{{"id",q},{"status","supported"},{"conclusion","Fabrication"},{"sources",Json::array({{{"source_id",id},{"quote","invented quote"}}})}},session,0);});
+  web.dispatch("research_resolve",{{"id",q},{"status","supported"},{"assessment",{{"proposition","How does rotation work?"},{"coverage","full"},{"rationale","The selected passage documents the rotation direction."}}},{"conclusion","Clockwise"},{"sources",Json::array({{{"source_id",id},{"quote","Rotation is clockwise."},{"relation","supports"}}})}},session,0);CHECK(web.unresolved_required(session,0).empty());
+  rejects([&]{web.dispatch("research_resolve",{{"id",q},{"status","supported"},{"assessment",{{"proposition","How does rotation work?"},{"coverage","full"},{"rationale","Fixture citation verification."}}},{"conclusion","Fabrication"},{"sources",Json::array({{{"source_id",id},{"quote","invented quote"},{"relation","supports"}}})}},session,0);});
   rejects([&]{persona.db->exec("UPDATE web_sources SET text='tampered' WHERE id=?",{id});});
   web.settings(false);auto cached=web.dispatch("web_read",{{"source_id",id}},session,0);CHECK(cached["source_id"]==id);CHECK(network==2);rejects([&]{web.dispatch("web_search",{{"query","rules"}},session,0);});CHECK(network==2);
   web.settings(true);web.service([&]{web.settings(false);});rejects([&]{web.dispatch("web_read",{{"url","https://example.com/new"}},session,0);});CHECK(network==2);
   PersonaContext other(paths,registry.create("Other synthetic persona",""),root/"project");CHECK(other.db->query("SELECT id FROM web_sources").empty());
-  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==11);
+  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==12);
 }
+void evidence_contract() {
+  auto root=fs::temp_directory_path()/("saga-passages-"+uuid());
+  struct Cleanup{fs::path path;~Cleanup(){fs::remove_all(path);}} cleanup{root};
+  Paths paths{root/"config",root/"data",root/"state",root/"run"};paths.create();private_dir(root/"project");Registry registry(paths);
+  PersonaContext p(paths,registry.create("Passage fixture",""),root/"project");Config config;
+  auto session=p.db->exec("INSERT INTO sessions(started_at,status) VALUES(?,'active')",{now()});
+  std::string html="<main><h1>Modern rules</h1><p>A T-spin examines three occupied corners after rotation.</p><h2>Scoring</h2><table><tr><th>Rule</th><th>Result</th></tr>";
+  for(int i=0;i<16;++i)html+="<tr><td>row "+std::to_string(i)+"</td><td>"+(i==4 || i==13 ? "T-spin [Impossible.]" : "Unrelated scoring")+"</td></tr>";
+  html+="</table><pre>    int score = 1;\n    return score;</pre></main>";
+  int fetches=0;WebResearch web(*p.db,config,[&](auto &url,auto&,auto&){++fetches;auto r=page(html);r.url=url;return r;});web.begin_turn(session,0);
+  auto claim=web.question("A T-spin examines only two occupied corners",true,session,0);
+  auto doc=web.dispatch("web_read",{{"url","https://rules.example.com/twist"},{"query","T-spin"},{"question_id",claim}},session,0);
+  CHECK(doc["query"]=="T-spin" && doc["focused"]==true && doc["next_offset"].is_null());CHECK(!doc["passages"].empty());
+  Id passage=0,table=0;
+  for(auto &entry:doc["passages"]) {
+    auto block=web.dispatch("web_read",{{"passage_id",entry["passage_id"]}},session,0);
+    CHECK(doc["content"].get<std::string>().find(block["content"].get<std::string>())!=std::string::npos);
+    auto content=block["content"].get<std::string>();
+    if(content.find("three occupied corners")!=std::string::npos)passage=entry["passage_id"];
+    if(content.find("[Impossible.]")!=std::string::npos) {table=entry["passage_id"];CHECK(content.find("Unrelated scoring")==std::string::npos);CHECK(block["selection_partial"]==true);}
+  }
+  CHECK(p.db->query("SELECT text FROM web_sources WHERE id=?",{doc["source_id"]})[0]["text"].get<std::string>().find("    int score = 1;\n    return score;")!=std::string::npos);
+  auto selection=Json::parse(p.db->query("SELECT selection_json FROM web_source_passages WHERE id=?",{table})[0]["selection_json"].get<std::string>());CHECK(selection["original_row_indices"]==Json::array({0,5,14}));
+  CHECK(passage>0 && table>0 && fetches==1);CHECK(doc["reduced"]==true && doc["complete"]==false);
+  auto cached=web.dispatch("web_read",{{"source_id",doc["source_id"]},{"query","T-spin"}},session,0);CHECK(cached["content"]==doc["content"] && cached["passages"]==doc["passages"]);
+  rejects([&]{p.db->exec("UPDATE web_source_passages SET text='changed' WHERE id=?",{passage});});
+  rejects([&]{p.db->exec("DELETE FROM web_source_passages WHERE id=?",{passage});});
+  auto assessment=[&](std::string proposition,std::string coverage){return Json{{"proposition",proposition},{"coverage",coverage},{"rationale","The passage documents three occupied corners; evaluate the original claim."}};};
+  Json resolution={{"id",claim},{"status","supported"},{"conclusion","Three corners are inspected"},{"assessment",assessment("A T-spin examines three occupied corners","full")},{"sources",Json::array({{{"passage_id",passage},{"relation","supports"}}})}};
+  try {web.dispatch("research_resolve",resolution,session,0);CHECK(false);}catch(const ResearchEvidenceError &e){CHECK(e.recovery["proposition"]=="A T-spin examines only two occupied corners");CHECK(e.recovery.contains("recovery_action"));}
+  resolution["assessment"]=assessment("A T-spin examines only two occupied corners","partial");rejects([&]{web.dispatch("research_resolve",resolution,session,0);});
+  resolution["status"]="unverified";auto partial=web.dispatch("research_resolve",resolution,session,0);CHECK(partial["assessment"]["coverage"]=="partial" && !web.unresolved_required(session,0).empty());
+  resolution["status"]="supported";resolution["assessment"]["coverage"]="full";resolution["sources"][0]["relation"]="contradicts";rejects([&]{web.dispatch("research_resolve",resolution,session,0);});
+  resolution["sources"].push_back({{"passage_id",passage},{"relation","supports"}});rejects([&]{web.dispatch("research_resolve",resolution,session,0);});resolution["sources"].erase(1);
+  resolution["status"]="contradicted";auto contradicted=web.dispatch("research_resolve",resolution,session,0);CHECK(contradicted["sources"][0]["citation_validated"]==true);CHECK(contradicted["assessment"]["semantic_validation"]=="agent_assessed");
+  auto replacement=web.dispatch("research_revise",{{"id",claim},{"question","A T-spin examines three occupied corners"},{"reason","The original corner count is wrong"}},session,0);
+  CHECK(replacement["required"]==1);auto original=p.db->query("SELECT * FROM research_questions WHERE id=?",{claim})[0];CHECK(original["question"]=="A T-spin examines only two occupied corners" && original["status"]=="contradicted");CHECK(original["superseded_by"]==replacement["claim_id"]);
+  CHECK(web.unresolved_required(session,0).size()==1);rejects([&]{web.dispatch("research_resolve",resolution,session,0);});
+  resolution["id"]=replacement["claim_id"];resolution["status"]="supported";resolution["assessment"]=assessment(replacement["proposition"],"full");resolution["sources"][0]["relation"]="supports";
+  auto supported=web.dispatch("research_resolve",resolution,session,0);CHECK(supported["sources"][0]["content_hash"].is_string());CHECK(web.unresolved_required(session,0).empty());
+  resolution["sources"]=Json::array({{{"source_id",doc["source_id"]},{"quote","T-spin Impossible."},{"relation","supports"}}});
+  try {web.dispatch("research_resolve",resolution,session,0);CHECK(false);}catch(const ResearchEvidenceError &e){CHECK(e.recovery["recovery_action"]["tool"]=="web_read");CHECK(e.recovery["citation_index"]==0);}
+  auto table_claim=web.question("The scoring table includes [Impossible.] entries",false,session,0);resolution["id"]=table_claim;resolution["assessment"]=assessment("The scoring table includes [Impossible.] entries","full");resolution["conclusion"]="The selected table rows contain [Impossible.] entries.";resolution["sources"]=Json::array({{{"passage_id",table},{"relation","supports"}}});CHECK(web.dispatch("research_resolve",resolution,session,0)["status"]=="supported");
+  // Local header/documentation observations are distinct from compilation proof.
+  auto local=web.question("Does the local ncurses header declare initscr?",true,session,0);
+  auto ev=p.db->event("tool.completed",{{"tool","file_read"},{"result",{{"content","extern WINDOW *initscr(void);"},{"encoding","utf-8"},{"path","fixture/curses.h"}}}},session);
+  Json local_resolution={{"id",local},{"status","supported"},{"conclusion","The captured header declares initscr."},{"assessment",assessment("Does the local ncurses header declare initscr?","full")},{"sources",Json::array({{{"event_id",ev},{"quote","WINDOW *initscr(void)"},{"relation","supports"}}})}};
+  CHECK(web.dispatch("research_resolve",local_resolution,session,0)["sources"][0]["basis"]=="local_document");
+  auto ack=p.db->event("tool.completed",{{"tool","remember"},{"result",{{"content","extern WINDOW *initscr(void);"},{"encoding","utf-8"}}}},session);local_resolution["sources"][0]["event_id"]=ack;rejects([&]{web.dispatch("research_resolve",local_resolution,session,0);});
+  auto binary=p.db->event("tool.completed",{{"tool","file_read"},{"result",{{"content","WINDOW *initscr(void)"},{"encoding","base64"}}}},session);local_resolution["sources"][0]["event_id"]=binary;rejects([&]{web.dispatch("research_resolve",local_resolution,session,0);});
+  // Migration preserves legacy conclusions and citations but requests semantic reassessment.
+  p.db->sql("DROP TABLE web_source_passages; ALTER TABLE research_questions DROP COLUMN assessment_json; ALTER TABLE research_questions DROP COLUMN superseded_by; UPDATE schema_version SET version=11");p.db->migrate();
+  auto migrated=p.db->query("SELECT status,conclusion,assessment_json,sources_json FROM research_questions WHERE id=?",{local})[0];CHECK(migrated["status"]=="unverified" && migrated["conclusion"]=="The captured header declares initscr.");CHECK(Json::parse(migrated["assessment_json"].get<std::string>())["coverage"]=="unreviewed");CHECK(!Json::parse(migrated["sources_json"].get<std::string>()).empty());
+}
+
 void proof_and_failure_gates() {
   auto root=fs::temp_directory_path()/("saga-web-proof-"+uuid());
   struct Cleanup{fs::path path;~Cleanup(){fs::remove_all(path);}} cleanup{root};
@@ -83,7 +138,7 @@ void proof_and_failure_gates() {
   auto bad=tools.execute("check_resolve",{{"check_id",check},{"source_event_id",result["source_event_id"]},{"passed",true},{"explanation","Downloaded docs"},{"quote","Rotation is clockwise."}});CHECK(bad.contains("error"));CHECK(p.db->query("SELECT status FROM task_checks WHERE id=?",{check})[0]["status"]=="unresolved");
   auto research_check=tools.execute("task_add_check",{{"description","Find documented rotation direction"},{"kind","research"}})["check_id"];
   auto good=tools.execute("check_resolve",{{"check_id",research_check},{"source_event_id",result["source_event_id"]},{"passed",true},{"explanation","Documented rule"},{"quote","Rotation is clockwise."}});CHECK(!good.contains("error"));
-  auto resolve=tools.execute("research_resolve",{{"id",q},{"status","supported"},{"conclusion","The source documents clockwise rotation."},{"sources",Json::array({{{"source_id",result["source_id"]},{"quote","Rotation is clockwise."}}})}});CHECK(!resolve.contains("error"));
+  auto resolve=tools.execute("research_resolve",{{"id",q},{"status","supported"},{"assessment",{{"proposition","Rotation?"},{"coverage","full"},{"rationale","The cited rule answers the rotation question."}}},{"conclusion","The source documents clockwise rotation."},{"sources",Json::array({{{"source_id",result["source_id"]},{"quote","Rotation is clockwise."},{"relation","supports"}}})}});CHECK(!resolve.contains("error"));
   auto fact=tools.execute("learn_fact",{{"subject","rotation"},{"predicate","direction"},{"object","clockwise"},{"source_event_id",result["source_event_id"]}});CHECK(!fact.contains("error"));double before=memory.confidence("fact",fact["id"]);
   auto repeat=tools.execute("web_read",{{"url","https://docs.example.com/rules"},{"refresh",true}});tools.execute("learn_fact",{{"subject","rotation"},{"predicate","direction"},{"object","clockwise"},{"source_event_id",repeat["source_event_id"]}});CHECK(memory.confidence("fact",fact["id"])==before);
   auto source_count=p.db->query("SELECT count(*) AS n FROM web_sources")[0]["n"];
@@ -120,12 +175,12 @@ public:
       if(m["role"]=="tool")last=Json::parse(text);
     }
     if(!state.empty()) {task_=state["active_task"][0]["id"];check_=state["task_checks"][0]["id"];if(!state["research_questions"].empty())question_=state["research_questions"][0]["id"];}
-    auto invoke=[&](std::string name,Json args){callback({{"choices",Json::array({{{"index",0},{"delta",{{"tool_calls",Json::array({{{"index",0},{"id","fixture-"+std::to_string(step_)},{"function",{{"name",name},{"arguments",args.dump()}}}}})}}},{"finish_reason","tool_calls"}}})}});};
+    auto invoke=[&](std::string name,Json args){if(name=="research_resolve")args["assessment"]={{"proposition","How does rotation work?"},{"coverage","full"},{"rationale","The cited fixture rule states the documented rotation direction."}};callback({{"choices",Json::array({{{"index",0},{"delta",{{"tool_calls",Json::array({{{"index",0},{"id","fixture-"+std::to_string(step_)},{"function",{{"name",name},{"arguments",args.dump()}}}}})}}},{"finish_reason","tool_calls"}}})}});};
     switch(step_++) {
       case 0:invoke("research_plan",{{"intent","Implement a widget"},{"operator_constraints",{"C++"}},{"desired_actions",{"Write and compile"}},{"goals",Json::array({{{"question","Modern rotation direction"},{"required",true},{"claims",{"How does rotation work?"}}}})}});break;
       case 1:invoke("web_search",{{"query","site:docs.example.com \"rotation\" rules"},{"include_domains",{"docs.example.com"}}});break;
       case 2:search_=last;CHECK(!search_.contains("error"));invoke("web_read",{{"source_id",search_["results"][0]["source_id"]}});break;
-      case 3:doc_=last;CHECK(!doc_.contains("error"));invoke("research_resolve",{{"id",question_},{"status","supported"},{"conclusion","The documented fixture rule is clockwise rotation."},{"sources",Json::array({{{"source_id",doc_["source_id"]},{"quote","Rotation is clockwise."}}})}});break;
+      case 3:doc_=last;CHECK(!doc_.contains("error"));invoke("research_resolve",{{"id",question_},{"status","supported"},{"conclusion","The documented fixture rule is clockwise rotation."},{"sources",Json::array({{{"source_id",doc_["source_id"]},{"quote","Rotation is clockwise."},{"relation","supports"}}})}});break;
       case 4:CHECK(!last.contains("error"));invoke("file_write",{{"path","widget.cpp"},{"content","int main() { return 0; }\n"},{"description","Synthetic research implementation"}});break;
       case 5:CHECK(!last.contains("error"));invoke("shell_exec",{{"command","c++ widget.cpp -o widget && ./widget"},{"execution","host"}});break;
       case 6:CHECK(!last.contains("error") && last["exit_code"]==0);invoke("check_resolve",{{"check_id",check_},{"source_event_id",last["source_event_id"]},{"passed",true},{"explanation","Compiled and executed the fixture program successfully"}});break;
@@ -162,4 +217,4 @@ void absent_research_gate() {
 }
 
 }
-int main(){try{parsing();boundaries();adapter();storage();proof_and_failure_gates();runtime_research();absent_research_gate();std::cout<<"Web adapter, extraction, boundaries and provenance checks passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{parsing();boundaries();adapter();storage();evidence_contract();proof_and_failure_gates();runtime_research();absent_research_gate();std::cout<<"Web adapter, extraction, boundaries and provenance checks passed\n";return 0;}catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

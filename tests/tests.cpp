@@ -136,7 +136,7 @@ void persistence() {
   auto p = f.persona(a); CHECK(p->soul == "Identity A");
   rejects([&]{ f.persona(a); });
   auto q = f.persona(b); CHECK(q->soul == "Identity B");
-  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 11);
+  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 12);
   auto id = db->event("test.event",{{"text","immutable"}});
   Json single = id;
   CHECK(db->query("SELECT type FROM events WHERE id=?",{single})[0]["type"] == "test.event");
@@ -145,7 +145,7 @@ void persistence() {
   CHECK(q->db->query("SELECT * FROM events WHERE type='test.event'").empty());
   q->db->sql("ALTER TABLE facts DROP COLUMN project_id; UPDATE schema_version SET version=1");
   q->db->migrate();
-  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 11);
+  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 12);
   bool scoped_column = false;
   for (const auto& column : q->db->query("PRAGMA table_info(facts)")) if (column["name"] == "project_id") scoped_column = true;
   CHECK(scoped_column);

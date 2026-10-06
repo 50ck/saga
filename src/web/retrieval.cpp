@@ -219,6 +219,8 @@ CanonicalDocument select_document(const CanonicalDocument &original,
         }
         if (block.rows.size() == 1)
           block.rows = std::move(rows);
+        else if (block.rows.size() != rows.size())
+          d.truncated = true;
       }
       if ((block.type == BlockType::Code || block.type == BlockType::Diff) &&
           estimate_tokens(render_block(block)) > content_budget / 2) {

@@ -73,6 +73,11 @@ struct ResearchReferenceError : std::runtime_error {
   ResearchReferenceError(std::string message, Json available)
       : std::runtime_error(std::move(message)), references(std::move(available)) {}
 };
+struct ResearchEvidenceError : std::runtime_error {
+  Json recovery;
+  ResearchEvidenceError(std::string message, Json data)
+      : std::runtime_error(std::move(message)), recovery(std::move(data)) {}
+};
 class WebResearch {
   Database &db_;
   Config config_;

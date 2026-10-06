@@ -67,7 +67,7 @@ void Database::transaction(const std::function<void()>& operation) {
 void Database::migrate() {
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  if (version > 11) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if (version > 12) throw std::runtime_error("Database schema is newer than this Saga binary");
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -155,6 +155,21 @@ void Database::migrate() {
     sql("UPDATE research_questions SET required=0,status='unverified',conclusion='Legacy whole-request entry retained for audit; external facts must be decomposed separately.' WHERE goal_id IS NULL AND EXISTS(SELECT 1 FROM events WHERE events.session_id=research_questions.session_id AND events.type='user.message' AND json_extract(events.payload_json,'$.content')=research_questions.question);");
     sql("UPDATE schema_version SET version=11");
   });
+
+  if(version<12)transaction([&]{
+    bool assessment=false,superseded=false;
+    for(auto &column:query("PRAGMA table_info(research_questions)")) {assessment |= column["name"]=="assessment_json";superseded |= column["name"]=="superseded_by";}
+    if(!assessment)sql("ALTER TABLE research_questions ADD COLUMN assessment_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(assessment_json))");
+    if(!superseded)sql("ALTER TABLE research_questions ADD COLUMN superseded_by INTEGER REFERENCES research_questions(id)");
+    sql(R"SQL(
+    CREATE TABLE IF NOT EXISTS web_source_passages(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES web_sources(id),block_id INTEGER NOT NULL,text TEXT NOT NULL,content_hash TEXT NOT NULL,selection_json TEXT NOT NULL CHECK(json_valid(selection_json)),created_at INTEGER NOT NULL,UNIQUE(source_id,block_id,content_hash));
+    CREATE TRIGGER IF NOT EXISTS web_passages_no_update BEFORE UPDATE ON web_source_passages BEGIN SELECT RAISE(ABORT,'Source passages are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS web_passages_no_delete BEFORE DELETE ON web_source_passages BEGIN SELECT RAISE(ABORT,'Source passages are immutable'); END;
+
+    UPDATE research_questions SET assessment_json='{"assessed_by":"legacy_agent","coverage":"unreviewed","citation_validation":"legacy_exact_quote"}' WHERE status IN ('supported','contradicted');
+    UPDATE research_questions SET status='unverified',disclosed=0 WHERE json_extract(assessment_json,'$.coverage')='unreviewed';
+    UPDATE schema_version SET version=12;
+  )SQL");});
 
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {

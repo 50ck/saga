@@ -34,10 +34,10 @@ Id WebResearch::question(const std::string &text, bool required, Id session, Id 
   return id;
 }
 Json research_context(Database &db, Id session, Id task) {
-  return db.query("SELECT id,id AS claim_id,goal_id,task_id,assumption_id,substr(question,1,160) AS "
-                  "question,required,status,substr(conclusion,1,1024) AS conclusion,(SELECT "
+  return db.query("SELECT id,id AS claim_id,goal_id,task_id,assumption_id,substr(question,1,512) AS "
+                  "question,required,status,assessment_json,superseded_by,substr(conclusion,1,1024) AS conclusion,(SELECT "
                   "json_group_array(json_extract(value,'$.source_id')) FROM "
-                  "json_each(sources_json)) AS source_ids,disclosed FROM research_questions WHERE "
+                  "json_each(sources_json)) AS source_ids,disclosed FROM research_questions WHERE superseded_by IS NULL AND "
                   "((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY status='pending' DESC,updated_at DESC,id DESC LIMIT 64",
                   {session, task});
 }
@@ -45,7 +45,7 @@ Json WebResearch::questions(Id session, Id task) const {
   return research_context(db_, session, task);
 }
 Json WebResearch::unresolved_required(Id session, Id task) const {
-  return db_.query("SELECT * FROM research_questions WHERE required=1 AND status IN "
+  return db_.query("SELECT * FROM research_questions WHERE required=1 AND superseded_by IS NULL AND status IN "
                    "('pending','unverified','contradicted') AND ((task_id IS NULL AND "
                    "session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id",
                    {session, task});
@@ -96,9 +96,9 @@ Json research_plan_context(Database &db,Id session,Id task) {
     row["decomposition"]=Json::parse(row["decomposition_json"].get<std::string>());row.erase("decomposition_json");row["decomposition"].erase("goals");
     row["goals"]=db.query("SELECT id AS goal_id,question,required FROM research_goals WHERE plan_id=?",{row["plan_id"]});
     for(auto &goal:row["goals"]) {
-      goal["claims"]=db.query("SELECT id AS claim_id,id AS question_id,question AS proposition,status,required FROM research_questions WHERE goal_id=?",{goal["goal_id"]});
+      goal["claims"]=db.query("SELECT id AS claim_id,id AS question_id,question AS proposition,status,required,assessment_json FROM research_questions WHERE superseded_by IS NULL AND goal_id=?",{goal["goal_id"]});
       bool supported=!goal["claims"].empty(),contradicted=false,pending=false,partial=false;
-      for(auto &claim:goal["claims"]) {supported=supported && claim["status"]=="supported";contradicted=contradicted || claim["status"]=="contradicted";pending=pending || claim["status"]=="pending";partial=partial || claim["status"]=="supported";}
+      for(auto &claim:goal["claims"]) {supported=supported && claim["status"]=="supported";contradicted=contradicted || claim["status"]=="contradicted";pending=pending || claim["status"]=="pending";partial=partial || claim["status"]=="supported" || Json::parse(claim["assessment_json"].get<std::string>()).value("coverage","")=="partial";}
       goal["status"]=supported ? "established" : contradicted ? "contradicted" : partial ? "partially_established" : pending ? "unknown" : "not_established";
     }
     result.push_back(std::move(row));
@@ -121,7 +121,7 @@ Json WebResearch::plan(const Json &args,Id session,Id task) {
     for(auto &entry:research_plan_context(db_,session,task))if(entry["plan_id"]==id)result["goals"]=entry["goals"];
     for(auto &goal:result["goals"]) {
       goal["question"]=utf8_excerpt(goal["question"].get<std::string>(),160);
-      for(auto &claim:goal["claims"])claim["proposition"]=utf8_excerpt(claim["proposition"].get<std::string>(),160);
+      // Full propositions are required for explicit evidence assessment.
     }
     if(reused)result["reused"]=true;
     return result;
@@ -175,7 +175,7 @@ Json WebResearch::references(Id session,Id task) const {
     {"reference_help","question_id (or research_resolve.id) identifies one claim. goal_id identifies a goal for a web search/read. These namespaces are distinct; use returned IDs, not ordinal numbers."}};
   std::map<Id,Json> goals;
   for(auto &claim:claims) {
-    result["available_claims"].push_back({{"claim_id",claim["claim_id"]},{"question_id",claim["claim_id"]},{"goal_id",claim["goal_id"]},{"question",utf8_excerpt(claim["question"].get<std::string>(),80)},{"status",claim["status"]}});
+    result["available_claims"].push_back({{"claim_id",claim["claim_id"]},{"question_id",claim["claim_id"]},{"goal_id",claim["goal_id"]},{"question",claim["question"].get<std::string>()},{"status",claim["status"]}});
     if(claim["goal_id"].is_null())continue;
     Id id=claim["goal_id"];
     if(!goals.contains(id)) {
@@ -185,10 +185,11 @@ Json WebResearch::references(Id session,Id task) const {
     goals[id]["claim_ids"].push_back(claim["claim_id"]);
   }
   for(auto &[id,goal]:goals)result["available_goals"].push_back(std::move(goal));
+  result["available_passages"]=db_.query("SELECT p.id AS passage_id,p.source_id,p.block_id,substr(p.text,1,100) AS preview FROM web_source_passages p JOIN web_sources s ON s.id=p.source_id WHERE ((s.task_id IS NULL AND s.session_id=?) OR (s.task_id IS NOT NULL AND s.task_id=?)) ORDER BY p.id DESC LIMIT 24",{session,task});
   return result;
 }
 Json WebResearch::lookup_claim(Id id,Id session,Id task) const {
-  auto rows=db_.query("SELECT * FROM research_questions WHERE id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?))",{id,session,task});
+  auto rows=db_.query("SELECT * FROM research_questions WHERE superseded_by IS NULL AND id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?))",{id,session,task});
   if(rows.empty())throw ResearchReferenceError("Unknown claim_id in the active research scope. A goal_id cannot be used as question_id; use goal_id explicitly or choose a returned claim_id.",references(session,task));
   return rows[0];
 }
@@ -202,7 +203,7 @@ Json WebResearch::dispatch(const std::string &name,const Json &args,Id session,I
   if(goal) {
     if(db_.query("SELECT id FROM research_goals WHERE id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?))",{goal,session,task}).empty())
       throw ResearchReferenceError("Unknown goal_id in the active research scope.",references(session,task));
-    selected=db_.query("SELECT id FROM research_questions WHERE goal_id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id",{goal,session,task});
+    selected=db_.query("SELECT id FROM research_questions WHERE superseded_by IS NULL AND goal_id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id",{goal,session,task});
     if(selected.empty())throw ResearchReferenceError("This research goal has no active claims.",references(session,task));
   }
   if(claim) {
@@ -211,7 +212,7 @@ Json WebResearch::dispatch(const std::string &name,const Json &args,Id session,I
     if(!row["goal_id"].is_null())goal=row["goal_id"];
     selected=Json::array({{{"id",claim}}});
   }else if(!goal) {
-    auto pending=db_.query("SELECT id,goal_id FROM research_questions WHERE status='pending' AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id",{session,task});
+    auto pending=db_.query("SELECT id,goal_id FROM research_questions WHERE superseded_by IS NULL AND status='pending' AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id",{session,task});
     if(pending.size()==1) {claim=pending[0]["id"];if(!pending[0]["goal_id"].is_null())goal=pending[0]["goal_id"];selected=Json::array({{{"id",claim}}});}
   }
   Json ids=Json::array();for(auto &row:selected)ids.push_back(row["id"]);

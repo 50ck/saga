@@ -400,6 +400,8 @@ Json WebResearch::source_excerpt(Id id, Id offset, Id limit,
       throw std::runtime_error("Web output budget must be 128–4096 tokens");
     auto document =
         web::document_from_json(Json::parse(canonical[0]["document_json"].get<std::string>()));
+    size_t total = 0;
+    for (const auto &block : document.blocks) total += web::render_block(block).size() + 1;
     size_t start = 0, bytes = 0;
     while (start < document.blocks.size() && bytes < static_cast<size_t>(offset))
       bytes += web::render_block(document.blocks[start++]).size() + 1;
@@ -425,8 +427,39 @@ Json WebResearch::source_excerpt(Id id, Id offset, Id limit,
           break;
       }
     }
-    row["next_offset"] = query ? Json() : Json(next);
-    row["total_bytes"] = rows[0]["text"].get_ref<const std::string &>().size();
+    row["next_offset"] = query || next >= total || selected.blocks.empty() ? Json() : Json(next);
+    row["total_bytes"] = total;
+    row["offset_basis"] = "rendered_body_blocks";
+    row["focused"] = query.has_value();
+    row["query"] = query ? Json(*query) : Json();
+    if(query && offset)throw std::runtime_error("Focused retrieval has no sequential cursor; omit offset or use an unfocused read");
+    row["passages"] = Json::array();
+    constexpr size_t passage_catalog_limit=32;
+    row["passage_catalog_complete"] = selected.blocks.size()<=passage_catalog_limit;
+    db_.transaction([&] {
+      for (const auto &block : selected.blocks) {
+        auto text = web::render_block(block);
+        if (text.empty()) continue;
+        auto hash = digest(text);
+        web::CanonicalDocument selection;
+        selection.blocks.push_back(block);
+        auto selected_json=web::document_json(selection);
+        for(const auto &original:document.blocks)if(original.id==block.id) {
+          auto original_text=web::render_block(original);
+          selected_json["original_block_hash"]=digest(original_text);
+          selected_json["partial"]=original_text!=text;
+          if(block.type==web::BlockType::Table) {
+            selected_json["original_row_indices"]=Json::array();size_t cursor=0;
+            for(const auto &row:block.rows)for(;cursor<original.rows.size();++cursor)if(original.rows[cursor]==row) {selected_json["original_row_indices"].push_back(cursor++);break;}
+          }
+          break;
+        }
+        db_.exec("INSERT OR IGNORE INTO web_source_passages(source_id,block_id,text,content_hash,selection_json,created_at) VALUES(?,?,?,?,?,?)",
+                 {id,block.id,text,hash,selected_json.dump(),now()});
+        auto passage = db_.query("SELECT id FROM web_source_passages WHERE source_id=? AND block_id=? AND content_hash=?",{id,block.id,hash})[0]["id"];
+        if(row["passages"].size()<passage_catalog_limit)row["passages"].push_back({{"passage_id",passage},{"block_id",block.id},{"preview",utf8_excerpt(text,120)},{"partial",selected_json.value("partial",false)}});
+      }
+    });
     row["complete"] = !selected.truncated;
     row["reduced"] = selected.truncated;
     row["untrusted"] = true;
@@ -467,6 +500,22 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
     auto id=question(args.at("question"), args.value("required", false), session, task);
     return {{"id",id},{"claim_id",id},{"question_id",id},{"goal_id",lookup_claim(id,session,task)["goal_id"]}};
   }
+  if (name == "research_revise") {
+    auto original=lookup_claim(args.at("id").get<Id>(),session,task);
+    auto text=trim(args.at("question").get<std::string>()),reason=trim(args.at("reason").get<std::string>());
+    if(text.empty() || text.size()>512 || text.find_first_of("\r\n")!=std::string::npos || text==original["question"].get<std::string>() || reason.empty() || reason.size()>2048)
+      throw std::runtime_error("Revision requires a different concise external proposition and a reason");
+    auto user=db_.query("SELECT json_extract(payload_json,'$.content') AS content FROM events WHERE session_id=? AND type='user.message' ORDER BY id DESC LIMIT 1",{session});
+    if(!user.empty() && text==trim(user[0]["content"].get<std::string>()))throw std::runtime_error("Operator instructions are not research propositions");
+    Id replacement=0;
+    db_.transaction([&] {
+      replacement=db_.exec("INSERT INTO research_questions(session_id,task_id,goal_id,assumption_id,question,required,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        {session,original["task_id"],original["goal_id"],original["assumption_id"],text,original["required"],now(),now()});
+      db_.exec("UPDATE research_questions SET superseded_by=?,updated_at=? WHERE id=?",{replacement,now(),original["id"]});
+      db_.event("research.claim_revised",{{"original_claim_id",original["id"]},{"claim_id",replacement},{"reason",reason}},session,task);
+    });
+    return {{"claim_id",replacement},{"question_id",replacement},{"goal_id",original["goal_id"]},{"proposition",text},{"status","pending"},{"required",original["required"]},{"supersedes",original["id"]}};
+  }
   if (name == "research_resolve") {
     auto id = args.at("id").get<Id>();
     auto claim = lookup_claim(id,session,task);
@@ -477,30 +526,74 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
       throw std::runtime_error("Research resolution requires a concise conclusion");
     if (citations.size() > 8)
       throw std::runtime_error("Use at most eight focused source passages per research conclusion");
-    if ((status == "supported" || status == "contradicted") && citations.empty())
-      throw std::runtime_error("Supported/contradicted research requires fetched passages");
-    for (auto &cite : citations) {
-      auto source =
-          db_.query("SELECT text,kind FROM web_sources WHERE id=?", {cite.at("source_id")});
-      if (source.empty() || source[0]["kind"] != "document")
-        throw std::runtime_error(
-            "Research citations must reference a fetched document in this persona");
-      auto quote = cite.at("quote").get<std::string>();
-      if (quote.empty() || quote.size() > 4096 ||
-          source[0]["text"].get_ref<const std::string &>().find(quote) == std::string::npos)
-        throw std::runtime_error("Citation quote is not present in the source snapshot");
+    auto failure=[&](const std::string &message,size_t index,const Json &cite) -> void {
+      Json recovery={{"claim_id",id},{"citation_index",index},{"proposition",claim["question"]}};
+      if(cite.contains("source_id"))recovery["recovery_action"]={{"tool","web_read"},{"arguments",{{"source_id",cite["source_id"]},{"query",claim["question"]},{"question_id",id}}}};
+      else if(cite.contains("passage_id"))recovery["recovery_action"]={{"tool","web_read"},{"arguments",{{"passage_id",cite["passage_id"]},{"question_id",id}}}};
+      else if(cite.contains("event_id"))recovery["recovery_action"]={{"tool","recall_observation"},{"arguments",{{"event_id",cite["event_id"]}}}};
+      else recovery["recovery_action"]={{"tool","research_status"},{"arguments",Json::object()}};
+      throw ResearchEvidenceError(message,std::move(recovery));
+    };
+    if ((status=="supported" || status=="contradicted") && citations.empty())failure("Supported/contradicted research requires fetched passages; read source documents or mark the claim unverified",0,Json::object());
+    if(status!="supported" && status!="contradicted" && status!="unverified")throw std::runtime_error("Invalid research status");
+    Json assessment=args.value("assessment",Json::object());
+    bool evaluated=status=="supported" || status=="contradicted";
+    if(evaluated || !assessment.empty()) {
+      if(!assessment.is_object() || assessment.value("proposition","")!=claim["question"].get<std::string>() || trim(assessment.value("rationale","")).empty() || assessment.value("rationale","").size()>2048)
+        failure("Assessment must address the exact original proposition and explain the evidence. Use research_revise for a corrected proposition.",0,Json::object());
+      auto coverage=assessment.value("coverage","");
+      if(coverage!="full" && coverage!="partial" && coverage!="none")failure("Assessment coverage must be full, partial or none",0,Json::object());
+      if(evaluated && coverage!="full")failure("Partial coverage cannot establish or contradict the entire claim; resolve unverified or split the claim",0,Json::object());
     }
-    if (status == "unverified" && claim["required"] == 1 && settings()["enabled"].get<bool>()) {
+    bool supports=false,contradicts=false;
+    size_t index=0;
+    for (auto &cite : citations) {
+      auto relation=cite.value("relation","");
+      if(relation!="supports" && relation!="contradicts" && relation!="partial" && relation!="background")failure("Each citation needs its relation to the original proposition",index,cite);
+      supports |= relation=="supports";contradicts |= relation=="contradicts";
+      std::string text,hash;
+      if(cite.contains("passage_id")) {
+        if(cite.contains("event_id"))failure("A passage and local event cannot identify the same citation",index,cite);
+        auto passage=db_.query("SELECT * FROM web_source_passages WHERE id=?",{cite["passage_id"]});
+        if(passage.empty())failure("Unknown immutable passage_id; use IDs returned by web_read",index,Json::object());
+        if(cite.contains("source_id") && cite["source_id"]!=passage[0]["source_id"])failure("Passage belongs to a different source",index,cite);
+        cite["source_id"]=passage[0]["source_id"];text=passage[0]["text"];hash=passage[0]["content_hash"];
+        cite["basis"]="web_document";
+      } else if(cite.contains("event_id")) {
+        if(cite.contains("source_id"))failure("Choose one evidence reference",index,cite);
+        auto events=db_.query("SELECT type,payload_json FROM events WHERE id=?",{cite["event_id"]});
+        if(events.empty() || events[0]["type"]!="tool.completed")failure("Local evidence must be a completed file_read observation",index,cite);
+        auto payload=Json::parse(events[0]["payload_json"].get<std::string>());
+        auto result=payload.value("result",Json::object());
+        if(payload.value("tool","")!="file_read" || result.contains("error") || !result.value("content",Json()).is_string() || result.value("encoding","")!="utf-8")failure("Local documentation evidence requires file_read content, never a tool acknowledgement or execution claim",index,cite);
+        text=result["content"];hash=digest(text);cite["basis"]="local_document";
+      } else if(cite.contains("source_id")) {
+        auto source=db_.query("SELECT text,kind,content_hash FROM web_sources WHERE id=?",{cite["source_id"]});
+        if(source.empty() || source[0]["kind"]!="document")failure("Search snippets are discovery; cite a fetched document passage",index,cite);
+        text=source[0]["text"];hash=source[0]["content_hash"];cite["basis"]="web_document";
+      } else failure("Cite passage_id, or source_id/event_id with an exact quote",index,cite);
+      if(!cite.contains("passage_id") || cite.contains("quote")) {
+        auto quote=cite.value("quote","");
+        if(quote.empty() || quote.size()>4096 || text.find(quote)==std::string::npos)
+          failure("Citation quote is not present in the immutable snapshot. Reread the source and cite a returned passage_id; do not paraphrase a quotation.",index,cite);
+      }
+      cite["content_hash"]=hash;cite["citation_validated"]=true;++index;
+    }
+    if(evaluated && ((status=="supported" && (!supports || contradicts)) || (status=="contradicted" && (!contradicts || supports))))
+      failure("Citation relations conflict with the requested status; conflicting evidence remains unverified",0,Json::object());
+    if(!assessment.empty()) {assessment["assessed_by"]="agent";assessment["citation_validation"]="deterministic";assessment["semantic_validation"]="agent_assessed";}
+    if (status == "unverified" && citations.empty() && claim["required"] == 1 && settings()["enabled"].get<bool>()) {
       auto attempts=db_.query("SELECT id FROM research_attempts WHERE claim_id=? LIMIT 1",{id});
       if (attempts.empty())
         throw std::runtime_error(
             "Required research must be attempted before marking it unverified");
     }
     db_.exec("UPDATE research_questions SET "
-             "status=?,conclusion=?,sources_json=?,disclosed=0,updated_at=? WHERE id=?",
-             {status, conclusion, citations.dump(), now(), id});
-    db_.event("research.resolved", args, session, task);
-    return {{"id", id}, {"status", status}, {"sources", citations}};
+             "status=?,conclusion=?,sources_json=?,assessment_json=?,disclosed=0,updated_at=? WHERE id=?",
+             {status, conclusion, citations.dump(), assessment.dump(), now(), id});
+    auto recorded=args;recorded["sources"]=citations;recorded["assessment"]=assessment;
+    db_.event("research.resolved", recorded, session, task);
+    return {{"id", id}, {"claim_id",id},{"status", status}, {"sources", citations},{"assessment",assessment}};
   }
   if (name == "web_search") {
     network_control();
@@ -549,6 +642,14 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
   }
   if (name == "web_read" || name == "web_fetch") {
     Id id = args.value("source_id", Id(0));
+    if(args.contains("passage_id")) {
+      if(args.contains("url") || args.value("refresh",false) || args.value("offset",Id(0))!=0)throw std::runtime_error("Passage reads address one immutable cached block; URL/refresh/offset cannot replace it");
+      auto rows=db_.query("SELECT p.*,s.title,s.url FROM web_source_passages p JOIN web_sources s ON s.id=p.source_id WHERE p.id=?",{args["passage_id"]});
+      if(rows.empty())throw ResearchEvidenceError("Unknown immutable passage_id",{{"recovery_action",{{"tool","research_status"},{"arguments",Json::object()}}}});
+      if(id && rows[0]["source_id"]!=id)throw std::runtime_error("Passage belongs to a different source");
+      auto row=rows[0];row["content"]=row["text"];row.erase("text");row["selection_partial"]=Json::parse(row["selection_json"].get<std::string>()).value("partial",false);row.erase("selection_json");row["passage_id"]=row["id"];row.erase("id");row["kind"]="document";row["untrusted"]=true;row["complete"]=true;row["next_offset"]=Json();
+      return row;
+    }
     std::string url;
     if (id) {
       auto rows = db_.query("SELECT kind,url FROM web_sources WHERE id=?", {id});
@@ -614,12 +715,11 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
                "VALUES(?,?,?)",
                {id, web::document_json(document).dump(), diagnostics.dump()});
     });
-    auto result = source_excerpt(id, 0, args.value("limit", Id(12288)));
-    result["content"] = std::move(acquired.rendered);
+    auto result = source_excerpt(id, 0, args.value("limit", Id(12288)),request.focus_query,tokens);
     result["untrusted"] = true;
-    result["reduced"] = acquired.extraction.reduced;
-    result["complete"] = !acquired.extraction.reduced && !document.truncated &&
-                         !acquired.extraction.duplicate;
+    if(acquired.extraction.duplicate) {
+      result["content"]=std::move(acquired.rendered);result["passages"]=Json::array();result["next_offset"]=Json();result["complete"]=false;
+    }
     result["duplicate"] = acquired.extraction.duplicate;
     result["acquisition_path"] = document.source.acquisition_path;
     result["platform"] = web::platform_name(document.source.platform);

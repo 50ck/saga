@@ -20,18 +20,19 @@ public:
   ModelInfo discover() override{return {"research-regression",65536,true,true,false};}
   CapabilityReport probe() override{return {true,true,true,true};}
   void chat(const ChatRequest &request,StreamCallback callback) override {
-    Json state=Json::object(),last=Json::object();
+    Json state=Json::object(),last=Json::object();size_t attention_count=0;
     for(auto &message:request.messages){
       if(!message.value("content",Json()).is_string())continue;
       auto text=message["content"].get<std::string>();
       auto marker=std::string("Runtime attention update (data):\n");
-      if(message["role"]=="user" && text.starts_with(marker))state=Json::parse(text.substr(marker.size()));
+      if(message["role"]=="user" && text.starts_with(marker)) {state=Json::parse(text.substr(marker.size()));++attention_count;}
       if(message["role"]=="tool")last=Json::parse(text);
     }
+    CHECK(attention_count>=1);
     claims_=state.value("research_questions",Json::array());
     auto claim=[&](const std::string &word)->Id {for(auto &c:claims_)if(c["question"].get<std::string>().find(word)!=std::string::npos)return c["id"];throw std::runtime_error("Missing scenario claim");};
     callback({{"choices",Json::array({{{"index",0},{"delta",{{"reasoning_content","private activity"}}}}})}});
-    auto invoke=[&](const std::string &name,Json args){callback({{"choices",Json::array({{{"index",0},{"delta",{{"tool_calls",Json::array({{{"index",0},{"id","scenario-"+std::to_string(step_)},{"function",{{"name",name},{"arguments",args.dump()}}}}})}}},{"finish_reason","tool_calls"}}})}});};
+    auto invoke=[&](const std::string &name,Json args){if(name=="research_resolve") {for(auto &c:claims_)if(c["id"]==args["id"])args["assessment"]={{"proposition",c["question"]},{"coverage","full"},{"rationale","The fixture passage directly documents this behavior."}};for(auto &cite:args["sources"])cite["relation"]="supports";}callback({{"choices",Json::array({{{"index",0},{"delta",{{"tool_calls",Json::array({{{"index",0},{"id","scenario-"+std::to_string(step_)},{"function",{{"name",name},{"arguments",args.dump()}}}}})}}},{"finish_reason","tool_calls"}}})}});};
     switch(step_++) {
       case 0:invoke("task_create",{{"title","Terminal game"},{"objective","Implement modern Tetris"},{"risk","low"},{"checks",Json::array({"Game compiles"})}});break;
       case 1:invoke("project_open",{{"path",workspace_.string()},{"create",true}});break;
@@ -97,7 +98,7 @@ void failure_is_not_verification() {
   research.account_for_pending(session,0,{});CHECK(research.questions(session,0)[0]["status"]=="pending");
   auto source=research.dispatch("web_read",{{"url","https://rules.example.com/rotation"},{"question_id",claim}},session,0);
   CHECK(p.db->query("SELECT engine FROM web_sources WHERE id=?",{source["source_id"]})[0]["engine"]=="web_acquisition");
-  research.dispatch("research_resolve",{{"id",claim},{"status","supported"},{"conclusion","Clockwise rotation is documented."},{"sources",Json::array({{{"source_id",source["source_id"]},{"quote","Rotation is clockwise."}}})}},session,0);
+  research.dispatch("research_resolve",{{"id",claim},{"status","supported"},{"assessment",{{"proposition","Rotation direction?"},{"coverage","full"},{"rationale","The fetched fixture directly specifies the direction."}}},{"conclusion","Clockwise rotation is documented."},{"sources",Json::array({{{"source_id",source["source_id"]},{"quote","Rotation is clockwise."},{"relation","supports"}}})}},session,0);
   CHECK(research.unresolved_required(session,0).empty());CHECK(p.db->query("SELECT id FROM research_attempts WHERE succeeded=0").size()==1);
   auto user=p.db->event("user.message",{{"content","Implement a program with C in /tmp/widget; inspect modern rules."}},session);
   rejects([&]{research.question("Implement a program with C in /tmp/widget; inspect modern rules.",true,session,0);});
@@ -197,7 +198,8 @@ void plan_defaults() {
   CHECK(research.plan_pending(session,0));CHECK(p.db->query("SELECT id FROM research_questions").size()==before);
   args["goals"][0]["claims"]=Json::array();
   for(int i=0;i<32;++i)args["goals"][0]["claims"].push_back("Rule "+std::to_string(i)+" "+std::string(450,'r'));
-  auto result=research.plan(args,session,0);CHECK(result["goals"][0]["claims"].size()==32 && result.dump().size()<16000);
+  auto result=research.plan(args,session,0);CHECK(result["goals"][0]["claims"].size()==32 && result.dump().size()<32000);
+  CHECK(result["goals"][0]["claims"][0]["proposition"]==args["goals"][0]["claims"][0]);
   CHECK(result["goals"][0]["required"]==1);CHECK(research.plan(args,session,0)["reused"]==true);
   auto stored=Json::parse(p.db->query("SELECT decomposition_json FROM research_plans WHERE id=?",{result["plan_id"]})[0]["decomposition_json"].get<std::string>());
   CHECK(stored["goals"][0]["claims"][0].get<std::string>().size()>450);
