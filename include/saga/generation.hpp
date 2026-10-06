@@ -46,7 +46,7 @@ struct GenerationState {
 };
 // A logical operator turn owns its model segments and tool executions.
 struct TurnState {
-  std::string id;
+  std::string id,user_message_id;
   TurnStatus status=TurnStatus::Active;
   TurnPhase phase=TurnPhase::Waiting;
   std::uint64_t sequence=0,input_tokens=0,output_tokens=0;

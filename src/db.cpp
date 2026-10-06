@@ -1,5 +1,6 @@
 #include <saga/db.hpp>
 #include <sqlite3.h>
+#include <tuple>
 #include <schema.hpp>
 #include <sys/stat.h>
 
@@ -66,7 +67,7 @@ void Database::transaction(const std::function<void()>& operation) {
 void Database::migrate() {
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  if (version > 8) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if (version > 9) throw std::runtime_error("Database schema is newer than this Saga binary");
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -127,6 +128,14 @@ void Database::migrate() {
     sql("UPDATE schema_version SET version=8");
   });
 
+  if(version<9)transaction([&]{
+    for(auto [table,name,type]:{std::tuple{"turns","user_message_id","TEXT"},std::tuple{"turns","user_content_hash","TEXT"},std::tuple{"turns","user_source_event_id","INTEGER REFERENCES events(id)"},std::tuple{"tool_runs","result_json","TEXT CHECK(result_json IS NULL OR json_valid(result_json))"}}) {
+      auto columns=query(std::string("PRAGMA table_info(")+table+")");bool exists=false;
+      for(auto& column:columns)if(column["name"]==name)exists=true;
+      if(!exists)sql(std::string("ALTER TABLE ")+table+" ADD COLUMN "+name+" "+type);
+    }
+    sql("CREATE UNIQUE INDEX IF NOT EXISTS turns_user_message ON turns(session_id,user_message_id) WHERE user_message_id IS NOT NULL; CREATE TABLE IF NOT EXISTS tool_dispatch_keys(turn_id TEXT NOT NULL REFERENCES turns(id),tool_call_id TEXT NOT NULL,run_id INTEGER NOT NULL REFERENCES tool_runs(id),PRIMARY KEY(turn_id,tool_call_id)); UPDATE schema_version SET version=9;");
+  });
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {
   return exec("INSERT INTO events(ts,session_id,task_id,type,payload_json) VALUES(?,?,?,?,?)",

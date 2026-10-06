@@ -37,7 +37,7 @@ struct Client {
   Json request(std::string type,Json payload = Json::object(),Emit callback = {}) {
     std::unique_lock receive_lock(receive_mutex);
     std::string streamed;
-    auto id = uuid(); send({{"type",std::move(type)},{"request_id",id},{"payload",std::move(payload)}});
+    auto id = uuid(); if(type=="chat" && !payload.contains("user_message_id"))payload["user_message_id"]=id; send({{"type",std::move(type)},{"request_id",id},{"payload",std::move(payload)}});
     auto started = std::chrono::steady_clock::now(),last_wait_notice = started;
     while (true) {
       auto frame = channel->receive(callback ? 1000 : -1);

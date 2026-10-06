@@ -64,7 +64,7 @@ void storage() {
   web.settings(false);auto cached=web.dispatch("web_read",{{"source_id",id}},session,0);CHECK(cached["source_id"]==id);CHECK(network==2);rejects([&]{web.dispatch("web_search",{{"query","rules"}},session,0);});CHECK(network==2);
   web.settings(true);web.service([&]{web.settings(false);});rejects([&]{web.dispatch("web_read",{{"url","https://example.com/new"}},session,0);});CHECK(network==2);
   PersonaContext other(paths,registry.create("Other synthetic persona",""),root/"project");CHECK(other.db->query("SELECT id FROM web_sources").empty());
-  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==8);
+  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==9);
 }
 void proof_and_failure_gates() {
   auto root=fs::temp_directory_path()/("saga-web-proof-"+uuid());

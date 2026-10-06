@@ -135,7 +135,7 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
           runtime->service(service);
           runtime->start(emit); emit("result",{{"active",true}});
         }
-        else if (type == "chat") { if (!runtime) throw std::runtime_error("Select a persona first"); runtime->chat(payload.at("content"),emit); emit("result",{{"ok",true}}); }
+        else if (type == "chat") { if (!runtime) throw std::runtime_error("Select a persona first"); runtime->chat(payload.at("content"),emit,payload.value("user_message_id",id)); emit("result",{{"ok",true}}); }
         else if (type == "command") {
           if (!runtime) throw std::runtime_error("Select a persona first");
           auto name = payload.at("name").get<std::string>(); auto args = payload.value("arguments",Json::object());

@@ -23,6 +23,7 @@ class Tools {
   std::function<void()> service_;
   Emit output_;
   Emit events_;
+  unsigned execution_depth_=0;
   fs::path safe_path(const std::string& path, bool write) const;
   Json dispatch(const std::string& name, const Json& args);
 public:

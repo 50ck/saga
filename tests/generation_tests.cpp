@@ -115,6 +115,21 @@ void runtime_tests() {
   run_scenario({limited(true),answer()},0,1);
   run_scenario({{{},true},answer()},0,0,1);
   run_scenario({tool("write","file_write",{{"path","written.txt"},{"content","once\n"},{"description","Synthetic once-only write"}}),{{{ProviderEventKind::Reasoning,"preserved after reset"}},true},answer()},1,0,1);
+  {Fixture f;
+    auto next=f.root/"workspace";
+    auto create=tool("new-task","task_create",{{"title","Workspace fixture"},{"objective","Create the requested program"},{"risk","low"},{"checks",Json::array({"Observed result"})}});
+    auto open=tool("workspace","project_open",{{"path",next.string()},{"create",true}});
+    auto backend=std::make_unique<ScriptBackend>(std::vector<Segment>{create,open,open,create,answer(),answer()});auto* script=backend.get();auto r=f.runtime(std::move(backend));
+    auto input="Create a program in "+next.string();r->chat(input,f.emit(),"operator-message");
+    auto requests=script->requests.size();r->chat(input,f.emit(),"operator-message");CHECK(script->requests.size()==requests);
+    auto& db=*r->persona().db;
+    CHECK(db.query("SELECT count(*) AS n FROM turns")[0]["n"]==1 && db.query("SELECT count(*) AS n FROM messages WHERE role='user'")[0]["n"]==1);
+    CHECK(db.query("SELECT count(*) AS n FROM tasks")[0]["n"]==1);
+    CHECK(db.query("SELECT count(*) AS n FROM events WHERE type='workspace.changed'")[0]["n"]==1);
+    CHECK(db.query("SELECT count(*) AS n FROM tool_runs WHERE tool_call_id='workspace'")[0]["n"]==1);
+    CHECK(r->persona().project_root==next);
+    rejects([&]{r->chat("different",f.emit(),"operator-message");});
+  }
   {Fixture f;f.config.default_max_output_tokens=16;f.config.hard_max_output_tokens=32;auto first=limited();first.events[1].data["output_tokens"]=16ULL;auto backend=std::make_unique<ScriptBackend>(std::vector<Segment>{first,answer()});auto* script=backend.get();auto r=f.runtime(std::move(backend));r->chat("hello",f.emit());CHECK(script->requests[0].max_tokens==16 && script->requests[1].max_tokens==32);}
   {Fixture f;auto r=f.runtime(std::make_unique<ScriptBackend>(std::vector<Segment>{limited()}));bool stopped=false;r->service([&]{if(!stopped && !r->persona().db->query("SELECT id FROM events WHERE type='reasoning.started'").empty()){stopped=true;r->command("stop");}});r->chat("hello",f.emit());CHECK(r->persona().db->query("SELECT status FROM turns")[0]["status"]=="cancelled");CHECK(r->persona().db->query("SELECT status FROM generations")[0]["status"]=="cancelled");auto cancelled=r->persona().db->query("SELECT payload_json FROM events WHERE type='turn.cancelled'");CHECK(cancelled.size()==1 && Json::parse(cancelled[0]["payload_json"].get<std::string>()).contains("turn_id"));}
   {Fixture f;auto r=f.runtime(std::make_unique<ScriptBackend>(std::vector<Segment>{answer()}));auto& db=*r->persona().db;

@@ -52,7 +52,7 @@ public:
   Runtime(std::unique_ptr<PersonaContext> persona,Config config,std::unique_ptr<ModelBackend> backend,Approve approve,WebTransport transport = fetch_public_web);
   ~Runtime();
   void start(Emit emit = {});
-  void chat(std::string input,Emit emit);
+  void chat(std::string input,Emit emit,std::string user_message_id = {});
   Json command(std::string name,const Json& args = Json::object(),Emit emit = {});
   void close(std::string reason,Emit emit = {});
   void tick(Emit emit = {},bool use_model = true);

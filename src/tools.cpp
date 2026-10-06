@@ -341,9 +341,23 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   auto it = std::find_if(definitions_list.begin(),definitions_list.end(),[&](auto& d){ return d["function"]["name"] == name; });
   if (it == definitions_list.end()) return {{"error","Unknown tool"}};
   try { validate(args,(*it)["function"]["parameters"]); } catch (const std::exception& e) { return {{"error",e.what()}}; }
+  bool identified=execution_depth_==0 && !p_.turn.empty() && !p_.tool_call.empty();
+  if(identified) {
+    auto previous=p_.db->query("SELECT tool_runs.* FROM tool_runs JOIN tool_dispatch_keys ON tool_dispatch_keys.run_id=tool_runs.id WHERE tool_dispatch_keys.turn_id=? AND tool_dispatch_keys.tool_call_id=?",{p_.turn,p_.tool_call});
+    if(!previous.empty()) {
+      auto& row=previous[0];
+      if(row["tool"]!=name || row["arguments_json"]!=args.dump())return {{"error","Tool call ID reused for a different action"},{"error_type","ToolCallConflict"}};
+      if(row["result_json"].is_null())return {{"error","Previous execution has no durable result; inspect its state before any new action"},{"error_type","ToolExecutionUncertain"}};
+      if(emit)emit("tool.replayed",{{"run_id",row["id"]},{"tool",name},{"cached",true}});
+      return Json::parse(row["result_json"].get<std::string>());
+    }
+  }
+  ++execution_depth_;
+  struct Depth {unsigned& value;~Depth(){--value;}} depth{execution_depth_};
   Id started = now();
   Id run = p_.db->exec("INSERT INTO tool_runs(session_id,task_id,tool,arguments_json,started_at,status) VALUES(?,?,?,?,?,'running')",{p_.session,p_.task ? Json(p_.task) : Json(),name,args.dump(),started});
-  p_.db->exec("UPDATE tool_runs SET turn_id=?,generation_id=?,tool_call_id=? WHERE id=?",{p_.turn.empty()?Json():Json(p_.turn),p_.generation?Json(p_.generation):Json(),p_.tool_call.empty()?Json():Json(p_.tool_call),run});
+  p_.db->exec("UPDATE tool_runs SET turn_id=?,generation_id=?,tool_call_id=? WHERE id=?",{p_.turn.empty()?Json():Json(p_.turn),p_.generation?Json(p_.generation):Json(),identified?Json(p_.tool_call):Json(),run});
+  if(identified)p_.db->exec("INSERT INTO tool_dispatch_keys(turn_id,tool_call_id,run_id) VALUES(?,?,?)",{p_.turn,p_.tool_call,run});
   p_.db->event("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}},p_.session,p_.task);
   if (emit && name!="report_progress") emit("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}});
   auto previous_output=std::move(output_);
@@ -370,6 +384,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
     {now()-started,failed ? "failed" : "completed",result.value("exit_code",Json()),result.value("stdout_size",result.value("stdout",std::string()).size()),result.value("stderr_size",result.value("stderr",std::string()).size()),failed ? Json(result.value("error",std::string("nonzero_exit"))) : Json(),digest(result.dump()),run});
   Id ev = p_.db->event(type,{{"run_id",run},{"tool",name},{"result",result}},p_.session,p_.task);
   result["source_event_id"] = ev;
+  p_.db->exec("UPDATE tool_runs SET result_json=? WHERE id=?",{result.dump(),run});
   if (p_.task && name!="report_progress" && !name.starts_with("web_") && !name.starts_with("research_")) memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
   if (emit && name!="report_progress") emit(type,{{"run_id",run},{"tool",name},{"result",result}});
   return result;
@@ -475,6 +490,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
       if(fs::exists(path) && !fs::is_directory(path))throw std::runtime_error("Workspace must be a directory");
     };
     validate_workspace();
+    if(path==p_.project_root)return {{"path",path.string()},{"project_id",p_.project},{"task_id",p_.task},{"reused",true}};
     bool requested=within(path,p_.project_root);
     for(auto& row:db->query("SELECT payload_json FROM events WHERE session_id=? AND type='user.message' ORDER BY id DESC LIMIT 20",{p_.session})) {
       auto data=Json::parse(row["payload_json"].get<std::string>());
@@ -562,6 +578,10 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     return result;
   }
   if (name == "task_create") {
+    if(!p_.turn.empty() && p_.task && !db->query("SELECT id FROM tool_runs WHERE turn_id=? AND tool='task_create' AND status='completed' LIMIT 1",{p_.turn}).empty()) {
+      for(auto& check:a["checks"])if(db->query("SELECT id FROM task_checks WHERE task_id=? AND description=?",{p_.task,check}).empty())db->exec("INSERT INTO task_checks(task_id,description) VALUES(?,?)",{p_.task,check});
+      return {{"id",p_.task},{"reused",true},{"checks",db->query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})}};
+    }
     if (a["checks"].empty()) throw std::runtime_error("A task requires at least one proof obligation");
     p_.task = db->exec("INSERT INTO tasks(session_id,project_id,title,objective,status,risk,domain,created_at) VALUES(?,?,?,?,'active',?,?,?)",{p_.session,p_.project,a["title"],a["objective"],a["risk"],a.value("domain","general"),now()});
     for (auto& check : a["checks"]) db->exec("INSERT INTO task_checks(task_id,description) VALUES(?,?)",{p_.task,check});
