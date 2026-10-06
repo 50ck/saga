@@ -171,7 +171,9 @@ void ChatView::event(const std::string& type,const Json& p) {
         if(!query.empty()) {
           auto first=it->text.find('\n'),elapsed=it->text.rfind("  ");
           auto suffix=elapsed==std::string::npos ? std::string() : it->text.substr(elapsed);
-          it->text=it->text.substr(0,first)+"\n"+query+suffix;
+          auto engine=result.value("engine","");
+          auto title=engine.empty() ? it->text.substr(0,first) : "Search completed through "+(engine=="duckduckgo" ? std::string("DuckDuckGo") : engine)+".";
+          it->text=title+"\n"+query+suffix;
         }
         break;
       }

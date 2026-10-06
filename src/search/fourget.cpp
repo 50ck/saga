@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <set>
 #include <cmath>
+#include <limits>
 
 namespace saga {
 bool FourGetInstance::eligible(const SearchContext &context) const {
@@ -26,7 +27,8 @@ struct FourGetSearchEngine::State {
   mutable std::mutex mutex;
   std::map<std::string,FourGetInstance> instances;
   Id directory_updated = 0;
-  SearchTime directory_retry{};
+  SearchTime directory_retry{}, directory_refresh{}, directory_stale{};
+  bool clock_bound = false;
   std::string preferred;
   State(Config c,WebTransport t,Database *d) : config(std::move(c)),transport(std::move(t)),db(d) {
     for(auto &origin:config.fourget_manual_instances)add(origin,true);
@@ -46,7 +48,7 @@ struct FourGetSearchEngine::State {
           instance.bot_protection=value.at("bot_protection");instance.version=value.at("version");
           instance.latency_ms=value.at("latency_ms");instance.failures=value.at("failures");instance.successes=value.at("successes");
           instance.last_probe=value.at("last_probe");instance.last_success=value.at("last_success");instance.cooldown_until=value.at("cooldown_until");
-          if(instance.cooldown_until>now())instance.retry_after=std::chrono::steady_clock::now()+SearchDuration(std::min<Id>(instance.cooldown_until-now(),3600000));
+
         }catch(const std::exception &){} // Obsolete cache records never authorize a host.
       }
     }
@@ -61,9 +63,22 @@ struct FourGetSearchEngine::State {
   void save(FourGetInstance &instance) {
     if(db)db->exec("INSERT INTO search_instance_cache(origin,state_json,updated_at) VALUES(?,?,?) ON CONFLICT(origin) DO UPDATE SET state_json=excluded.state_json,updated_at=excluded.updated_at",{instance.origin,instance.json().dump(),now()});
   }
+  void bind_clock(const SearchContext &context) {
+    if(clock_bound)return;
+    auto time=context.clock.time();auto wall=now();
+    auto remaining=[&](Id expiry,Id maximum){return SearchDuration(std::clamp<Id>(expiry-wall,0,maximum));};
+    auto directory_ttl=Id(config.fourget_directory_ttl_seconds)*1000;
+    directory_refresh=time+remaining(directory_updated+directory_ttl,directory_ttl);
+    directory_stale=time+remaining(directory_updated+4*directory_ttl,4*directory_ttl);
+    for(auto &[origin,instance]:instances) {
+      instance.retry_after=time+remaining(instance.cooldown_until,3600000);
+      instance.probe_after=time+remaining(instance.last_probe+Id(config.fourget_probe_ttl_seconds)*1000,Id(config.fourget_probe_ttl_seconds)*1000);
+    }
+    clock_bound=true;
+  }
   void refresh(const SearchContext &context) {
-    if(directory_updated && now()-directory_updated<Id(config.fourget_directory_ttl_seconds)*1000)return;
-    if(directory_updated && now()-directory_updated>Id(config.fourget_directory_ttl_seconds)*4000) {
+    if(directory_updated && context.clock.time()<directory_refresh)return;
+    if(directory_updated && context.clock.time()>=directory_stale) {
       std::erase_if(instances,[](auto &entry){return !entry.second.manual;});directory_updated=0;
     }
     if(context.clock.time()<directory_retry)return;
@@ -72,7 +87,7 @@ struct FourGetSearchEngine::State {
       auto seeds=FourGetSearchEngine::directory(response);
       if(seeds.empty())throw SearchError(SearchErrorCode::InvalidResponse,"4get directory contains no eligible origins");
       for(auto &origin:seeds)add(origin,false);
-      directory_updated=now();
+      directory_updated=now();directory_refresh=context.clock.time()+std::chrono::seconds(config.fourget_directory_ttl_seconds);directory_stale=context.clock.time()+std::chrono::seconds(Id(config.fourget_directory_ttl_seconds)*4);
       if(db)db->exec("INSERT INTO search_directory_cache(directory,origins_json,updated_at) VALUES('4get.ca',?,?) ON CONFLICT(directory) DO UPDATE SET origins_json=excluded.origins_json,updated_at=excluded.updated_at",{Json(seeds).dump(),directory_updated});
     }catch(const TurnCancelled &){throw;}
      catch(const SearchError &error){
@@ -134,25 +149,28 @@ FourGetInstance FourGetSearchEngine::probe(const WebResponse &response,const std
   if(!server.contains("api_enabled") || !server["api_enabled"].is_boolean() || !server.contains("bot_protection") || !server["bot_protection"].is_number_integer() || !server.contains("version") || !server["version"].is_number_integer())
     throw SearchError(SearchErrorCode::InvalidResponse,"4get probe lacks required capabilities");
   FourGetInstance instance;instance.origin=origin;instance.checked=true;
-  instance.api_enabled=server["api_enabled"];instance.bot_protection=server["bot_protection"];instance.version=server["version"];
-  if(instance.version<1 || instance.version>1000000)throw SearchError(SearchErrorCode::InvalidResponse,"4get probe has an unsupported version");
-  instance.last_probe=now();return instance;
+  auto protection=server["bot_protection"].get<Id>(), version=server["version"].get<Id>();
+  if(protection<0 || protection>std::numeric_limits<int>::max())throw SearchError(SearchErrorCode::InvalidResponse,"4get probe has an invalid protection mode");
+  instance.api_enabled=server["api_enabled"];instance.bot_protection=static_cast<int>(protection);
+  if(version<1 || version>1000000)throw SearchError(SearchErrorCode::InvalidResponse,"4get probe has an unsupported version");
+  instance.version=static_cast<int>(version);instance.last_probe=now();return instance;
 }
 Json FourGetSearchEngine::parse(const WebResponse &response,const SearchRequest &request,const std::string &origin) {
   auto value=search_detail::payload(response);
   if(!value.contains("web") || !value["web"].is_array())throw SearchError(SearchErrorCode::InvalidResponse,"4get search response lacks web results");
-  Json hits=Json::array();std::set<std::string> seen;size_t inspected=0;
+  Json hits=Json::array();std::set<std::string> seen;size_t inspected=0;bool valid_target=false;
   for(auto &hit:value["web"]) {
     if(++inspected>1000)break;
     if(!hit.is_object() || !hit.contains("url") || !hit["url"].is_string())continue;
     try {
-      auto url=web_url(hit["url"].get<std::string>());
+      auto url=web_url(hit["url"].get<std::string>());valid_target=true;
       if(!search_detail::allowed(url,request) || !seen.insert(url).second)continue;
-      auto field=[&](const char *name,size_t bytes){return hit.contains(name) && hit[name].is_string() ? utf8_excerpt(utf8_text(hit[name].get<std::string>()),bytes) : std::string();};
+      auto field=[&](const char *name,size_t bytes){return hit.contains(name) && hit[name].is_string() ? utf8_excerpt(web::sanitize_text(hit[name].get<std::string>()),bytes) : std::string();};
       hits.push_back({{"title",field("title",512)},{"url",url},{"snippet",field("description",2048)},{"rank",hits.size()+1}});
       if(hits.size()>=static_cast<size_t>(request.limit))break;
     }catch(const std::exception &){} // Malformed target links cannot become fetch destinations.
   }
+  if(!value["web"].empty() && !valid_target)throw SearchError(SearchErrorCode::InvalidResponse,"4get results contain no valid target URLs");
   Json result={{"engine","fourget"},{"query",request.query},{"submitted_query",search_detail::query(request)},{"results",hits},{"empty",hits.empty()}};
   if(value.contains("npt") && !value["npt"].is_null()) {
     if(!value["npt"].is_string() || value["npt"].get_ref<const std::string &>().size()>4096)
@@ -165,11 +183,11 @@ Json FourGetSearchEngine::health() const {
   std::lock_guard guard(state_->mutex);Json result=Json::array();for(auto &[origin,instance]:state_->instances)result.push_back(instance.json());return result;
 }
 Json FourGetSearchEngine::run(const SearchRequest &request,const SearchContext &context) {
-  search_detail::validate(request);context.check();auto guard=search_detail::lock(state_->mutex,context);
+  search_detail::validate(request);context.check();auto guard=search_detail::lock(state_->mutex,context);state_->bind_clock(context);
   std::string affinity,token;
   if(!request.cursor.empty()) {
     Json cursor;
-    try{cursor=Json::parse(request.cursor);}catch(const Json::exception &){throw SearchError(SearchErrorCode::PaginationUnavailable,"Invalid 4get cursor; restart the search");}
+    try{cursor=search_detail::cursor(request.cursor);}catch(const Json::exception &){throw SearchError(SearchErrorCode::PaginationUnavailable,"Invalid 4get cursor; restart the search");}
     if(cursor.value("engine","")!="fourget" || cursor.value("query","")!=request.query || cursor.value("include_domains",Json())!=Json(request.include_domains) || cursor.value("exclude_domains",Json())!=Json(request.exclude_domains) || cursor.value("expires_at",Id(0))<now() || !cursor.contains("npt") || !cursor["npt"].is_string())
       throw SearchError(SearchErrorCode::PaginationUnavailable,"4get cursor expired or belongs to another query; restart the search");
     affinity=cursor.value("instance","");token=cursor["npt"];if(token.empty() || token.size()>4096)throw SearchError(SearchErrorCode::PaginationUnavailable,"Invalid 4get cursor; restart the search");
@@ -179,7 +197,7 @@ Json FourGetSearchEngine::run(const SearchRequest &request,const SearchContext &
   for(auto &[origin,instance]:state_->instances) {
     if(!affinity.empty() && origin!=affinity)continue;
     // Ineligible capabilities are reconsidered only after their probe TTL and cooldown.
-    if(instance.checked && now()-instance.last_probe>=Id(state_->config.fourget_probe_ttl_seconds)*1000 && context.clock.time()>=instance.retry_after)instance.checked=false;
+    if(instance.checked && context.clock.time()>=instance.probe_after && context.clock.time()>=instance.retry_after)instance.checked=false;
     if(instance.eligible(context))candidates.push_back(&instance);
   }
   std::stable_sort(candidates.begin(),candidates.end(),[&](auto *a,auto *b){
@@ -194,6 +212,7 @@ Json FourGetSearchEngine::run(const SearchRequest &request,const SearchContext &
       if(!instance->checked) {
         auto response=search_detail::fetch(state_->transport,instance->origin+"/ami4get","",context,state_->config.fourget_probe_timeout_seconds,private_allowed);
         auto checked=probe(response,instance->origin);checked.manual=instance->manual;checked.failures=instance->failures;checked.successes=instance->successes;
+        checked.probe_after=context.clock.time()+std::chrono::seconds(state_->config.fourget_probe_ttl_seconds);
         checked.latency_ms=std::chrono::duration_cast<SearchDuration>(context.clock.time()-start).count();*instance=checked;state_->save(*instance);
         if(!instance->api_enabled)throw SearchError(SearchErrorCode::ApiDisabled,"4get instance has disabled its API");
         if(instance->bot_protection!=0)throw SearchError(SearchErrorCode::BotChallenge,"4get instance has bot protection; Saga will not bypass it");

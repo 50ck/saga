@@ -52,7 +52,7 @@ struct FourGetInstance {
   double latency_ms = 0;
   unsigned failures = 0, successes = 0;
   Id last_probe = 0, last_success = 0, cooldown_until = 0;
-  SearchTime retry_after{};
+  SearchTime retry_after{}, probe_after{};
   bool eligible(const SearchContext &) const;
   double score(bool preferred) const;
   Json json() const;
@@ -99,6 +99,7 @@ std::string query(const SearchRequest &);
 WebResponse fetch(const WebTransport &, const std::string &, const std::string &,
                   const SearchContext &, int timeout, bool allow_private = false);
 Json payload(const WebResponse &);
+Json cursor(std::string_view);
 std::unique_lock<std::mutex> lock(std::mutex &, const SearchContext &);
 }
 } // namespace saga

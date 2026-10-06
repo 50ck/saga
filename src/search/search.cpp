@@ -36,7 +36,11 @@ void SearchContext::event(const std::string &type, Json data) const {
 SearchRateLimiter::SearchRateLimiter(SearchDuration interval, SearchDuration backoff)
     : interval_(std::max(interval, SearchDuration(1000))), backoff_(backoff) {}
 void SearchRateLimiter::configure(SearchDuration interval, SearchDuration backoff) {
-  std::lock_guard guard(mutex_);interval_=std::max(interval_,interval);backoff_=std::max(backoff_,backoff);
+  std::lock_guard guard(mutex_);
+  auto spacing=std::max(interval_,interval), penalty=std::max(backoff_,backoff);
+  if(next_!=SearchTime{})next_+=spacing-interval_;
+  if(cooldown_!=SearchTime{})cooldown_+=penalty-backoff_;
+  interval_=spacing;backoff_=penalty;
 }
 void SearchRateLimiter::wait(const SearchContext &context) {
   bool queued=false;
@@ -65,6 +69,7 @@ WebResponse SearchRateLimiter::perform(const SearchContext &context,const std::f
 Json SearchEngine::search(const SearchRequest &request, const std::function<void()> &service) {
   // Explicit calls of the public synchronous convenience API are operator actions.
   SearchContext context;context.human_initiated=true;context.service=service;
+  context.deadline=context.clock.time()+std::chrono::seconds(Config{}.search_total_timeout_seconds);
   return run(request,context);
 }
 namespace search_detail {
@@ -128,12 +133,20 @@ WebResponse fetch(const WebTransport &transport, const std::string &url,const st
     throw SearchError(code,"Search transport failed ("+search_error_name(code)+")");
   }
 }
+Json cursor(std::string_view text) {
+  if(text.size()>16384)throw SearchError(SearchErrorCode::PaginationUnavailable,"Search cursor exceeds size limit; restart the search");
+  try {
+    auto result=Json::parse(text,[](int depth,Json::parse_event_t,Json &){if(depth>16)throw SearchError(SearchErrorCode::PaginationUnavailable,"Search cursor nesting exceeds limit");return true;});
+    if(!result.is_object())throw SearchError(SearchErrorCode::PaginationUnavailable,"Search cursor must be an object; restart the search");
+    return result;
+  }catch(const Json::exception &){throw SearchError(SearchErrorCode::PaginationUnavailable,"Invalid search cursor; restart the search");}
+}
 Json payload(const WebResponse &response) {
   if(response.status==429)throw SearchError(SearchErrorCode::RateLimited,"4get rate limited the request");
   if(response.status==401 || response.status==403)throw SearchError(SearchErrorCode::BotChallenge,"4get rejected the request; protected instances are not bypassed");
   if(response.status!=200)throw SearchError(SearchErrorCode::HttpFailure,"4get HTTP status "+std::to_string(response.status));
   Json value;
-  try{value=Json::parse(response.body);}catch(const Json::exception &){throw SearchError(SearchErrorCode::ParseError,"4get returned malformed JSON");}
+  try{value=Json::parse(response.body,[](int depth,Json::parse_event_t,Json &){if(depth>64)throw SearchError(SearchErrorCode::InvalidResponse,"4get JSON nesting exceeds limit");return true;});}catch(const Json::exception &){throw SearchError(SearchErrorCode::ParseError,"4get returned malformed JSON");}
   if(!value.is_object() || !value.contains("status") || !value["status"].is_string())throw SearchError(SearchErrorCode::InvalidResponse,"4get response lacks its status field");
   if(value["status"]!="ok") {
     auto status=lower(value["status"].get<std::string>());
@@ -190,7 +203,7 @@ Json SearchOrchestrator::search(const SearchRequest &request,SearchContext conte
   auto guard=search_detail::lock(mutex_,context);
   auto candidates=order_;
   if(!request.cursor.empty()) {
-    auto cursor=Json::parse(request.cursor);
+    auto cursor=search_detail::cursor(request.cursor);
     candidates={cursor.value("engine",std::string("duckduckgo"))};
   }
   context.event("search.requested");Json failures=Json::array();std::set<std::string> attempted;

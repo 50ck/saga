@@ -272,7 +272,7 @@ Json Memory::checkpoint(std::string reason,Id through,const Json& working) {
     {"last_user_request",objective.empty() ? Json("") : Json::parse(objective[0]["content_json"].get<std::string>())["content"]},
     {"task",task},{"checks",db.query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})},
     {"assumptions",db.query("SELECT * FROM assumptions WHERE task_id=? AND status='unresolved'",{p_.task})},
-    {"research",research_context(db,p_.session,p_.task)},
+    {"research",research_context(db,p_.session,p_.task)},{"research_plans",research_plan_context(db,p_.session,p_.task)},
     {"hypotheses",db.query("SELECT * FROM hypotheses WHERE task_id=? AND status='unresolved'",{p_.task})},
     {"decisions",project_context()["decisions"]},{"recent_dialogue",excerpts},{"working",working},
     {"tool_observations",db.query("SELECT id AS source_event_id,type,json_extract(payload_json,'$.tool') AS tool FROM events WHERE session_id=? AND type IN ('tool.completed','tool.failed') ORDER BY id DESC LIMIT 8",{p_.session})},

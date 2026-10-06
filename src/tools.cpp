@@ -225,9 +225,11 @@ Json Tools::definitions() {
   add("recall_observation","Retrieve an archived observation by its provenance event ID; offset and limit page the original JSON text",{{"event_id",integer()},{"offset",integer()},{"limit",integer()}},{"event_id"});
   auto strings=Json{{"type","array"},{"items",str()}};
   auto citations=Json{{"type","array"},{"items",{{"type","object"},{"properties",{{"source_id",integer()},{"quote",str()}}},{"required",{"source_id","quote"}},{"additionalProperties",false}}}};
-  add("web_search","Search the selected public web engine using its advanced syntax. Snippets are discovery only; use web_read for evidence. Domain constraints are enforced locally. No host shell approval is needed. Respect /web and bounded research budgets.",{{"query",str()},{"limit",integer()},{"cursor",str()},{"include_domains",strings},{"exclude_domains",strings}},{"query"});
-  add("web_read","Acquire a public document through deterministic extraction, platform APIs and local section retrieval. URL or source_id is required. Supply query to focus on the current knowledge gap. HTML/API payloads never enter cognition. Stored snapshots remain available; refresh creates a new snapshot. offset/limit support older excerpts.",{{"url",str()},{"source_id",integer()},{"query",str()},{"max_output_tokens",integer()},{"offset",integer()},{"limit",integer()},{"refresh",boolean()}},{});
-  add("web_fetch","Fetch a public document as compact, sanitized, untrusted source sections. Use query for local BM25F retrieval; max_output_tokens bounds output. Platform acquisition and cleanup are automatic. No browser, JavaScript execution or model summarization is used.",{{"url",str()},{"query",str()},{"max_output_tokens",integer()}},{"url"});
+  add("web_search","Search public web sources with automatic backend routing, caching and bounded failover. Snippets are discovery only; use web_read for evidence. Domain constraints are enforced locally. No host shell approval is needed. Respect /web and bounded research budgets.",{{"query",str()},{"limit",integer()},{"cursor",str()},{"include_domains",strings},{"exclude_domains",strings},{"question_id",integer()}},{"query"});
+  add("web_read","Acquire a public document through deterministic extraction, platform APIs and local section retrieval. URL or source_id is required. Supply query to focus on the current knowledge gap. HTML/API payloads never enter cognition. Stored snapshots remain available; refresh creates a new snapshot. offset/limit support older excerpts.",{{"url",str()},{"source_id",integer()},{"query",str()},{"max_output_tokens",integer()},{"offset",integer()},{"limit",integer()},{"refresh",boolean()},{"question_id",integer()}},{});
+  add("web_fetch","Fetch a public document as compact, sanitized, untrusted source sections. Use query for local BM25F retrieval; max_output_tokens bounds output. Platform acquisition and cleanup are automatic. No browser, JavaScript execution or model summarization is used.",{{"url",str()},{"query",str()},{"max_output_tokens",integer()},{"question_id",integer()}},{"url"});
+  auto research_goals=Json{{"type","array"},{"items",{{"type","object"},{"properties",{{"question",str()},{"required",boolean()},{"claims",strings}}},{"required",{"question","claims"}},{"additionalProperties",false}}}};
+  add("research_plan","Decompose this operator request into intent, operator constraints, desired actions and focused external research goals/claims. Instructions and paths are not claims. Explicit research needs at least one required external goal. Returned claim IDs are used by question_id on web tools and research_resolve.",{{"intent",str()},{"operator_constraints",strings},{"desired_actions",strings},{"goals",research_goals}},{"intent","operator_constraints","desired_actions","goals"});
   add("research_question","Record a concrete external knowledge gap. Set required=true for critical assumptions or explicit user research requests.",{{"question",str()},{"required",boolean()}},{"question"});
   add("research_resolve","Account for a research question with supported, contradicted or unverified findings. Supported/contradicted conclusions require fetched document source IDs and exact quotes. An attempted search/read is required before marking required research unverified unless web access is disabled.",{{"id",integer()},{"status",{{"type","string"},{"enum",{"supported","contradicted","unverified"}}}},{"conclusion",str()},{"sources",citations}},{"id","status","conclusion","sources"});
   add("observe_environment","Safely inspect the current project, git state, clock and machine",Json::object(),{});
@@ -398,6 +400,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
   if(implementation)web_.account_for_pending(p_.session,p_.task,events_);
   web_.disclose_failures(p_.session,p_.task,events_);
   auto pending=web_.unresolved_required(p_.session,p_.task);
+  if(implementation && web_.plan_pending(p_.session,p_.task))return {{"error","Decompose the requested research with research_plan before implementation; user instructions are not claims"}};
   if(name=="file_write" || name=="file_edit" || name=="shell_exec")for(auto& q:pending)if(q["status"]=="pending")return {{"error","Required research must be attempted and accounted for before implementation. Use web_search/web_read and research_resolve, or disclose disabled access."},{"research",pending}};
   if(implementation && !pending.empty() && p_.task) {
     auto risk=db->query("SELECT risk FROM tasks WHERE id=?",{p_.task});
@@ -514,6 +517,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
         db->exec("UPDATE tasks SET status='blocked',completed_at=NULL WHERE id=? AND status!='completed'",{previous});
         p_.task=db->exec("INSERT INTO tasks(session_id,project_id,title,objective,status,risk,domain,created_at) VALUES(?,?,?,?,'active',?,?,?)",{p_.session,project,task["title"],task["objective"],task["risk"],task["domain"],now()});
         for(auto& check:db->query("SELECT description,required FROM task_checks WHERE task_id=?",{previous}))db->exec("INSERT INTO task_checks(task_id,description,required) VALUES(?,?,?)",{p_.task,check["description"],check["required"]});
+        web_.rebind_task(previous,p_.task,p_.turn);
         event("task.rescoped",{{"previous_task_id",previous},{"task_id",p_.task},{"project_id",project}});
       }
     }
@@ -581,6 +585,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
   }
   if (name == "task_create") {
     if(!p_.turn.empty() && p_.task && !db->query("SELECT id FROM tool_runs WHERE turn_id=? AND tool='task_create' AND status='completed' LIMIT 1",{p_.turn}).empty()) {
+      if(a["risk"]=="high")db->exec("UPDATE tasks SET risk='high' WHERE id=?",{p_.task});
       for(auto& check:a["checks"])if(db->query("SELECT id FROM task_checks WHERE task_id=? AND description=?",{p_.task,check}).empty())db->exec("INSERT INTO task_checks(task_id,description) VALUES(?,?)",{p_.task,check});
       return {{"id",p_.task},{"reused",true},{"checks",db->query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})}};
     }

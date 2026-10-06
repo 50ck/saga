@@ -105,6 +105,7 @@ int main(int argc,char** argv) {
     CHECK(view.task.empty() && view.agent_status["task"].empty());
     CHECK(chat_utf8(view.status(120)).find("Inspect tmux")==std::string::npos);
     view.event("generation.started",{{"generation_id",99}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is waiting for the model...");
     view.event("reasoning.started",{{"generation_id",99}});
     CHECK(chat_utf8(view.activity(true))==view.name+" is thinking...");
     view.event("context.usage",{{"output_tokens",8192},{"streaming",true}});

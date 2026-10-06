@@ -271,7 +271,7 @@ Json DuckDuckGoEngine::run(const SearchRequest &request, const SearchContext &co
   if (!request.cursor.empty()) {
     if (request.cursor.size() > 8192)
       throw std::runtime_error("Search cursor exceeds limit");
-    auto cursor = Json::parse(request.cursor);
+    auto cursor = search_detail::cursor(request.cursor);
     if (cursor.at("query") != request.query ||
         cursor.at("include_domains") != Json(request.include_domains) ||
         cursor.at("exclude_domains") != Json(request.exclude_domains))

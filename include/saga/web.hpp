@@ -67,6 +67,7 @@ public:
 std::unique_ptr<SearchEngine> make_search_engine(const std::string &name,
                                                  WebTransport transport = fetch_public_web);
 Json research_context(Database &, Id session, Id task);
+Json research_plan_context(Database &, Id session, Id task);
 class WebResearch {
   Database &db_;
   Config config_;
@@ -75,8 +76,10 @@ class WebResearch {
   std::shared_ptr<web::WebAcquisitionEngine> acquisition_;
   int searches_ = 0, reads_ = 0;
   Id session_ = 0, task_ = 0;
+  std::string turn_;
   std::function<void()> service_;
   void network_control();
+  Json dispatch_operation(const std::string &, const Json &, Id, Id, const Emit &);
   Json source_excerpt(Id id, Id offset, Id limit, const std::optional<std::string> &query = {},
                       Id tokens = 0);
 
@@ -86,10 +89,14 @@ public:
   void service(std::function<void()> callback) {
     service_ = std::move(callback);
   }
-  void begin_turn(Id session, Id task);
+  void begin_turn(Id session, Id task, std::string turn = {});
+  void rebind_task(Id previous, Id next, const std::string &turn);
   Json settings(const std::optional<bool> &enabled = {});
   std::string guidance() const;
   Json dispatch(const std::string &name, const Json &args, Id session, Id task, const Emit &emit = {});
+  void require_plan(Id user_event, const std::string &turn, Id session, Id task);
+  bool plan_pending(Id session, Id task) const;
+  Json plan(const Json &, Id session, Id task);
   Id question(const std::string &text, bool required, Id session, Id task, Id assumption = 0);
   Json questions(Id session, Id task) const;
   Json unresolved_required(Id session, Id task) const;

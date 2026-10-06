@@ -64,7 +64,7 @@ void storage() {
   web.settings(false);auto cached=web.dispatch("web_read",{{"source_id",id}},session,0);CHECK(cached["source_id"]==id);CHECK(network==2);rejects([&]{web.dispatch("web_search",{{"query","rules"}},session,0);});CHECK(network==2);
   web.settings(true);web.service([&]{web.settings(false);});rejects([&]{web.dispatch("web_read",{{"url","https://example.com/new"}},session,0);});CHECK(network==2);
   PersonaContext other(paths,registry.create("Other synthetic persona",""),root/"project");CHECK(other.db->query("SELECT id FROM web_sources").empty());
-  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==10);
+  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==11);
 }
 void proof_and_failure_gates() {
   auto root=fs::temp_directory_path()/("saga-web-proof-"+uuid());
@@ -119,10 +119,10 @@ public:
       if(m["role"]=="user" && text.starts_with(marker))state=Json::parse(text.substr(marker.size()));
       if(m["role"]=="tool")last=Json::parse(text);
     }
-    if(!state.empty()) {task_=state["active_task"][0]["id"];check_=state["task_checks"][0]["id"];question_=state["research_questions"][0]["id"];}
+    if(!state.empty()) {task_=state["active_task"][0]["id"];check_=state["task_checks"][0]["id"];if(!state["research_questions"].empty())question_=state["research_questions"][0]["id"];}
     auto invoke=[&](std::string name,Json args){callback({{"choices",Json::array({{{"index",0},{"delta",{{"tool_calls",Json::array({{{"index",0},{"id","fixture-"+std::to_string(step_)},{"function",{{"name",name},{"arguments",args.dump()}}}}})}}},{"finish_reason","tool_calls"}}})}});};
     switch(step_++) {
-      case 0:invoke("report_progress",{{"text","I will check the rules before implementing the program."}});break;
+      case 0:invoke("research_plan",{{"intent","Implement a widget"},{"operator_constraints",{"C++"}},{"desired_actions",{"Write and compile"}},{"goals",Json::array({{{"question","Modern rotation direction"},{"required",true},{"claims",{"How does rotation work?"}}}})}});break;
       case 1:invoke("web_search",{{"query","site:docs.example.com \"rotation\" rules"},{"include_domains",{"docs.example.com"}}});break;
       case 2:search_=last;CHECK(!search_.contains("error"));invoke("web_read",{{"source_id",search_["results"][0]["source_id"]}});break;
       case 3:doc_=last;CHECK(!doc_.contains("error"));invoke("research_resolve",{{"id",question_},{"status","supported"},{"conclusion","The documented fixture rule is clockwise rotation."},{"sources",Json::array({{{"source_id",doc_["source_id"]},{"quote","Rotation is clockwise."}}})}});break;

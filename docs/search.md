@@ -123,3 +123,69 @@ spacing, concurrent gates, directory safety, capability checks, protected-instan
 rejection, HTTP-200 errors, malformed JSON, circuit recovery, cancellation,
 instance failover, single-flight operations, pagination affinity and result caching.
 Public services are not queried by CTest.
+
+## Research decomposition and verification
+
+An explicit research request creates a pending `research_plans` record referencing
+its user event and logical turn. It does not turn the operator's entire prompt into
+a proposition. `research_plan` records intent, operator constraints, desired actions
+and external goals, then creates granular claims. `research_goals` groups claims;
+the existing `research_questions` table remains the backward-compatible claim store.
+A concrete additional `research_question` creates its own external goal. Goal status
+is derived from its claims: unknown, partially established, established,
+not established or contradicted.
+
+`question_id` on web tools associates queries and source reads with a claim. With
+one pending claim, older calls can infer that association. With multiple claims,
+association is explicit. `research_attempts` stores outcomes separately from claim
+status and source snapshots. A failed backend or search never evaluates a claim,
+invalidates previously fetched evidence or marks every outstanding goal unverified.
+Supported/contradicted conclusions require exact quotes from immutable fetched
+documents; search snippets cannot serve as evidence. Evaluation remains the agent's
+responsibility, recorded through `research_resolve` per claim. This validates
+provenance and quoted passages, not mathematical truth or source authority.
+
+Required claims need an associated search/read attempt before an explicit
+unverified resolution. Disabled network access is reported separately. Reversible
+low-risk work may proceed after disclosed uncertainty; required unverified claims
+still prevent verified completion. Optional claims do not impose that gate. Normal
+warnings contain short claim descriptions, never the entire operator request.
+Intent, constraints and actions cannot be submitted verbatim as claims. Decomposition
+is bounded to eight goals and 32 concise claims and is committed transactionally.
+Legacy whole-request questions are retained as non-required audit records by the
+schema migration.
+
+The context builder and cognitive checkpoints carry goal/claim IDs and the
+structured decomposition. Existing personas, tool names, source snapshots and
+research conclusions remain compatible. Infrastructure health, pacing and latency
+stay in the runtime event journal, not model conversation history.
+
+## Dispatch and workspace invariants
+
+Tracing found no workspace callback that invokes `Runtime::chat` a second time.
+The confirmed duplication was task setup: the runtime created a task before the
+model, while its prompt still invited another `task_create`. Attention rebuilds
+also carry operator content as data, which must not become a fresh user turn.
+
+The client now supplies `user_message_id`; the daemon carries it through to a
+unique `(session_id, user_message_id)` durable turn. Replays return the existing
+turn status without dispatching it again; reusing an ID for different content is
+rejected. Workspace changes do not alter that ID or create a turn. Missing IDs from
+older clients inherit the request ID or receive a fresh ID for a new operation.
+
+`tool_dispatch_keys` identifies `(turn_id, tool_call_id)`. A completed call returns
+its durable result; conflicting arguments are rejected. An execution without a
+durable result is uncertain and cannot automatically run again. Nested skill steps
+are distinguished from their outer call. Repeated task setup in one turn reuses the
+active task and merges proof obligations; reopening the active workspace is a no-op.
+When existing workspace logic re-scopes a task after work began, the current
+turn's research plans, goals and claims follow the new task ID. This prevents
+completed side effects from repeating after request replay or crash.
+There is no automatic replay of an interrupted turn.
+
+`tests/research_tests.cpp` reproduces setup, workspace switching, three focused
+Tetris claims, two DuckDuckGo successes, a challenge, 4get recovery, direct source
+reads, granular evidence resolution, shell preflight and the next generation's
+reasoning activity. It verifies one turn/task/user dispatch and retained evidence.
+The separate failure regression proves a completely unavailable search can still
+be followed by successful direct acquisition and claim verification.

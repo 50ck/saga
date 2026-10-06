@@ -67,7 +67,7 @@ void Database::transaction(const std::function<void()>& operation) {
 void Database::migrate() {
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  if (version > 10) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if (version > 11) throw std::runtime_error("Database schema is newer than this Saga binary");
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -142,6 +142,19 @@ void Database::migrate() {
     CREATE TABLE IF NOT EXISTS search_directory_cache(directory TEXT PRIMARY KEY,origins_json TEXT NOT NULL CHECK(json_valid(origins_json)),updated_at INTEGER NOT NULL);
     UPDATE schema_version SET version=10;
   )SQL");});
+
+  if(version<11)transaction([&]{sql(R"SQL(
+    CREATE TABLE IF NOT EXISTS research_plans(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),task_id INTEGER REFERENCES tasks(id),turn_id TEXT UNIQUE REFERENCES turns(id),user_source_event_id INTEGER REFERENCES events(id),status TEXT NOT NULL DEFAULT 'pending',decomposition_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(decomposition_json)),created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS research_goals(id INTEGER PRIMARY KEY,plan_id INTEGER REFERENCES research_plans(id),session_id INTEGER NOT NULL REFERENCES sessions(id),task_id INTEGER REFERENCES tasks(id),question TEXT NOT NULL,required INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS research_attempts(id INTEGER PRIMARY KEY,claim_id INTEGER NOT NULL REFERENCES research_questions(id),operation TEXT NOT NULL,source_id INTEGER REFERENCES web_sources(id),succeeded INTEGER NOT NULL,source_event_id INTEGER REFERENCES events(id),created_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS research_attempts_claim ON research_attempts(claim_id,id);
+  )SQL");
+    bool linked=false;for(auto &column:query("PRAGMA table_info(research_questions)"))if(column["name"]=="goal_id")linked=true;
+    if(!linked)sql("ALTER TABLE research_questions ADD COLUMN goal_id INTEGER REFERENCES research_goals(id)");
+    // Whole-request entries from older runtimes remain audit data, not proof obligations.
+    sql("UPDATE research_questions SET required=0,status='unverified',conclusion='Legacy whole-request entry retained for audit; external facts must be decomposed separately.' WHERE goal_id IS NULL AND EXISTS(SELECT 1 FROM events WHERE events.session_id=research_questions.session_id AND events.type='user.message' AND json_extract(events.payload_json,'$.content')=research_questions.question);");
+    sql("UPDATE schema_version SET version=11");
+  });
 
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {

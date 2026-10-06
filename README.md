@@ -486,7 +486,7 @@ Repeated evidence from the same source URL does not increase confidence as thoug
 it came from independent sources. Search and page content remain untrusted data,
 never instructions to change permissions or execute commands.
 
-V1 reads HTML and plain text, including headings, lists, code and tables. PDF,
+V1 reads HTML, Markdown and plain text, including headings, lists, code and tables. PDF,
 authenticated sites and JavaScript-dependent content are unsupported. Requests
 use verified TLS, public HTTP/HTTPS destinations, address checks at connection
 time, validated redirects, no ambient proxies, and no model credentials. Each
@@ -500,7 +500,9 @@ model context. Older snapshots retain compatibility with byte-based excerpts.
 Global configuration additions in Saga's `config.toml`:
 
 ```toml
-search_engine = "duckduckgo"
+search_engine = "duckduckgo" # Legacy first choice
+search_engines = ["duckduckgo", "fourget"]
+duckduckgo_min_request_interval_ms = 1000
 web_search_limit = 4
 web_read_limit = 8
 web_output_tokens = 4096
@@ -511,7 +513,10 @@ These are per-turn network budgets, in addition to the existing tool-round budge
 Cached source excerpts do not consume page-fetch budget. A search defaults to five
 results, with a maximum of ten. Changing the selected engine requires restarting
 the daemon; additional engines implement `SearchEngine` and register in
-`make_search_engine`. HTTP transport, document extraction, cognitive tools and
+`SearchEngineRegistry`. Engine fallback, caching and instance policy belong to
+`SearchOrchestrator`, while 4get owns safe instance discovery and failover. See
+[search and research architecture](docs/search.md) for policies and configuration.
+HTTP transport, document extraction, cognitive tools and
 persistence are shared. No dynamic plugin loader is required.
 
 The deterministic web tests use synthetic HTML and a mocked HTTP transport,
@@ -520,6 +525,7 @@ DuckDuckGo. Optional live diagnostics (built with `BUILD_TESTING=ON`):
 
 ```sh
 ./build/saga_web_smoke 'site:duckduckgo.com "advanced syntax"'
+./build/saga_web_smoke --engine fourget 'CMake CXX_STANDARD'
 ./build/saga_web_smoke --read https://duckduckgo.com/duckduckgo-help-pages/results/syntax
 ```
 

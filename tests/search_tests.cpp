@@ -2,6 +2,7 @@
 #include <saga/search.hpp>
 #include <atomic>
 #include <thread>
+#include <future>
 using namespace saga;
 namespace {
 WebResponse response(std::string url,std::string body,long status=200) {
@@ -30,6 +31,8 @@ void limiter() {
   for(int i=0;i<3;++i)threads.emplace_back([&]{concurrent.wait(c);std::lock_guard guard(mutex);starts.push_back(clock.ms.load());});
   for(auto &t:threads)t.join();
   CHECK(starts.size()==3);CHECK(clock.ms>=3000); // Gate admission, not callback scheduling, defines start spacing.
+  FakeClock configured_clock;auto configured=configured_clock.context();SearchRateLimiter configured_gate;
+  configured_gate.wait(configured);configured_gate.configure(SearchDuration(1500),SearchDuration(60000));configured_gate.wait(configured);CHECK(configured_clock.ms==1500);
   gate.degrade(c);bool blocked=false;try{gate.wait(c);}catch(const SearchError &e){blocked=e.code==SearchErrorCode::RateLimited;}CHECK(blocked);
   c.service=[] {throw TurnCancelled();};bool cancelled=false;try{gate.wait(c);}catch(const TurnCancelled &){cancelled=true;}CHECK(cancelled);
   FakeClock ddg_time;auto context=ddg_time.context();std::vector<long> requests;
@@ -47,10 +50,16 @@ void parsing() {
   auto disabled=FourGetSearchEngine::probe(response("https://a.example/ami4get",probe_json(false)),"https://a.example");CHECK(!disabled.eligible(c));
   auto protected_instance=FourGetSearchEngine::probe(response("https://a.example/ami4get",probe_json(true,1)),"https://a.example");CHECK(!protected_instance.eligible(c));
   for(auto body:{std::string("not json"),std::string("{\"status\":\"no\"}"),std::string("{\"status\":\"ok\",\"service\":\"other\"}"),std::string("{\"status\":\"ok\",\"service\":\"4get\",\"server\":{}}"),probe_json(true,0,0)})rejects([&]{FourGetSearchEngine::probe(response("https://a.example/ami4get",body),"https://a.example");});
+  std::string deep(70,'[');deep+="0";deep+=std::string(70,']');
+  rejects([&]{FourGetSearchEngine::probe(response("https://a.example/ami4get",deep),"https://a.example");});
+  rejects([]{search_detail::cursor(std::string(40,'[')+"0"+std::string(40,']'));});
+  auto huge=Json::parse(probe_json());huge["server"]["bot_protection"]=4294967296LL;
+  rejects([&]{FourGetSearchEngine::probe(response("https://a.example/ami4get",huge.dump()),"https://a.example");});
   SearchRequest request{"SRS","",5,{"example.com"},{}};
   auto hits=FourGetSearchEngine::parse(response("https://a.example/api/v1/web",hits_json("OPAQUE+TOKEN")),request,"https://a.example");CHECK(hits["results"].size()==1);CHECK(hits["results"][0]["snippet"]=="");CHECK(Json::parse(hits["next_cursor"].get<std::string>())["instance"]=="https://a.example");
   // HTTP 200 is not API success.
   rejects([&]{FourGetSearchEngine::parse(response("https://a.example/api/v1/web","{\"status\":\"The server administrator disabled the API!\"}"),request,"https://a.example");});
+  rejects([&]{FourGetSearchEngine::parse(response("https://a.example/api/v1/web",R"({"status":"ok","web":[{"unexpected":"shape"}]})"),request,"https://a.example");});
   auto slow=healthy;healthy.latency_ms=80;slow.latency_ms=200;CHECK(healthy.score(false)>slow.score(false));
   slow.retry_after=c.clock.time()+SearchDuration(1000);CHECK(!slow.eligible(c));
 }
@@ -87,15 +96,25 @@ void concurrent_single_flight() {
     if(url.ends_with("/ami4get")) {++probes;return response(url,probe_json());}
     ++queries;return response(url,hits_json());
   });
-  std::vector<std::thread> threads;
-  for(int i=0;i<4;++i)threads.emplace_back([&]{engine.run({"query","",5,{},{}},context);});
-  for(auto &thread:threads)thread.join();
+  // Mutex contention must not fast-forward the network timeout clock. Admission
+  // timing is tested separately; here concurrent callers exercise single-flight.
+  auto flight_context=context;flight_context.clock.pause=[](SearchDuration){std::this_thread::yield();};
+  std::vector<std::future<Json>> flights;
+  for(int i=0;i<4;++i)flights.push_back(std::async(std::launch::async,[&]{return engine.run({"query","",5,{},{}},flight_context);}));
+  for(auto &flight:flights)(void)flight.get();
   CHECK(directories==1 && probes==1 && queries==4);
   auto limiter=std::make_shared<SearchRateLimiter>();std::vector<long> starts;
   auto transport=[&](auto &url,auto&,auto&){starts.push_back(clock.ms);return response(url,"<p class='no-results'>No results found</p>");};
   DuckDuckGoEngine first(transport,limiter),second(transport,limiter);
-  std::thread a([&]{first.run({"A","",5,{},{}},context);});
-  std::thread b([&]{second.run({"B","",5,{},{}},context);});a.join();b.join();
+  auto pacing_context=context;
+  std::atomic<bool> waiting_for_admission{false};
+  pacing_context.emit=[&](const std::string &type,const Json &){
+    if(type=="search.queued")waiting_for_admission=true;
+    if(type=="search.rate_limit_wait")waiting_for_admission=false;
+  };
+  pacing_context.clock.pause=[&](SearchDuration duration){if(waiting_for_admission)clock.ms+=duration.count();std::this_thread::yield();};
+  auto a=std::async(std::launch::async,[&]{return first.run({"A","",5,{},{}},pacing_context);});
+  auto b=std::async(std::launch::async,[&]{return second.run({"B","",5,{},{}},pacing_context);});(void)a.get();(void)b.get();
   CHECK(starts.size()==2 && starts[1]-starts[0]>=1000);
   // A one-use page token is never sent to a replacement instance.
   bool failed=false;config.fourget_manual_instances={"https://a.example","https://b.example"};
@@ -109,6 +128,32 @@ void concurrent_single_flight() {
   SearchRequest request{"query","",5,{},{}};auto page=paged.run(request,context);request.cursor=page["next_cursor"];failed=true;
   bool unavailable=false;try{paged.run(request,context);}catch(const SearchError &e){unavailable=e.code==SearchErrorCode::PaginationUnavailable;}CHECK(unavailable);
   CHECK(std::none_of(urls.begin(),urls.end(),[](auto &url){return url.starts_with("https://b.example/api");}));
+}
+void persistent_health_and_config() {
+  auto root=fs::temp_directory_path()/("saga-search-cache-"+uuid());private_dir(root);
+  struct Cleanup{fs::path root;~Cleanup(){fs::remove_all(root);}} cleanup{root};
+  Database db(root/"cache.sqlite");db.migrate();Config config;FakeClock clock;auto context=clock.context();
+  int directories=0,probes=0,queries=0;
+  auto transport=[&](auto &url,auto&,auto&){
+    if(url.ends_with("/instances")){++directories;return response(url,directory_html({"https://a.example"}));}
+    if(url.ends_with("/ami4get")){++probes;return response(url,probe_json());}
+    ++queries;return response(url,hits_json());
+  };
+  {FourGetSearchEngine first(config,transport,&db);first.run({"first","",5,{},{}},context);}
+  FourGetSearchEngine restored(config,transport,&db);restored.run({"second","",5,{},{}},context);
+  CHECK(directories==1 && probes==1 && queries==2);
+  clock.ms+=310000;restored.run({"third","",5,{},{}},context);CHECK(directories==1 && probes==2);
+  Paths paths{root/"config",root/"data",root/"state",root/"run"};paths.create();
+  config.endpoint="http://example.invalid";config.model="fixture";config.context_length=65536;
+  config.search_engines={"fourget","duckduckgo"};config.duckduckgo_min_request_interval_ms=1200;config.fourget_manual_instances={"https://manual.example"};
+  config.save(paths);auto loaded=Config::load(paths);loaded.validate();CHECK(loaded.search_engines==config.search_engines);CHECK(loaded.duckduckgo_min_request_interval_ms==1200);CHECK(loaded.fourget_manual_instances==config.fourget_manual_instances);
+  loaded.duckduckgo_min_request_interval_ms=999;rejects([&]{loaded.validate();});
+  bool in_probe=false;context.service=[&]{if(in_probe)throw TurnCancelled();};
+  FourGetSearchEngine cancelled(Config{},[&](auto &url,auto&,auto& control){
+    if(url.ends_with("/instances"))return response(url,directory_html({"https://cancel.example"}));
+    in_probe=true;if(control)control();return response(url,probe_json());
+  });
+  bool stopped=false;try{cancelled.run({"cancel","",5,{},{}},context);}catch(const TurnCancelled &){stopped=true;}CHECK(stopped);CHECK(cancelled.health()[0]["failures"]==0);
 }
 class Stub final : public SearchEngine {
 public:
@@ -130,4 +175,4 @@ void orchestration() {
   context.service={};f->fail=true;request.query="different";rejects([&]{orchestrator.search(request,context);});
 }
 }
-int main(){try{limiter();parsing();failover_and_pagination();concurrent_single_flight();orchestration();return 0;}catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{limiter();parsing();failover_and_pagination();concurrent_single_flight();persistent_health_and_config();orchestration();return 0;}catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}}

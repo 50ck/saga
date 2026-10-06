@@ -357,7 +357,8 @@ WebResearch::WebResearch(Database &db, Config config, WebTransport transport)
 }
 WebResearch::~WebResearch() = default;
 std::string WebResearch::guidance() const { return engine_->guidance(); }
-void WebResearch::begin_turn(Id session, Id task) {
+void WebResearch::begin_turn(Id session, Id task, std::string turn) {
+  turn_=std::move(turn);
   session_ = session;
   task_ = task;
   searches_ = reads_ = 0;
@@ -372,7 +373,7 @@ Json WebResearch::settings(const std::optional<bool> &enabled) {
   }
   auto rows = db_.query("SELECT value FROM runtime_settings WHERE key='web_enabled'");
   return {{"enabled", rows.empty() || rows[0]["value"] == "true"},
-          {"engine", config_.search_engine},
+          {"engine", config_.search_engines.empty() ? config_.search_engine : config_.search_engines.front()},
           {"capabilities", engine_->capabilities()},
           {"searches", searches_},
           {"reads", reads_},
@@ -457,86 +458,10 @@ Json WebResearch::source_excerpt(Id id, Id offset, Id limit,
       "[" + row["title"].get<std::string>() + "](" + row["url"].get<std::string>() + ")";
   return row;
 }
-Id WebResearch::question(const std::string &text, bool required, Id session, Id task,
-                         Id assumption) {
-  if (trim(text).empty() || text.size() > 8192)
-    throw std::runtime_error("Research question must contain 1–8192 bytes");
-  auto rows = db_.query("SELECT id FROM research_questions WHERE session_id=? AND "
-                        "coalesce(task_id,0)=? AND question=? AND status='pending'",
-                        {session, task, text});
-  if (!rows.empty()) {
-    if (required)
-      db_.exec("UPDATE research_questions SET required=1 WHERE id=?", {rows[0]["id"]});
-    return rows[0]["id"];
-  }
-  auto id = db_.exec("INSERT INTO "
-                     "research_questions(session_id,task_id,assumption_id,question,required,"
-                     "created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                     {session, task ? Json(task) : Json(), assumption ? Json(assumption) : Json(),
-                      text, required, now(), now()});
-  db_.event("research.question_created", {{"id", id}, {"question", text}, {"required", required}},
-            session, task);
-  return id;
-}
-Json research_context(Database &db, Id session, Id task) {
-  return db.query("SELECT id,task_id,assumption_id,substr(question,1,512) AS "
-                  "question,required,status,substr(conclusion,1,1024) AS conclusion,(SELECT "
-                  "json_group_array(json_extract(value,'$.source_id')) FROM "
-                  "json_each(sources_json)) AS source_ids,disclosed FROM research_questions WHERE "
-                  "session_id=? OR (task_id IS NOT NULL AND task_id=?) ORDER BY id DESC LIMIT 30",
-                  {session, task});
-}
-Json WebResearch::questions(Id session, Id task) const {
-  return research_context(db_, session, task);
-}
-Json WebResearch::unresolved_required(Id session, Id task) const {
-  return db_.query("SELECT * FROM research_questions WHERE required=1 AND status IN "
-                   "('pending','unverified','contradicted') AND ((task_id IS NULL AND "
-                   "session_id=?) OR (task_id IS NOT NULL AND task_id=?))",
-                   {session, task});
-}
-void WebResearch::disclose_failures(Id session, Id task, const Emit &emit) {
-  for (auto &row : unresolved_required(session, task))
-    if (row["status"] != "pending" && row["disclosed"] == 0) {
-      auto content =
-          "Research could not establish: " + row["question"].get<std::string>() + "\n" +
-          row["conclusion"].get<std::string>() +
-          "\nReversible work may continue with uncertainty; this is not verified completion.";
-      db_.event("research.uncertainty_disclosed",
-                {{"question_id", row["id"]}, {"content", content}}, session, task);
-      db_.exec("INSERT INTO messages(session_id,ts,role,content_json,token_count) "
-               "VALUES(?,?,'assistant',?,?)",
-               {session, now(), Json{{"role", "assistant"}, {"content", content}}.dump(),
-                estimate_tokens(content)});
-      db_.exec("UPDATE research_questions SET disclosed=1 WHERE id=?", {row["id"]});
-      if (emit)
-        emit("research.warning", {{"content", content}});
-    }
-}
-void WebResearch::account_for_pending(Id session, Id task, const Emit &emit) {
-  bool disabled = !settings()["enabled"].get<bool>();
-  for (auto &q : unresolved_required(session, task))
-    if (q["status"] == "pending") {
-      auto attempts =
-          db_.query("SELECT count(*) AS n FROM events WHERE session_id=? AND ts>=? AND type IN "
-                    "('tool.completed','tool.failed') AND json_extract(payload_json,'$.tool') IN "
-                    "('web_search','web_read','web_fetch')",
-                    {session, q["created_at"]})[0]["n"]
-              .get<int>();
-      if (disabled || searches_ >= config_.web_search_limit || reads_ >= config_.web_read_limit ||
-          attempts)
-        db_.exec("UPDATE research_questions SET status='unverified',conclusion=?,updated_at=? "
-                 "WHERE id=?",
-                 {disabled ? "Public web access is disabled."
-                           : "Research attempts did not establish a supported conclusion.",
-                  now(), q["id"]});
-    }
-  disclose_failures(session, task, emit);
-}
-
-Json WebResearch::dispatch(const std::string &name, const Json &args, Id session, Id task, const Emit &emit) {
+Json WebResearch::dispatch_operation(const std::string &name, const Json &args, Id session, Id task, const Emit &emit) {
   session_ = session;
   task_ = task;
+  if (name == "research_plan")return plan(args,session,task);
   if (name == "research_question")
     return {{"id", question(args.at("question"), args.value("required", false), session, task)}};
   if (name == "research_resolve") {
@@ -567,11 +492,7 @@ Json WebResearch::dispatch(const std::string &name, const Json &args, Id session
         throw std::runtime_error("Citation quote is not present in the source snapshot");
     }
     if (status == "unverified" && rows[0]["required"] == 1 && settings()["enabled"].get<bool>()) {
-      auto attempts =
-          db_.query("SELECT id FROM events WHERE session_id=? AND ts>=? AND type IN "
-                    "('tool.completed','tool.failed') AND json_extract(payload_json,'$.tool') IN "
-                    "('web_search','web_read','web_fetch') LIMIT 1",
-                    {session, rows[0]["created_at"]});
+      auto attempts=db_.query("SELECT id FROM research_attempts WHERE claim_id=? LIMIT 1",{id});
       if (attempts.empty())
         throw std::runtime_error(
             "Required research must be attempted before marking it unverified");
@@ -687,7 +608,7 @@ Json WebResearch::dispatch(const std::string &name, const Json &args, Id session
       id = db_.exec("INSERT INTO "
                     "web_sources(session_id,task_id,kind,engine,url,title,retrieved_at,content_"
                     "hash,text,truncated,source_event_id) VALUES(?,?,'document',?,?,?,?,?,?,?,?)",
-                    {session, task ? Json(task) : Json(), config_.search_engine,
+                    {session, task ? Json(task) : Json(), "web_acquisition",
                      document.source.final_url, document.metadata.title, now(), digest(full), full,
                      document.truncated, ev});
       db_.exec("INSERT INTO web_source_documents(source_id,document_json,diagnostics_json) "
