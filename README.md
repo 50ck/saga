@@ -244,6 +244,8 @@ prevents deletion; finish or stop active work before using the command.
 
 Diagnostic ownership is recorded by UUID in each persona's
 `diagnostic-bundles.json`, independently of its display name. Existing bundles
+must use a log directory outside persona storage to prevent cross-persona data
+mixing or recreating an erased identity through an idle diagnostic writer. Bundles
 in the default log directory and the current custom log directory are also
 discovered through their manifests. Old, unregistered recordings in other
 custom directories, exported copies and backups cannot be located automatically.

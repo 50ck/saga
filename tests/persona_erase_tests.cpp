@@ -82,6 +82,10 @@ void protocol_tests(const Paths& paths,const fs::path& project) {
     auto a=request(client,"personas.create",{{"name","Active profile"},{"soul","Synthetic A"}});
     auto b=request(client,"personas.create",{{"name","Other profile"},{"soul","Synthetic B"}});
     auto aid=a["uuid"].get<std::string>(),bid=b["uuid"].get<std::string>();
+    auto unsafe=options;unsafe.directory=paths.persona(aid)/"logs";
+    rejects([&]{request(client,"debug.configure",unsafe.json());});
+    auto alias=project.parent_path()/"diagnostic-alias";fs::create_directory_symlink(paths.persona(aid),alias);
+    unsafe.directory=alias/"nested";rejects([&]{request(client,"debug.configure",unsafe.json());});
     request(client,"persona.activate",{{"uuid",aid},{"cwd",project.string()}});
     request(client,"command",{{"name","fact"},{"arguments",{{"subject","test"},{"predicate","value"},{"object","private"}}}});
     rejects([&]{erase(client,"");});rejects([&]{erase(client,"Unknown");});

@@ -110,7 +110,10 @@ DebugOptions DebugOptions::from_json(const Json& value,const Paths& paths) {
   if(options.rotate_bytes<4096 || options.rotate_bytes>4ULL*1024*1024*1024 || options.keep>10000 || options.sample_interval_ms<100 || options.sample_interval_ms>3600000)throw std::runtime_error("Diagnostic limits are out of range");
   for(auto &filter:options.components)list(filter);
   for(auto &filter:options.exclude)list(filter);
-  options.directory=fs::absolute(options.directory).lexically_normal();return options;
+  options.directory=fs::absolute(options.directory).lexically_normal();
+  if(within(options.directory,paths.data/"personas"))
+    throw std::runtime_error("Diagnostic directory must be outside persona storage");
+  return options;
 }
 bool debug_argument(int argc,char** argv,int& index,DebugOptions& options) {
   std::string arg=argv[index];if(!arg.starts_with("--debug"))return false;
