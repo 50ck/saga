@@ -136,7 +136,10 @@ int main(int argc,char** argv) {
     CHECK(view.entries.back().text.find("rotation rules site:example.com")!=std::string::npos);
     view.event("tool.started",{{"tool","web_fetch"},{"run_id",54323},{"arguments",{{"url","https://example.com/manual"}}}});
     view.event("tool.completed",{{"tool","web_fetch"},{"run_id",54323},{"result",{{"url","https://example.com/manual"},{"title","Manual"}}}});
-    CHECK(view.entries.back().text.find("Visited Manual (https://example.com/manual)")!=std::string::npos);
+    CHECK(view.entries.back().text=="Visited: Manual (https://example.com/manual)");
+    view.event("tool.started",{{"tool","web_read"},{"run_id",54324},{"arguments",{{"source_id",0}}}});
+    view.event("tool.completed",{{"tool","web_read"},{"run_id",54324},{"result",{{"url","https://example.com/rules"},{"title","Rules"}}}});
+    CHECK(view.entries.back().text=="Visited: Rules (https://example.com/rules)");
     auto web_lines=view.lines(100);CHECK(std::any_of(web_lines.begin(),web_lines.end(),[](auto& line){return line.starts_with(L"• ");}));
     CHECK(std::none_of(web_lines.begin(),web_lines.end(),[](auto& line){return line.find(L"┊")!=std::wstring::npos;}));
     view.event("research.warning",{{"content","Synthetic uncertainty warning"}});CHECK(view.entries.back().text=="Synthetic uncertainty warning");

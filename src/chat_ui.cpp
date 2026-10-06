@@ -169,7 +169,7 @@ void ChatView::event(const std::string& type,const Json& p) {
     }
     if(type=="tool.completed" && (p.value("tool","")=="web_read" || p.value("tool","")=="web_fetch")) {
       auto result=p.value("result",Json::object());
-      for(auto it=entries.rbegin();it!=entries.rend();++it)if(it->activity && it->run==run){it->text+="\nVisited "+result.value("title","")+" ("+result.value("url","")+")";break;}
+      for(auto it=entries.rbegin();it!=entries.rend();++it)if(it->activity && it->run==run){it->text="Visited: "+result.value("title","")+" ("+result.value("url","")+")";break;}
     }
     if(!std::any_of(entries.begin(),entries.end(),[](auto& entry){return entry.activity && entry.started;}))phase="respond";
     if (type == "tool.failed") {
