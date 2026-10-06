@@ -226,6 +226,21 @@ Config Config::load(const Paths& paths) {
       else if (k == "timeout_seconds") c.timeout_seconds = Json::parse(v).get<int>();
       else if (k == "max_tool_rounds") c.max_tool_rounds = Json::parse(v).get<int>();
       else if (k == "search_engine") c.search_engine = Json::parse(v).get<std::string>();
+      else if (k == "search_engines") c.search_engines = Json::parse(v).get<std::vector<std::string>>();
+      else if (k == "fourget_manual_instances") c.fourget_manual_instances = Json::parse(v).get<std::vector<std::string>>();
+      else if (k == "fourget_prefer_manual") c.fourget_prefer_manual = Json::parse(v).get<bool>();
+      else if (k == "fourget_allow_private_instances") c.fourget_allow_private_instances = Json::parse(v).get<bool>();
+      else if (k == "duckduckgo_min_request_interval_ms") c.duckduckgo_min_request_interval_ms = Json::parse(v).get<int>();
+      else if (k == "duckduckgo_challenge_backoff_ms") c.duckduckgo_challenge_backoff_ms = Json::parse(v).get<int>();
+      else if (k == "search_cache_ttl_seconds") c.search_cache_ttl_seconds = Json::parse(v).get<int>();
+      else if (k == "search_total_timeout_seconds") c.search_total_timeout_seconds = Json::parse(v).get<int>();
+      else if (k == "search_max_engine_attempts") c.search_max_engine_attempts = Json::parse(v).get<int>();
+      else if (k == "fourget_directory_ttl_seconds") c.fourget_directory_ttl_seconds = Json::parse(v).get<int>();
+      else if (k == "fourget_probe_ttl_seconds") c.fourget_probe_ttl_seconds = Json::parse(v).get<int>();
+      else if (k == "fourget_failure_backoff_ms") c.fourget_failure_backoff_ms = Json::parse(v).get<int>();
+      else if (k == "fourget_max_instance_attempts") c.fourget_max_instance_attempts = Json::parse(v).get<int>();
+      else if (k == "fourget_probe_timeout_seconds") c.fourget_probe_timeout_seconds = Json::parse(v).get<int>();
+      else if (k == "fourget_request_timeout_seconds") c.fourget_request_timeout_seconds = Json::parse(v).get<int>();
       else if (k == "web_search_limit") c.web_search_limit = Json::parse(v).get<int>();
       else if (k == "web_read_limit") c.web_read_limit = Json::parse(v).get<int>();
       else if (k == "web_allow_private_network") c.web_allow_private_network = Json::parse(v).get<bool>();
@@ -250,7 +265,7 @@ void Config::save(const Paths& p) const {
     {"generation_reserve",generation_reserve},{"safety_margin",safety_margin},{"allow_small_context",allow_small_context},
     {"default_max_output_tokens",default_max_output_tokens},{"hard_max_output_tokens",hard_max_output_tokens},{"max_continuations",max_continuations},{"max_generation_retries",max_generation_retries},{"reasoning_budget",reasoning_budget},{"reasoning_soft_budget",reasoning_soft_budget},{"reasoning_hard_budget",reasoning_hard_budget},{"reasoning_control",reasoning_control},{"stream_assistant_text",stream_assistant_text},
     {"insecure_tls",insecure_tls},{"timeout_seconds",timeout_seconds},{"max_tool_rounds",max_tool_rounds},
-    {"search_engine",search_engine},{"web_search_limit",web_search_limit},{"web_read_limit",web_read_limit},
+    {"search_engine",search_engine},{"search_engines",search_engines},{"fourget_manual_instances",fourget_manual_instances},{"fourget_prefer_manual",fourget_prefer_manual},{"fourget_allow_private_instances",fourget_allow_private_instances},{"duckduckgo_min_request_interval_ms",duckduckgo_min_request_interval_ms},{"duckduckgo_challenge_backoff_ms",duckduckgo_challenge_backoff_ms},{"search_cache_ttl_seconds",search_cache_ttl_seconds},{"search_total_timeout_seconds",search_total_timeout_seconds},{"search_max_engine_attempts",search_max_engine_attempts},{"fourget_directory_ttl_seconds",fourget_directory_ttl_seconds},{"fourget_probe_ttl_seconds",fourget_probe_ttl_seconds},{"fourget_failure_backoff_ms",fourget_failure_backoff_ms},{"fourget_max_instance_attempts",fourget_max_instance_attempts},{"fourget_probe_timeout_seconds",fourget_probe_timeout_seconds},{"fourget_request_timeout_seconds",fourget_request_timeout_seconds},{"web_search_limit",web_search_limit},{"web_read_limit",web_read_limit},
     {"web_allow_private_network",web_allow_private_network},{"web_output_tokens",web_output_tokens},
     {"lexical_weight",lexical_weight},{"entity_weight",entity_weight},{"project_weight",project_weight},{"goal_weight",goal_weight},
     {"salience_weight",salience_weight},{"recency_weight",recency_weight},{"confidence_weight",confidence_weight},{"accessibility_weight",accessibility_weight}};
@@ -264,6 +279,8 @@ void Config::validate() const {
   if (context_length <= generation_reserve || context_length - generation_reserve <= safety_margin)
     throw std::runtime_error("Generation reserve and safety margin leave no input budget");
   if(hard_max_output_tokens<1 || hard_max_output_tokens>1048576 || default_max_output_tokens>hard_max_output_tokens || max_continuations<0 || max_continuations>16 || max_generation_retries<0 || max_generation_retries>3 || (reasoning_budget!="auto" && reasoning_budget!="fixed" && reasoning_budget!="disabled") || (reasoning_hard_budget && reasoning_soft_budget>reasoning_hard_budget))throw std::runtime_error("Invalid generation limits");
+  for (auto &engine : search_engines) (void)make_search_engine(engine);
+  if (search_engines.size()>8 || duckduckgo_min_request_interval_ms<1000 || duckduckgo_min_request_interval_ms>60000 || duckduckgo_challenge_backoff_ms<1000 || search_cache_ttl_seconds<1 || search_cache_ttl_seconds>86400 || search_total_timeout_seconds<1 || search_total_timeout_seconds>120 || search_max_engine_attempts<1 || search_max_engine_attempts>8 || fourget_directory_ttl_seconds<60 || fourget_directory_ttl_seconds>604800 || fourget_probe_ttl_seconds<1 || fourget_probe_ttl_seconds>86400 || fourget_failure_backoff_ms<1000 || fourget_failure_backoff_ms>3600000 || fourget_max_instance_attempts<1 || fourget_max_instance_attempts>16 || fourget_probe_timeout_seconds<1 || fourget_probe_timeout_seconds>15 || fourget_request_timeout_seconds<1 || fourget_request_timeout_seconds>60 || fourget_manual_instances.size()>16) throw std::runtime_error("Invalid search policy limits");
   (void)make_search_engine(search_engine); // The provider registry owns engine validation.
   if (web_search_limit < 1 || web_search_limit > 100 || web_read_limit < 1 || web_read_limit > 100 || web_output_tokens<128 || web_output_tokens>4096) throw std::runtime_error("Invalid web research limits");
   if (timeout_seconds < 1 || timeout_seconds > 1800 || max_tool_rounds < 1 || max_tool_rounds > 100)

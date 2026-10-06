@@ -1,5 +1,6 @@
 #include <curl/curl.h>
 #include <saga/web.hpp>
+#include <saga/search.hpp>
 #include <saga/web/acquisition.hpp>
 #if __has_include(<curl/multi.h>)
 #include <curl/multi.h>
@@ -33,102 +34,6 @@ struct Url {
     return raw;
   }
 };
-std::string decode(std::string_view value) {
-  std::string out;
-  auto hex = [](char c) -> int {
-    if (c >= '0' && c <= '9')
-      return c - '0';
-    if (c >= 'a' && c <= 'f')
-      return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-      return c - 'A' + 10;
-    return -1;
-  };
-  for (size_t i = 0; i < value.size(); ++i) {
-    if (value[i] == '%' && i + 2 < value.size() && hex(value[i + 1]) >= 0 &&
-        hex(value[i + 2]) >= 0) {
-      out += static_cast<char>(hex(value[i + 1]) * 16 + hex(value[i + 2]));
-      i += 2;
-    } else
-      out += value[i] == '+' ? ' ' : value[i];
-  }
-  return out;
-}
-std::string query_field(std::string_view query, std::string_view name) {
-  while (!query.empty()) {
-    auto end = query.find('&');
-    auto part = query.substr(0, end);
-    auto eq = part.find('=');
-    if (decode(part.substr(0, eq)) == name)
-      return eq == std::string_view::npos ? "" : decode(part.substr(eq + 1));
-    if (end == std::string_view::npos)
-      break;
-    query.remove_prefix(end + 1);
-  }
-  return {};
-}
-using SearchNode = web::Node;
-std::string attribute(SearchNode *node, const char *name) { return web::attr(node, name); }
-std::string node_text(SearchNode *node) {
-  std::string result;
-  web::walk(node, [&](SearchNode *child, size_t) { result += web::text(child); }, {});
-  return trim(utf8_text(result));
-}
-bool tag(SearchNode *node, std::string_view name) { return web::tag(node) == name; }
-bool css(SearchNode *node, std::string_view name) {
-  std::istringstream words(attribute(node, "class"));
-  std::string word;
-  while (words >> word)
-    if (word == name)
-      return true;
-  return false;
-}
-void walk(SearchNode *node, const std::function<void(SearchNode *)> &visit) {
-  for (; node; node = node->next)
-    web::walk(node, [&](SearchNode *child, size_t) { visit(child); }, {});
-}
-SearchNode *next_element(SearchNode *node) {
-  for (node = node->next; node; node = node->next)
-    if (!web::tag(node).empty())
-      return node;
-  return nullptr;
-}
-std::unique_ptr<web::HtmlDocument> html(std::string_view body) {
-  return std::make_unique<web::HtmlDocument>(body, web::WebLimits{});
-}
-bool matches_domain(const std::string &host, const std::string &domain) {
-  return host == domain || (host.size() > domain.size() && host.ends_with("." + domain));
-}
-void validate_domains(const std::vector<std::string> &domains) {
-  if (domains.size() > 16)
-    throw std::runtime_error("At most 16 domain constraints are supported");
-  for (auto &domain : domains)
-    if (domain.empty() || domain.size() > 253 || domain != lower(domain) || domain.front() == '.' ||
-        domain.back() == '.' ||
-        domain.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789.-") != std::string::npos)
-      throw std::runtime_error(
-          "Domain constraints must be lowercase domain names, without a URL or wildcard");
-}
-std::string submitted_query(const SearchRequest &request) {
-  auto query = request.query;
-  if (request.include_domains.size() == 1 &&
-      query.find("site:" + request.include_domains[0]) == std::string::npos)
-    query += " site:" + request.include_domains[0];
-  for (auto &domain : request.exclude_domains)
-    if (query.find("-site:" + domain) == std::string::npos)
-      query += " -site:" + domain;
-  return query;
-}
-
-bool allowed_result(const std::string &url, const SearchRequest &request) {
-  auto host = web_host(url);
-  for (auto &domain : request.exclude_domains)
-    if (matches_domain(host, domain))
-      return false;
-  return request.include_domains.empty() ||
-         std::any_of(request.include_domains.begin(), request.include_domains.end(),
-                     [&](auto &domain) { return matches_domain(host, domain); });
-}
 } // namespace
 std::string web_encode(std::string_view value) {
   constexpr char hex[] = "0123456789ABCDEF";
@@ -239,7 +144,7 @@ WebResponse fetch_web_http(const std::string &target, const std::string &form,
     throw std::runtime_error(
         "Responsive web research requires libcurl with asynchronous DNS support");
   auto url = web_url(target, {}, options.allow_private_network), body = form;
-  auto deadline = now() + options.total_timeout * 1000;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(options.total_timeout);
   for (int redirect = 0; redirect <= options.max_redirects; ++redirect) {
     if (service)
       service();
@@ -269,7 +174,7 @@ WebResponse fetch_web_http(const std::string &target, const std::string &form,
     set(CURLOPT_SSL_VERIFYHOST, 2L);
     set(CURLOPT_NOSIGNAL, 1L);
     set(CURLOPT_CONNECTTIMEOUT, static_cast<long>(options.connect_timeout));
-    set(CURLOPT_TIMEOUT, std::max(1L, static_cast<long>((deadline - now() + 999) / 1000)));
+    set(CURLOPT_TIMEOUT, std::max(1L, static_cast<long>((std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count() + 999) / 1000)));
     set(CURLOPT_USERAGENT, "Saga/0.1 (public web research)");
     set(CURLOPT_ACCEPT_ENCODING, "");
     if (version->features & (1 << 16))
@@ -378,7 +283,7 @@ WebResponse fetch_web_http(const std::string &target, const std::string &form,
     while (running) {
       if (service)
         service();
-      if (now() >= deadline)
+      if (std::chrono::steady_clock::now() >= deadline)
         throw std::runtime_error("Web request timed out");
       if (curl_multi_perform(multi.get(), &running) != 0)
         throw std::runtime_error("Web transfer failed");
@@ -442,200 +347,16 @@ WebDocument extract_web_document(const WebResponse &response) {
     body += web::render_block(block) + "\n";
   return {document.metadata.title, std::move(body), document.truncated};
 }
-Json DuckDuckGoEngine::capabilities() const {
-  return {{"id", "duckduckgo"},
-          {"advanced_query", true},
-          {"pagination", true},
-          {"domain_constraints", true},
-          {"formats", {"html", "text"}}};
-}
-std::string DuckDuckGoEngine::guidance() const {
-  return "Selected search engine: DuckDuckGo. Use focused technical queries with "
-         "versions/platforms. Operators: \"exact phrase\", site:domain, -site:domain, "
-         "intitle:term, inurl:term, filetype:pdf/doc/docx/xls/xlsx/ppt/pptx/html; +term emphasizes "
-         "and -term reduces results. ~\"phrase\" is experimental semantic expansion. Operators may "
-         "be imperfect and empty advanced searches may fall back to related results. Inspect "
-         "sources; explicit include_domains/exclude_domains are enforced locally. Start with "
-         "primary documentation, narrow noise, broaden empty results explicitly, search exact "
-         "errors, and investigate contradictions. Read pages before treating claims as verified. "
-         "Search snippets are discovery only. Bangs (!site), safe-search bangs and first-result "
-         "shortcuts are unsupported; do not use them. HTML/text reading only; a PDF search result "
-         "cannot be read in v1.";
-}
-Json DuckDuckGoEngine::parse(const WebResponse &response, const SearchRequest &request) {
-  auto low = lower(response.body);
-  if (response.status == 429)
-    throw std::runtime_error("DuckDuckGo rate limited the search; retry later");
-  if (response.status == 403 || response.status == 202 ||
-      low.find("anomaly.js") != std::string::npos ||
-      low.find("challenge-form") != std::string::npos ||
-      low.find("bots use duckduckgo") != std::string::npos)
-    throw std::runtime_error("DuckDuckGo returned a bot challenge; Saga does not bypass CAPTCHA");
-  if (response.status != 200)
-    throw std::runtime_error("DuckDuckGo HTTP status " + std::to_string(response.status));
-  auto doc = html(response.body);
-  Json results = Json::array();
-  std::set<std::string> seen;
-  Json next = Json::object();
-  bool recognized = false;
-  walk(doc->root(), [&](SearchNode *node) {
-    if (tag(node, "a") && (css(node, "result__a") || css(node, "result-link") ||
-                           (tag(node->parent, "h2") && css(node->parent, "result__title")))) {
-      recognized = true;
-      auto href = attribute(node, "href");
-      std::string url;
-      try {
-        url = web_url(href, response.url);
-        if (web_host(url) == "duckduckgo.com" || web_host(url).ends_with(".duckduckgo.com")) {
-          Url u;
-          curl_url_set(u.value, CURLUPART_URL, url.c_str(), 0);
-          auto destination = query_field(u.get(CURLUPART_QUERY), "uddg");
-          if (!destination.empty())
-            url = web_url(destination);
-          else
-            return;
-        }
-      } catch (const std::exception &) {
-        return;
-      }
-      if (!allowed_result(url, request) || !seen.insert(url).second ||
-          results.size() >= static_cast<size_t>(request.limit))
-        return;
-      auto *container = node;
-      while (container->parent && !css(container, "result") && !tag(container, "tr"))
-        container = container->parent;
-      if (css(container, "result--ad") || css(container, "result--sponsored"))
-        return;
-      std::string snippet;
-      walk(container->first_child, [&](SearchNode *n) {
-        if (css(n, "result__snippet") || css(n, "result-snippet"))
-          snippet = node_text(n);
-      });
-      if (snippet.empty() && tag(container, "tr")) {
-        auto *row = next_element(container);
-        for (int i = 0; row && i < 3 && snippet.empty(); ++i, row = next_element(row)) {
-          bool next_result = false;
-          walk(row->first_child, [&](SearchNode *n) {
-            if (css(n, "result-link"))
-              next_result = true;
-            if (css(n, "result-snippet"))
-              snippet = node_text(n);
-          });
-          if (next_result)
-            break;
-        }
-      }
-      results.push_back({{"title", utf8_excerpt(node_text(node), 512)},
-                         {"url", url},
-                         {"snippet", utf8_excerpt(snippet, 2048)},
-                         {"rank", results.size() + 1}});
-    }
-    if (tag(node, "form")) {
-      Json fields = Json::object();
-      walk(node->first_child, [&](SearchNode *n) {
-        if (tag(n, "input") && lower(attribute(n, "type")) == "hidden") {
-          auto key = attribute(n, "name"), value = attribute(n, "value");
-          if (!key.empty() && key.size() < 128 && value.size() < 4096)
-            fields[key] = value;
-        }
-      });
-      if (fields.contains("q") && (fields.contains("s") || fields.contains("dc")) &&
-          !fields.contains("prev") && !fields.contains("previous"))
-        next = fields;
-    }
-  });
-  if (!recognized && low.find("no-results") == std::string::npos &&
-      low.find("no more results") == std::string::npos &&
-      low.find("no results found") == std::string::npos)
-    throw std::runtime_error("DuckDuckGo result format was not recognized");
-  auto provider_url = response.url;
-  Json result = {{"engine", "duckduckgo"},
-                 {"query", request.query},
-                 {"submitted_query", submitted_query(request)},
-                 {"results", results},
-                 {"empty", results.empty()},
-                 {"operator_warning",
-                  "DuckDuckGo may return related matches; verify constraints against sources"}};
-  if (!next.empty()) {
-    next["q"] = submitted_query(request);
-    auto cursor = Json{{"endpoint", provider_url},
-                       {"fields", next},
-                       {"query", request.query},
-                       {"include_domains", request.include_domains},
-                       {"exclude_domains", request.exclude_domains}}
-                      .dump();
-    if (cursor.size() <= 8192)
-      result["next_cursor"] = cursor;
-  }
-  return result;
-}
-Json DuckDuckGoEngine::search(const SearchRequest &request, const std::function<void()> &service) {
-  auto q = trim(request.query);
-  if (q.empty() || q.size() > 2048 || q.find_first_of("\r\n") != std::string::npos)
-    throw std::runtime_error("Search query must contain 1–2048 bytes on one line");
-  if (q.find('\\') != std::string::npos)
-    throw std::runtime_error("First-result redirects are unsupported");
-  std::istringstream tokens(q);
-  std::string token;
-  while (tokens >> token)
-    if (token.find('!') != std::string::npos)
-      throw std::runtime_error(
-          "DuckDuckGo bangs are unsupported; use the selected engine's results");
-  if (request.limit < 1 || request.limit > 10)
-    throw std::runtime_error("Search limit must be between 1 and 10");
-  validate_domains(request.include_domains);
-  validate_domains(request.exclude_domains);
-  auto endpoint = std::string("https://html.duckduckgo.com/html/");
-  Json fields = {{"q", submitted_query(request)}};
-  if (!request.cursor.empty()) {
-    if (request.cursor.size() > 8192)
-      throw std::runtime_error("Search cursor exceeds limit");
-    auto cursor = Json::parse(request.cursor);
-    if (cursor.at("query") != request.query ||
-        cursor.at("include_domains") != Json(request.include_domains) ||
-        cursor.at("exclude_domains") != Json(request.exclude_domains))
-      throw std::runtime_error("Search cursor belongs to another query or constraints");
-    endpoint = cursor.at("endpoint");
-    fields = cursor.at("fields");
-    if (endpoint != "https://html.duckduckgo.com/html/" &&
-        endpoint != "https://lite.duckduckgo.com/lite/")
-      throw std::runtime_error("Invalid DuckDuckGo cursor endpoint");
-    if (!fields.is_object() || fields.size() > 32 ||
-        fields.value("q", "") != submitted_query(request))
-      throw std::runtime_error("Invalid search pagination fields");
-    for (auto &[key, value] : fields.items())
-      if (!value.is_string() || key.size() > 128 ||
-          value.get_ref<const std::string &>().size() > 4096)
-        throw std::runtime_error("Invalid search pagination field");
-  }
-  auto form = [&] {
-    std::string body;
-    for (auto &[key, value] : fields.items()) {
-      if (!body.empty())
-        body += '&';
-      body += web_encode(key) + "=" + web_encode(value.get<std::string>());
-    }
-    return body;
-  };
-  auto response = transport_(endpoint, form(), service);
-  // One endpoint fallback for a server-side failure; challenges and rate limits remain visible.
-  if (request.cursor.empty() && (response.status >= 500 || response.status == 404))
-    response = transport_("https://lite.duckduckgo.com/lite/", form(), service);
-  return parse(response, request);
-}
-std::unique_ptr<SearchEngine> make_search_engine(const std::string &name, WebTransport transport) {
-  if (name == "duckduckgo")
-    return std::make_unique<DuckDuckGoEngine>(std::move(transport));
-  throw std::runtime_error("Unsupported search engine: " + name);
-}
 WebResearch::WebResearch(Database &db, Config config, WebTransport transport)
     : db_(db), config_(std::move(config)), transport_(std::move(transport)),
-      engine_(make_search_engine(config_.search_engine, transport_)) {
+      engine_(std::make_unique<SearchOrchestrator>(db_, config_, transport_)) {
   web::WebLimits limits;
   limits.allow_private_network = config_.web_allow_private_network;
   limits.max_rendered_tokens = config_.web_output_tokens;
   acquisition_ = std::make_shared<web::WebAcquisitionEngine>(&db_, transport_, limits);
 }
+WebResearch::~WebResearch() = default;
+std::string WebResearch::guidance() const { return engine_->guidance(); }
 void WebResearch::begin_turn(Id session, Id task) {
   session_ = session;
   task_ = task;
@@ -813,7 +534,7 @@ void WebResearch::account_for_pending(Id session, Id task, const Emit &emit) {
   disclose_failures(session, task, emit);
 }
 
-Json WebResearch::dispatch(const std::string &name, const Json &args, Id session, Id task) {
+Json WebResearch::dispatch(const std::string &name, const Json &args, Id session, Id task, const Emit &emit) {
   session_ = session;
   task_ = task;
   if (name == "research_question")
@@ -877,7 +598,8 @@ Json WebResearch::dispatch(const std::string &name, const Json &args, Id session
         throw std::runtime_error("Unknown stored search cursor; repeat the search");
       request.cursor = cursor[0]["cursor_json"];
     }
-    auto result = engine_->search(request, [&] { network_control(); });
+    SearchContext context; context.human_initiated = true; context.service = [&] { network_control(); }; context.emit = emit;
+    auto result = engine_->search(request, context);
     if (result.contains("next_cursor")) {
       auto token = "cursor:" + uuid();
       db_.exec("INSERT INTO web_search_cursors(token,cursor_json,created_at) VALUES(?,?,?)",
@@ -888,7 +610,7 @@ Json WebResearch::dispatch(const std::string &name, const Json &args, Id session
     }
     db_.transaction([&] {
       auto ev = db_.event("web.search_observed",
-                          {{"engine", config_.search_engine},
+                          {{"engine", result["engine"]},
                            {"query", request.query},
                            {"submitted_query", result["submitted_query"]},
                            {"results", result["results"]}},
@@ -898,7 +620,7 @@ Json WebResearch::dispatch(const std::string &name, const Json &args, Id session
             db_.exec("INSERT INTO "
                      "web_sources(session_id,task_id,kind,engine,url,title,query,retrieved_at,"
                      "content_hash,text,source_event_id) VALUES(?,?,'search',?,?,?,?,?,?,?,?)",
-                     {session, task ? Json(task) : Json(), config_.search_engine, entry["url"],
+                     {session, task ? Json(task) : Json(), result["engine"], entry["url"],
                       entry["title"], result["submitted_query"], now(),
                       digest(entry["snippet"].get<std::string>()), entry["snippet"], ev});
       }

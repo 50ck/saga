@@ -53,7 +53,15 @@ struct Config {
   bool reasoning_control=false,stream_assistant_text=true;
   bool allow_small_context = false, insecure_tls = false;
   int timeout_seconds = 600, max_tool_rounds = 24;
-  std::string search_engine = "duckduckgo";
+  std::string search_engine = "duckduckgo"; // Legacy first-choice setting.
+  std::vector<std::string> search_engines;
+  int duckduckgo_min_request_interval_ms = 1000, duckduckgo_challenge_backoff_ms = 60000;
+  int search_cache_ttl_seconds = 600, search_total_timeout_seconds = 45, search_max_engine_attempts = 2;
+  int fourget_directory_ttl_seconds = 21600, fourget_probe_ttl_seconds = 300;
+  int fourget_failure_backoff_ms = 60000, fourget_max_instance_attempts = 6;
+  int fourget_probe_timeout_seconds = 3, fourget_request_timeout_seconds = 10;
+  std::vector<std::string> fourget_manual_instances;
+  bool fourget_prefer_manual = true, fourget_allow_private_instances = false;
   int web_search_limit = 4, web_read_limit = 8;
   bool web_allow_private_network=false;
   size_t web_output_tokens=4096;

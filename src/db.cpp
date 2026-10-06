@@ -67,7 +67,7 @@ void Database::transaction(const std::function<void()>& operation) {
 void Database::migrate() {
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  if (version > 9) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if (version > 10) throw std::runtime_error("Database schema is newer than this Saga binary");
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -136,6 +136,13 @@ void Database::migrate() {
     }
     sql("CREATE UNIQUE INDEX IF NOT EXISTS turns_user_message ON turns(session_id,user_message_id) WHERE user_message_id IS NOT NULL; CREATE TABLE IF NOT EXISTS tool_dispatch_keys(turn_id TEXT NOT NULL REFERENCES turns(id),tool_call_id TEXT NOT NULL,run_id INTEGER NOT NULL REFERENCES tool_runs(id),PRIMARY KEY(turn_id,tool_call_id)); UPDATE schema_version SET version=9;");
   });
+  if(version<10)transaction([&]{sql(R"SQL(
+    CREATE TABLE IF NOT EXISTS search_result_cache(cache_key TEXT PRIMARY KEY,response_json TEXT NOT NULL CHECK(json_valid(response_json)),expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS search_instance_cache(origin TEXT PRIMARY KEY,state_json TEXT NOT NULL CHECK(json_valid(state_json)),updated_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS search_directory_cache(directory TEXT PRIMARY KEY,origins_json TEXT NOT NULL CHECK(json_valid(origins_json)),updated_at INTEGER NOT NULL);
+    UPDATE schema_version SET version=10;
+  )SQL");});
+
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {
   return exec("INSERT INTO events(ts,session_id,task_id,type,payload_json) VALUES(?,?,?,?,?)",

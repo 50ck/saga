@@ -1,6 +1,7 @@
 #include <saga/tools.hpp>
 #include <saga/edit.hpp>
 #include <saga/web/acquisition.hpp>
+#include <saga/search.hpp>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -376,6 +377,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
     if(emit)emit("tool.cancelled",{{"run_id",run},{"tool",name}});
     throw;
   } catch (const web::Error& e) { result = {{"error",e.what()},{"error_type",web::error_name(e.code)}}; }
+  catch (const SearchError& e) { result = {{"error",e.what()},{"error_type",search_error_name(e.code)}}; }
   catch (const std::exception& e) { result = {{"error",e.what()}}; }
   bool failed = result.contains("error") || (result.contains("exit_code") && result["exit_code"] != 0);
   p_.db->exec("UPDATE internal_state SET frustration=max(0,min(1,frustration+?)),confidence=max(0.05,min(0.95,confidence+?)),engagement=min(1,engagement+0.02),satisfaction=max(0,min(1,satisfaction+?)),updated_at=? WHERE id=1",{failed ? 0.15 : -0.03,failed ? -0.08 : 0.02,failed ? -0.1 : 0.03,now()});
@@ -391,7 +393,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
 }
 Json Tools::dispatch(const std::string& name,const Json& a) {
   auto db = p_.db.get();
-  if(name.starts_with("web_") || name.starts_with("research_"))return web_.dispatch(name,a,p_.session,p_.task);
+  if(name.starts_with("web_") || name.starts_with("research_"))return web_.dispatch(name,a,p_.session,p_.task,events_);
   bool implementation=name=="file_write" || name=="file_edit" || name=="shell_exec";
   if(implementation)web_.account_for_pending(p_.session,p_.task,events_);
   web_.disclose_failures(p_.session,p_.task,events_);

@@ -153,7 +153,7 @@ void ChatView::event(const std::string& type,const Json& p) {
     if (!partial.empty()) { entries.push_back({name,std::exchange(partial,""),false,0,0,{},true}); }
     auto args=p.value("arguments",Json::object());
     std::string text=name+(tool == "shell_exec" ? " is opening a terminal..." : " is using "+tool+"...");
-    if(tool=="web_search"){auto engine=agent_status.value("web",Json::object()).value("engine","duckduckgo");text=name+" is searching "+(engine=="duckduckgo" ? "DuckDuckGo" : engine)+"...\n"+args.value("query","");}
+    if(tool=="web_search"){text=name+" is searching the web...\n"+args.value("query","");}
     if(tool=="web_read" || tool=="web_fetch")text=name+" is reading a source...\n"+(args.contains("url") ? args["url"].get<std::string>() : "Source "+std::to_string(args.value("source_id",0LL)));
     if (tool != "shell_exec" && args.contains("path")) text += "\n"+args.at("path").get<std::string>();
     entries.push_back({"",text,true,p.value("run_id",0LL),now(),tool == "shell_exec" ? args.value("command","") : ""});
@@ -217,6 +217,7 @@ void ChatView::event(const std::string& type,const Json& p) {
     permission_menu=true; agent_status["permissions"]=p;
     entries.push_back({"Saga","Execution permissions (this persona)\nCurrent: "+p.value("label","")+"\n\nGuarded host:\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations.\n\nUnrestricted host:\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS).\n\nUnrestricted host runs as your OS user without Saga isolation, including access to private Saga storage. System/container restrictions still apply.\nChoose 1, 2, 3 or 4 and press Enter. File edits/workspace changes also ask in 1/3 and are automatic in 2/4. Sandbox shell actions stay automatic."});
   } else if(type=="web.changed") {agent_status["web"]=p;
+  } else if(type=="search.fallback") {entries.push_back({"",p.value("engine","")+" search unavailable ("+p.value("reason","")+"); trying another backend...",true});
   } else if(type=="research.warning") {entries.push_back({"Saga",p.value("content","")});
   } else if (type == "permissions.changed") { agent_status["permissions"]=p; permission_menu=false;
   } else if (type == "notification") entries.push_back({"Saga",p.value("description","")});
@@ -421,6 +422,7 @@ std::wstring ChatView::activity(bool busy) const {
   if(!approval_id.empty())return L"Awaiting approval: y / n · Tab/Enter selects · Esc stops";
   if(!busy && !activity_started)return {};
   if(phase=="prepare_operation")return chat_wide(name+" is preparing "+operation+"...");
+  if(phase=="waiting_for_model")return chat_wide(name+" is waiting for the model...");
   if(phase=="thinking")return chat_wide(name+" is thinking...");
   if(phase=="generating_tool")return chat_wide(name+" is generating a tool call...");
   if(generating)return chat_wide(name+(generated_tokens ? " is typing..." : " is preparing context..."));
