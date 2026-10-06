@@ -66,7 +66,7 @@ void Database::transaction(const std::function<void()>& operation) {
 void Database::migrate() {
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  if (version > 7) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if (version > 8) throw std::runtime_error("Database schema is newer than this Saga binary");
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -114,6 +114,19 @@ void Database::migrate() {
     CREATE TRIGGER IF NOT EXISTS web_source_documents_no_delete BEFORE DELETE ON web_source_documents BEGIN SELECT RAISE(ABORT,'Canonical source snapshots are immutable'); END;
     UPDATE schema_version SET version=7;
   )SQL");});
+  if(version<8)transaction([&]{sql(R"SQL(
+    CREATE TABLE IF NOT EXISTS turns(id TEXT PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),status TEXT NOT NULL,phase TEXT NOT NULL,started_at INTEGER NOT NULL,ended_at INTEGER,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,sequence_number INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS generations(id INTEGER PRIMARY KEY REFERENCES model_calls(id),turn_id TEXT REFERENCES turns(id),session_id INTEGER REFERENCES sessions(id),purpose TEXT NOT NULL,status TEXT NOT NULL,started_at INTEGER NOT NULL,ended_at INTEGER,requested_max_output_tokens INTEGER NOT NULL,effective_max_output_tokens INTEGER NOT NULL,input_estimate INTEGER NOT NULL,state_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(state_json)));
+    CREATE INDEX IF NOT EXISTS generations_turn ON generations(turn_id,id);
+  )SQL");
+    auto columns=query("PRAGMA table_info(tool_runs)");
+    for(auto [name,type]:{std::pair{"turn_id","TEXT REFERENCES turns(id)"},{"generation_id","INTEGER REFERENCES generations(id)"},{"tool_call_id","TEXT"}}) {
+      bool exists=false;for(auto& column:columns)if(column["name"]==name)exists=true;
+      if(!exists)sql(std::string("ALTER TABLE tool_runs ADD COLUMN ")+name+" "+type);
+    }
+    sql("UPDATE schema_version SET version=8");
+  });
+
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {
   return exec("INSERT INTO events(ts,session_id,task_id,type,payload_json) VALUES(?,?,?,?,?)",

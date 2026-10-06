@@ -19,7 +19,8 @@ struct PersonaContext {
   std::unique_ptr<Database> db;
   std::vector<fs::path> private_roots;
   Json host_environment = Json::object();
-  Id session = 0, project = 0, task = 0;
+  Id session = 0, project = 0, task = 0, generation = 0;
+  std::string turn,tool_call;
   int lock_fd = -1;
   PersonaContext(const Paths& paths, const Json& metadata, const fs::path& cwd);
   ~PersonaContext();

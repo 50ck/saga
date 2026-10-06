@@ -1,10 +1,11 @@
 #include "check.hpp"
+#include "mock_model.hpp"
 #include <saga/runtime.hpp>
 #include <algorithm>
 #include <thread>
 using namespace saga;
 namespace {
-class TestBackend : public ModelBackend {
+class TestBackend : public MockChatBackend {
   std::shared_ptr<Json> log_;
 public:
   bool fail = false;
@@ -44,7 +45,7 @@ public:
       }
       if (m["role"] == "system") { auto s=m.value("content",""); std::string prefix="Persistent working state (data):\n"; auto at=s.find(prefix); if (at != std::string::npos) state=Json::parse(s.substr(at+prefix.size())); }
     }
-    if(input=="Empty always" || (input=="Empty once" && !state.value("attention",Json::object()).contains("empty_response_recovery"))) {
+    if(input=="Empty always" || (input=="Empty once" && !state.value("attention",Json::object()).contains("generation_continuation"))) {
       cb({{"choices",Json::array({{{"index",0},{"delta",{{"reasoning_content","Internal reasoning only"}}},{"finish_reason","stop"}}})}});return;
     }
     if(input=="Public progress" && request.messages.back()["role"]!="tool" && request.messages.dump().find("published")==std::string::npos) {
@@ -137,7 +138,7 @@ int main() {
     CHECK(review_steering && runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="delivered");
     CHECK(runtime->command("tasks")[0]["status"]=="verifying");
     CHECK(runtime->persona().db->query("SELECT * FROM events WHERE type='assistant.completion_gated'").size()==1);
-    CHECK(events[events.size()-2]["type"]=="assistant.completed" && events.back()["type"]=="turn.finished"); CHECK(events[events.size()-2]["payload"]["content"].get<std::string>().starts_with("The task is not complete"));
+    CHECK(events[events.size()-3]["type"]=="assistant.completed" && events.back()["type"]=="turn.finished"); CHECK(events[events.size()-3]["payload"]["content"].get<std::string>().starts_with("The task is not complete"));
     bool fresh_review=false; for (auto& messages:*log) if (messages.size()==2 && messages[1].value("content","").starts_with("Independently review")) fresh_review=true; CHECK(fresh_review);
     runtime->close("user_exit"); runtime.reset();
     runtime=activate(b); runtime->start();bool successful_review_steering=false;
@@ -156,8 +157,8 @@ int main() {
     CHECK(exact_updates>=3 && last_exact==10005);CHECK(runtime->command("status")["usage"]["used_tokens"]==10005);
     CHECK(runtime->command("status")["usage"]["cached_input_tokens"]==8500);
     CHECK(!runtime->persona().db->query("SELECT id FROM events WHERE session_id=? AND type='model.cache_observed'",{same_session}).empty());
-    events=Json::array();runtime->chat("Empty once",emit);CHECK(events[events.size()-2]["type"]=="assistant.completed" && events.back()["type"]=="turn.finished");CHECK(!events[events.size()-2]["payload"]["content"].get<std::string>().empty());
-    auto calls_before=log->size();rejects([&]{runtime->chat("Empty always",emit);});CHECK(log->size()==calls_before+2);
+    events=Json::array();runtime->chat("Empty once",emit);CHECK(events[events.size()-3]["type"]=="assistant.completed" && events.back()["type"]=="turn.finished");CHECK(!events[events.size()-3]["payload"]["content"].get<std::string>().empty());
+    auto calls_before=log->size();rejects([&]{runtime->chat("Empty always",emit);});CHECK(log->size()==calls_before+static_cast<size_t>(config.max_continuations+1));
     events=Json::array();runtime->chat("Public progress",emit);
     CHECK(std::any_of(events.begin(),events.end(),[](auto& e){return e["type"]=="progress.updated" && !e["payload"].value("complete",true);}));
     CHECK(!runtime->persona().db->query("SELECT id FROM events WHERE type='progress.completed'").empty());

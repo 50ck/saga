@@ -32,11 +32,16 @@ class Runtime {
   CognitiveMode current_mode_ = CognitiveMode::Respond;
   std::function<void()> service_;
   bool active_=false,cancelled_=false;
+  std::optional<TurnState> turn_;
+  GenerationState last_generation_;
+  void journal(std::string type,Json payload,Emit emit = {},bool durable=true);
+  void phase(TurnPhase next,Emit emit);
+  void finish_turn(TurnStatus status,Emit emit);
   void chat_turn(std::string input,Emit emit);
   void cancel_turn(Emit emit);
   bool steering_pending();
   void deliver_steering(Emit emit);
-  Completion call(ChatRequest request,const std::string& purpose,Emit emit);
+  GenerationState call(ChatRequest request,const std::string& purpose,Emit emit);
   Json structured(std::string name,std::string prompt,Json properties,Json required,Emit emit = {});
   void consolidate(Id session,bool use_model);
   void extract_memory(Id session,bool final = true,Emit emit = {});

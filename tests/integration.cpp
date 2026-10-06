@@ -50,6 +50,8 @@ class MockModel {
     if (forced == "submit_memory_extraction") return tool(forced,{{"facts",Json::array()},{"praxis",Json::array()}});
     const auto& messages = request.at("messages"); size_t user_at = 0; std::string input;
     for (size_t i=0; i<messages.size(); ++i) if (messages[i]["role"] == "user" && !messages[i].value("content",std::string()).starts_with("Runtime attention update (data):\n")) { user_at=i; input=messages[i].value("content",""); }
+    if(input=="Output limit fixture" && messages.dump().find("generation_continuation")==std::string::npos)
+      return {{"role","assistant"},{"content",""},{"reasoning_content",std::string(48,'r')},{"_fixture_finish","length"}};
     if (input.starts_with("Create artifact")) {
       Json state = Json::object();
       for (auto& m : messages) if (m["role"] == "system" && m["content"].is_string()) {
@@ -81,7 +83,14 @@ class MockModel {
     while (raw.size()-header_end-4<length) { auto n=recv(fd,buffer,sizeof buffer,0); if (n<=0) return; raw.append(buffer,static_cast<size_t>(n)); }
     auto first=headers.substr(0,headers.find("\r\n")); auto request=length ? Json::parse(raw.substr(header_end+4,length)) : Json::object();
     { std::lock_guard lock(mutex_); requests_.push_back({{"line",first},{"headers",headers},{"body",request}}); }
-    auto response=[&](std::string body,std::string type="application/json",int code=200) { send_all(fd,"HTTP/1.1 "+std::to_string(code)+" OK\r\nContent-Type: "+type+"\r\nContent-Length: "+std::to_string(body.size())+"\r\nConnection: close\r\n\r\n"+body); };
+    auto response=[&](std::string body,std::string type="application/json",int code=200) {
+      auto declared=body.size()+(type=="text/event-stream" && premature.exchange(false)?20:0);
+      auto headers="HTTP/1.1 "+std::to_string(code)+" OK\r\nContent-Type: "+type+"\r\nContent-Length: "+std::to_string(declared)+"\r\nConnection: close\r\n\r\n";
+      if(type=="text/event-stream" && slow_stream.exchange(false)) {
+        send_all(fd,headers);size_t step=std::max<size_t>(1,body.size()/5);
+        for(size_t offset=0;offset<body.size();offset+=step){send_all(fd,std::string_view(body).substr(offset,step));std::this_thread::sleep_for(std::chrono::milliseconds(300));}
+      }else send_all(fd,headers+body);
+    };
     if (first.starts_with("GET ") && first.find("/models ") != std::string::npos) { Json m={{"id","mock-model"}}; if (metadata) m["meta"]={{"n_ctx",context.load()}}; response(Json{{"data",Json::array({m})}}.dump()); return; }
     if (first.starts_with("GET ") && first.find("/props ") != std::string::npos) { if (props) response(Json{{"default_generation_settings",{{"n_ctx",context.load()}}}}.dump()); else response("{}","application/json",404); return; }
     if (first.find("/chat/completions ") == std::string::npos) { response("{}","application/json",404); return; }
@@ -91,23 +100,24 @@ class MockModel {
       while (!resume && std::chrono::steady_clock::now()<deadline) std::this_thread::sleep_for(std::chrono::milliseconds(10));
       waiting=false;
     }
-    auto message=reply(request); std::string reason=message.contains("tool_calls") ? "tool_calls" : "stop";
+    auto message=reply(request); std::string reason=message.value("_fixture_finish",message.contains("tool_calls") ? "tool_calls" : "stop");
     if (!request.value("stream",false)) { response(Json{{"choices",Json::array({{{"index",0},{"message",message},{"finish_reason",reason}}})}}.dump()); return; }
     std::string body;
     auto chunk=[&](Json delta,Json finish=Json()) { body+="data: "+Json{{"choices",Json::array({{{"index",0},{"delta",delta},{"finish_reason",finish}}})}}.dump()+"\r\n\r\n"; };
+    if(message.contains("reasoning_content"))chunk({{"reasoning_content",message["reasoning_content"]}});
     if (message.contains("tool_calls")) {
       auto call=message["tool_calls"][0]; auto args=call["function"]["arguments"].get<std::string>(); auto first_call=call;
       first_call["index"]=0; first_call["function"]["arguments"]=args.substr(0,args.size()/2); chunk({{"tool_calls",Json::array({first_call})}});
       chunk({{"tool_calls",Json::array({{{"index",0},{"function",{{"arguments",args.substr(args.size()/2)}}}}})}},reason);
-    } else { auto content=message.value("content",""); chunk({{"content",content.substr(0,content.size()/2)}}); chunk({{"content",content.substr(content.size()/2)}},reason); }
-    body+="data: "+Json{{"choices",Json::array()},{"usage",{{"prompt_tokens",123},{"completion_tokens",21}}}}.dump()+"\n\n";
-    if (!truncated) body+="data: [DONE]\n\n";
+    } else { auto content=message.value("content",""); chunk({{"content",content.substr(0,content.size()/2)}}); chunk({{"content",content.substr(content.size()/2)}},unfinished ? Json() : Json(reason)); }
+    body+="data: "+Json{{"choices",Json::array()},{"usage",{{"prompt_tokens",123},{"completion_tokens",reason=="length"?request.value("max_tokens",21):21}}}}.dump()+"\n\n";
+    if (!truncated && !unfinished) body+="data: [DONE]\n\n";
     response(body,"text/event-stream");
   }
 public:
   std::atomic<std::uint64_t> context=65536;
-  std::atomic_bool metadata=true,props=true,tool_support=true,reject_usage=false,truncated=false;
-  std::atomic_bool pause=false,waiting=false,resume=false;
+  std::atomic_bool metadata=true,props=true,tool_support=true,reject_usage=false,truncated=false,unfinished=false;
+  std::atomic_bool pause=false,waiting=false,resume=false,slow_stream=false,premature=false;
   std::string endpoint;
   MockModel() {
     listener_=socket(AF_INET,SOCK_STREAM | SOCK_CLOEXEC,0); CHECK(listener_>=0);
@@ -178,10 +188,28 @@ void model_contracts(MockModel& mock) {
   mock.props=false; CHECK(!OpenAICompatibleBackend(c).discover().context_length); mock.metadata=true; mock.props=true;
   mock.tool_support=false; rejects([&]{ backend.probe(); }); mock.tool_support=true;
   mock.reject_usage=true; CHECK(backend.probe().streaming); mock.reject_usage=false;
-  mock.truncated=true; ChatRequest r; r.messages=Json::array({{{"role","user"},{"content","hello"}}}); rejects([&]{ backend.chat(r,[](auto&){}); }); mock.truncated=false;
+  mock.truncated=true; ChatRequest r; r.messages=Json::array({{{"role","user"},{"content","hello"}}});
+  GenerationState completed;backend.generate(r,[&](const ProviderEvent& event){completed.accept(event);});CHECK(completed.status==GenerationStatus::Completed);mock.truncated=false;
+  mock.premature=true;GenerationState retained;backend.generate(r,[&](const ProviderEvent& event){retained.accept(event);});CHECK(retained.status==GenerationStatus::Completed);
+  mock.unfinished=true;rejects([&]{backend.generate(r,[](const ProviderEvent&){});});mock.unfinished=false;
+  c.timeout_seconds=1;OpenAICompatibleBackend lively(c);lively.discover();mock.slow_stream=true;GenerationState long_stream;
+  auto started=std::chrono::steady_clock::now();lively.generate(r,[&](const ProviderEvent& event){long_stream.accept(event);});
+  CHECK(long_stream.status==GenerationStatus::Completed && std::chrono::steady_clock::now()-started>std::chrono::seconds(1));
   c.api_key="test-key"; OpenAICompatibleBackend(c).discover();
   CHECK(mock.requests().back()["headers"].get<std::string>().find("Authorization: Bearer test-key")!=std::string::npos);
   for (auto& request:mock.requests()) CHECK(request["line"].get<std::string>().find("/v1/v1")==std::string::npos);
+}
+void http_continuation(MockModel& mock) {
+  Environment fixture;Registry registry(fixture.paths);Config config;config.endpoint=mock.endpoint;config.model="mock-model";config.context_length=65536;config.default_max_output_tokens=16;config.hard_max_output_tokens=32;
+  auto identity=registry.create("HTTP continuation fixture","");
+  Runtime runtime(std::make_unique<PersonaContext>(fixture.paths,identity,fixture.project),config,std::make_unique<OpenAICompatibleBackend>(config),[](auto&,auto&){return true;});runtime.start();
+  Json events=Json::array();runtime.chat("Output limit fixture",[&](const std::string& type,const Json& payload){events.push_back({{"type",type},{"payload",payload}});});
+  auto turns=runtime.persona().db->query("SELECT * FROM turns");CHECK(turns.size()==1 && turns[0]["status"]=="completed");
+  auto segments=runtime.persona().db->query("SELECT * FROM generations ORDER BY id");CHECK(segments.size()==2 && segments[0]["status"]=="output_limit");
+  CHECK(segments[0]["effective_max_output_tokens"]==16 && segments[1]["effective_max_output_tokens"]==32);
+  CHECK(segments[0]["turn_id"]==segments[1]["turn_id"]);
+  auto state=Json::parse(segments[0]["state_json"].get<std::string>());CHECK(state["reasoning"].get<std::string>().size()==48);
+  CHECK(std::none_of(events.begin(),events.end(),[](auto& e){return e["type"]=="generation.empty_recovery" || e["type"]=="generation.retry";}));
 }
 void end_to_end(MockModel& mock,const std::string& daemon,const std::string& client) {
   Environment env; env.start(daemon); Peer peer(env.paths.socket());
@@ -260,6 +288,6 @@ int main(int argc,char** argv) {
   int probe = socket(AF_INET,SOCK_STREAM | SOCK_CLOEXEC,0);
   if (probe < 0 && (errno == EPERM || errno == EACCES)) { std::cout << "SKIP HTTP/daemon integration: environment denies local TCP sockets\n"; return 77; }
   if (probe >= 0) close(probe);
-  try { CHECK(argc==3); MockModel mock; model_contracts(mock); std::cout << "PASS HTTP probes, context detection, SSE fragments, API keys, usage fallback and interrupted streams\n"; end_to_end(mock,fs::canonical(argv[1]).string(),fs::canonical(argv[2]).string()); std::cout << "PASS daemon and CLI: creation, setup, tools, approvals, proof gates, journals, switching, isolation and restart recall\n"; return 0; }
+  try { CHECK(argc==3); MockModel mock; model_contracts(mock);http_continuation(mock); std::cout << "PASS HTTP probes, context detection, SSE fragments, API keys, usage fallback and interrupted streams\n"; end_to_end(mock,fs::canonical(argv[1]).string(),fs::canonical(argv[2]).string()); std::cout << "PASS daemon and CLI: creation, setup, tools, approvals, proof gates, journals, switching, isolation and restart recall\n"; return 0; }
   catch (const std::exception& e) { std::cerr << "FAIL integration: " << e.what() << '\n'; return 1; }
 }

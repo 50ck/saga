@@ -343,6 +343,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   try { validate(args,(*it)["function"]["parameters"]); } catch (const std::exception& e) { return {{"error",e.what()}}; }
   Id started = now();
   Id run = p_.db->exec("INSERT INTO tool_runs(session_id,task_id,tool,arguments_json,started_at,status) VALUES(?,?,?,?,?,'running')",{p_.session,p_.task ? Json(p_.task) : Json(),name,args.dump(),started});
+  p_.db->exec("UPDATE tool_runs SET turn_id=?,generation_id=?,tool_call_id=? WHERE id=?",{p_.turn.empty()?Json():Json(p_.turn),p_.generation?Json(p_.generation):Json(),p_.tool_call.empty()?Json():Json(p_.tool_call),run});
   p_.db->event("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}},p_.session,p_.task);
   if (emit && name!="report_progress") emit("tool.started",{{"run_id",run},{"tool",name},{"arguments",args}});
   auto previous_output=std::move(output_);

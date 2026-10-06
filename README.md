@@ -70,7 +70,7 @@ formatting, then the completed response is parsed from its original Markdown.
 Ambiguous constructs can change appearance as more text arrives; stored messages
 are never modified. Unchanged bubbles are cached; resizing rebuilds layout.
 Strikes use a combining stroke through the text, and italic appearance depends
-on terminal support. Public `report_progress` commentary streams separately from completion claims; commands stream bounded stdout/stderr while running. Empty model replies get one recovery attempt and then a visible error, never an empty bubble. `/steer PROMPT` queues instructions for the next model call in the same session, after the current command and approval finish. `/stop`, Ctrl+C or Esc interrupt active work and cancel queued steering while preserving completed changes.
+on terminal support. Public `report_progress` commentary streams separately from completion claims; commands stream bounded stdout/stderr while running. Genuinely empty generations get one recovery attempt. Reasoning-only and output-limit segments are preserved and continue within the same turn; they are never treated as empty replies. `/steer PROMPT` queues instructions for the next model call in the same session, after the current command and approval finish. `/stop`, Ctrl+C or Esc interrupt active work and cancel queued steering while preserving completed changes.
 
 `/help`, `/status`, `/permissions`, `/web` and inspection commands
 remain available while the agent waits for the model, streams a reply, runs a tool
@@ -269,16 +269,23 @@ with a strong record for habitual. Promotion requires actual task outcomes and
 passed checks. Habitual procedures can become approved tool macros; their actions
 still pass the action gate.
 
+The provider adapter emits normalized reasoning, commentary, text, tool-fragment,
+usage and termination events. Durable turns own generation segments and tool
+executions, with separate IDs, checkpoints and an append-only journal. Output-limit
+continuations and transient transport retries retain progress and committed tool
+results. See [Generation lifecycle](docs/generation-runtime.md) for architecture,
+limits, configuration, recovery guarantees and tests.
+
 Default context reserves 8,192 tokens for generation and 2,048 for safety. Without
 a model tokenizer, the builder uses a conservative byte upper estimate, leaving
 capacity unused. For detected llama.cpp endpoints, Saga requests `timings_per_token`
 and `return_progress` on the normal chat-completions stream. Context uses
 `prompt_n + cache_n + predicted_n`, including reused cache tokens. Prompt progress
 can report the full input count before generation. Exact streamed counts update
-the UI at most every 150 ms; no `~` is shown once both counts are available.
+the UI at most every 100 ms; no `~` is shown once both counts are available.
 While generating, a separate `+N` shows generated tokens individually so progress
 remains visible between changes in the rounded K total (`+~N` for estimates).
-The typing indicator appears only once the current stream has generated tokens;
+Reasoning shows an in-place thinking indicator; public text shows typing once generated tokens arrive;
 connection and prompt processing show “is preparing context...” beforehand.
 If a server omits those fields, the UI estimates input plus generated content,
 reasoning and tool arguments and marks it with `~`. Final standard usage is

@@ -112,6 +112,15 @@ std::vector<std::wstring> chat_wrap(std::wstring_view text,int width) {
 void ChatView::event(const std::string& type,const Json& p) {
   if(!approval_id.empty() && approval.value("kind","")=="edit" && (type=="help" || type=="result" || type=="command.error" || type=="permissions.menu"))approval_hidden=true;
   if (type == "session.started") { name=p.value("name",name); model=p.value("model",model); context=p.value("context_length",context); task.clear(); agent_status["task"]=Json::array(); }
+  else if(type=="generation.started"){generating=false;generated_tokens=0;phase="waiting_for_model";}
+  else if(type=="turn.phase"){phase=p.value("phase","waiting_for_model");}
+  else if(type=="reasoning.started"){phase="thinking";generating=true;}
+  else if(type=="assistant.text.started"){phase="answering";generating=true;}
+  else if(type=="tool.call.started"){phase="generating_tool";generating=true;}
+  else if(type=="generation.completed" || type=="generation.interrupted"){generating=false;}
+  else if(type=="commentary.completed" || type=="assistant.segment.completed") {
+    auto text=p.value("content","");if(!trim(text).empty())entries.push_back({name,text,false,0,0,{},true});partial.clear();
+  }
   else if (type == "assistant.delta") partial += p.value("content","");
   else if(type=="help")entries.push_back({"Saga",p.at("content").get<std::string>(),false,0,0,{},true,true});
   else if (type == "assistant.completed") { auto text=p.value("content","");if(!trim(text).empty())entries.push_back({name,text,false,0,0,{},true});else entries.push_back({"Saga","The model returned an empty response."});partial.clear(); }
@@ -412,6 +421,8 @@ std::wstring ChatView::activity(bool busy) const {
   if(!approval_id.empty())return L"Awaiting approval: y / n · Tab/Enter selects · Esc stops";
   if(!busy && !activity_started)return {};
   if(phase=="prepare_operation")return chat_wide(name+" is preparing "+operation+"...");
+  if(phase=="thinking")return chat_wide(name+" is thinking...");
+  if(phase=="generating_tool")return chat_wide(name+" is generating a tool call...");
   if(generating)return chat_wide(name+(generated_tokens ? " is typing..." : " is preparing context..."));
   return chat_wide(name+(phase=="research" ? " is researching..." : phase=="act" ? " is running a tool..." : phase=="verify" ? " is verifying..." : phase=="reflect" ? " is saving memory..." : " is preparing context..."));
 }
@@ -476,8 +487,14 @@ ChatAction chat_ui(ChatView view,const std::function<void(const std::string&,Emi
     }
     if(type=="tool.started") {
       auto summary=p;auto args=p.value("arguments",Json::object());summary["arguments"]=Json::object();
-      for(auto key:{"path","command"})if(args.contains(key) && args[key].is_string())summary["arguments"][key]=utf8_excerpt(args[key].get<std::string>(),16384);
+      for(auto key:{"path","command","query","url","source_id"})if(args.contains(key)){if(args[key].is_string())summary["arguments"][key]=utf8_excerpt(args[key].get<std::string>(),16384);else summary["arguments"][key]=args[key];}
       pending.emplace_back(type,std::move(summary));return;
+    }
+    if(type=="assistant.delta") {
+      auto text=p.value("content","");
+      if(output_bytes+text.size()>4*1024*1024)return;
+      output_bytes+=text.size();
+      if(!pending.empty() && pending.back().first==type){pending.back().second["content"]=pending.back().second.value("content","")+text;return;}
     }
     if(type=="tool.output") {
       auto text=p.value("content","");

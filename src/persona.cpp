@@ -67,6 +67,15 @@ PersonaContext::PersonaContext(const Paths& paths, const Json& meta, const fs::p
         db->exec("UPDATE sessions SET ended_at=?,end_reason='crash_recovery',status='needs_consolidation' WHERE id=?",{now(),sid});
         db->event("session.closed",{{"reason","crash_recovery"}},sid);
       }
+      for(auto& turn:db->query("SELECT id FROM turns WHERE status='active'")) {
+        db->event("turn.interrupted",{{"turn_id",turn["id"]},{"reason","crash_recovery"},{"tool_replay","forbidden"}});
+        db->exec("UPDATE turns SET status='interrupted',ended_at=? WHERE id=?",{now(),turn["id"]});
+      }
+      for(auto& generation:db->query("SELECT id,turn_id FROM generations WHERE status IN ('created','streaming')")) {
+        db->event("generation.interrupted",{{"generation_id",generation["id"]},{"turn_id",generation["turn_id"]},{"reason","crash_recovery"}});
+        db->exec("UPDATE generations SET status='interrupted',state_json=json_set(state_json,'$.status','interrupted','$.interruption','crash_recovery'),ended_at=? WHERE id=?",{now(),generation["id"]});
+      }
+      for(auto& tool:db->query("SELECT id,turn_id,tool_call_id FROM tool_runs WHERE status='running'"))db->event("tool.execution.unknown_after_crash",tool);
       db->exec("UPDATE tool_runs SET status='failed',error_type='crash_recovery' WHERE status='running'");
       db->exec("UPDATE model_calls SET status='failed',error='crash_recovery' WHERE status='running'");
       for(auto& row:db->query("SELECT id FROM steering_messages WHERE status='queued'"))db->event("steering.cancelled",{{"id",row["id"]},{"reason","crash_recovery"}});

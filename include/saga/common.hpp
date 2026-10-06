@@ -15,7 +15,7 @@ using Json = nlohmann::json;
 namespace fs = std::filesystem;
 using Id = std::int64_t;
 using Emit = std::function<void(const std::string&, const Json&)>;
-inline constexpr int runtime_context_revision=8;
+inline constexpr int runtime_context_revision=9;
 struct TurnCancelled : std::runtime_error { TurnCancelled() : std::runtime_error("Stopped by user") {} };
 std::string json_string_prefix(std::string_view source,std::string_view key);
 bool live_command_allowed(std::string_view name,const Json& arguments = Json::object());
@@ -45,6 +45,12 @@ struct Paths {
 struct Config {
   std::string endpoint, api_key, model;
   std::uint64_t context_length = 0, generation_reserve = 8192, safety_margin = 2048;
+  // Zero default inherits generation_reserve for existing configurations.
+  std::uint64_t default_max_output_tokens=0,hard_max_output_tokens=32768;
+  int max_continuations=3,max_generation_retries=1;
+  std::string reasoning_budget="auto";
+  std::uint64_t reasoning_soft_budget=0,reasoning_hard_budget=0;
+  bool reasoning_control=false,stream_assistant_text=true;
   bool allow_small_context = false, insecure_tls = false;
   int timeout_seconds = 600, max_tool_rounds = 24;
   std::string search_engine = "duckduckgo";

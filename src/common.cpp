@@ -211,6 +211,15 @@ Config Config::load(const Paths& paths) {
       else if (k == "model") c.model = Json::parse(v).get<std::string>();
       else if (k == "context_length") c.context_length = Json::parse(v).get<std::uint64_t>();
       else if (k == "generation_reserve") c.generation_reserve = Json::parse(v).get<std::uint64_t>();
+      else if (k == "default_max_output_tokens") c.default_max_output_tokens = Json::parse(v).get<std::uint64_t>();
+      else if (k == "hard_max_output_tokens") c.hard_max_output_tokens = Json::parse(v).get<std::uint64_t>();
+      else if (k == "max_continuations") c.max_continuations = Json::parse(v).get<int>();
+      else if (k == "max_generation_retries") c.max_generation_retries = Json::parse(v).get<int>();
+      else if (k == "reasoning_budget") c.reasoning_budget = Json::parse(v).get<std::string>();
+      else if (k == "reasoning_soft_budget") c.reasoning_soft_budget = Json::parse(v).get<std::uint64_t>();
+      else if (k == "reasoning_hard_budget") c.reasoning_hard_budget = Json::parse(v).get<std::uint64_t>();
+      else if (k == "reasoning_control") c.reasoning_control = Json::parse(v).get<bool>();
+      else if (k == "stream_assistant_text") c.stream_assistant_text = Json::parse(v).get<bool>();
       else if (k == "safety_margin") c.safety_margin = Json::parse(v).get<std::uint64_t>();
       else if (k == "allow_small_context") c.allow_small_context = Json::parse(v).get<bool>();
       else if (k == "insecure_tls") c.insecure_tls = Json::parse(v).get<bool>();
@@ -239,6 +248,7 @@ void Config::save(const Paths& p) const {
   s << "# Saga: global OpenAI-compatible backend\n";
   Json fields = {{"endpoint",endpoint},{"api_key",api_key},{"model",model},{"context_length",context_length},
     {"generation_reserve",generation_reserve},{"safety_margin",safety_margin},{"allow_small_context",allow_small_context},
+    {"default_max_output_tokens",default_max_output_tokens},{"hard_max_output_tokens",hard_max_output_tokens},{"max_continuations",max_continuations},{"max_generation_retries",max_generation_retries},{"reasoning_budget",reasoning_budget},{"reasoning_soft_budget",reasoning_soft_budget},{"reasoning_hard_budget",reasoning_hard_budget},{"reasoning_control",reasoning_control},{"stream_assistant_text",stream_assistant_text},
     {"insecure_tls",insecure_tls},{"timeout_seconds",timeout_seconds},{"max_tool_rounds",max_tool_rounds},
     {"search_engine",search_engine},{"web_search_limit",web_search_limit},{"web_read_limit",web_read_limit},
     {"web_allow_private_network",web_allow_private_network},{"web_output_tokens",web_output_tokens},
@@ -253,6 +263,7 @@ void Config::validate() const {
     throw std::runtime_error("Saga requires at least 65,536 tokens of effective context. Detected: " + std::to_string(context_length) + ".");
   if (context_length <= generation_reserve || context_length - generation_reserve <= safety_margin)
     throw std::runtime_error("Generation reserve and safety margin leave no input budget");
+  if(hard_max_output_tokens<1 || hard_max_output_tokens>1048576 || default_max_output_tokens>hard_max_output_tokens || max_continuations<0 || max_continuations>16 || max_generation_retries<0 || max_generation_retries>3 || (reasoning_budget!="auto" && reasoning_budget!="fixed" && reasoning_budget!="disabled") || (reasoning_hard_budget && reasoning_soft_budget>reasoning_hard_budget))throw std::runtime_error("Invalid generation limits");
   (void)make_search_engine(search_engine); // The provider registry owns engine validation.
   if (web_search_limit < 1 || web_search_limit > 100 || web_read_limit < 1 || web_read_limit > 100 || web_output_tokens<128 || web_output_tokens>4096) throw std::runtime_error("Invalid web research limits");
   if (timeout_seconds < 1 || timeout_seconds > 1800 || max_tool_rounds < 1 || max_tool_rounds > 100)

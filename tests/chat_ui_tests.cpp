@@ -104,6 +104,17 @@ int main(int argc,char** argv) {
     view.event("session.started",{{"session_id",2}});
     CHECK(view.task.empty() && view.agent_status["task"].empty());
     CHECK(chat_utf8(view.status(120)).find("Inspect tmux")==std::string::npos);
+    view.event("generation.started",{{"generation_id",99}});
+    view.event("reasoning.started",{{"generation_id",99}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is thinking...");
+    view.event("context.usage",{{"output_tokens",8192},{"streaming",true}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is thinking...");
+    view.event("tool.call.started",{{"tool_call_id","prepared"}});
+    CHECK(chat_utf8(view.activity(true))==view.name+" is generating a tool call...");
+    view.event("commentary.completed",{{"content","A verified stage finished; moving to the next action."}});
+    CHECK(view.entries.back().text=="A verified stage finished; moving to the next action.");
+    view.event("turn.finished",Json::object());
+    CHECK(view.activity(false).empty());
     auto wide=view.lines(100); auto narrow=view.lines(20); CHECK(narrow.size() > wide.size());
     for (int width : {6,12,20,40,80,120}) {
       for (const auto& line : view.lines(width)) CHECK(chat_columns(line) <= width);

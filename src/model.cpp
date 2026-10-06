@@ -18,60 +18,103 @@ void SseParser::line(std::string_view s) {
 }
 void SseParser::feed(std::string_view s) {
   pending_.append(s);
-  if (pending_.size() + data_.size() > 4*1024*1024) throw std::runtime_error("SSE frame exceeds limit");
+  if (pending_.size() + data_.size() > 4*1024*1024) throw ProviderError(ProviderErrorKind::StreamParse,"SSE frame exceeds limit");
   size_t begin = 0, end;
   while ((end = pending_.find('\n',begin)) != std::string::npos) { line(std::string_view(pending_).substr(begin,end-begin)); begin = end+1; }
   pending_.erase(0,begin);
 }
 void SseParser::finish() { if (!pending_.empty()) { line(pending_); pending_.clear(); } line(""); }
-void Completion::accept(const Json& chunk) {
-  if (chunk.contains("error")) throw std::runtime_error("Model returned an error");
-  auto count=[](const Json& object,std::string_view key)->std::optional<std::uint64_t>{
-    auto it=object.find(std::string(key));if(it==object.end() || !it->is_number_integer() || (!it->is_number_unsigned() && it->get<std::int64_t>()<0))return {};
+void OpenAIStreamAdapter::feed(const Json& chunk) {
+  if(closed_)throw ProviderError(ProviderErrorKind::StreamParse,"Data after provider termination");
+  if(!chunk.is_object())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model stream chunk");
+  if(chunk.empty()){emit_({ProviderEventKind::Heartbeat});return;}
+  if(chunk.contains("error"))throw ProviderError(ProviderErrorKind::Semantic,"Model returned a provider error");
+  if(chunk.contains("id") && chunk["id"].is_string())provider_id_=chunk["id"];
+  emit_({ProviderEventKind::Activity});
+  auto count=[](const Json& object,const char* key)->std::optional<std::uint64_t>{
+    auto it=object.find(key);if(it==object.end() || !it->is_number_integer() || (!it->is_number_unsigned() && it->get<std::int64_t>()<0))return {};
     return it->get<std::uint64_t>();
   };
+  Json usage=Json::object();
+  auto put=[&](const Json& object,const char* source,const char* target){if(auto n=count(object,source))usage[target]=*n;};
   if(chunk.contains("timings") && chunk["timings"].is_object()) {
-    auto& timings=chunk["timings"];auto prompt=count(timings,"prompt_n"),cache=count(timings,"cache_n");
-    if(prompt && cache && *prompt<=UINT64_MAX-*cache)input_tokens=*prompt+*cache;
-    if(cache)cache_tokens=*cache;
-    if(auto output=count(timings,"predicted_n"))output_tokens=*output;
+    auto& t=chunk["timings"];auto prompt=count(t,"prompt_n"),cache=count(t,"cache_n");
+    if(prompt && cache && *prompt<=UINT64_MAX-*cache)usage["input_tokens"]=*prompt+*cache;
+    put(t,"cache_n","cached_tokens");put(t,"predicted_n","output_tokens");
   }
   if(chunk.contains("prompt_progress") && chunk["prompt_progress"].is_object()) {
-    if(auto total=count(chunk["prompt_progress"],"total"))input_tokens=*total;
-    if(auto cache=count(chunk["prompt_progress"],"cache"))cache_tokens=*cache;
+    auto& p=chunk["prompt_progress"];put(p,"total","input_tokens");put(p,"cache","cached_tokens");
   }
-  if (chunk.contains("usage") && chunk["usage"].is_object()) {
-    usage.update(chunk["usage"]);
-    if(auto input=count(usage,"prompt_tokens"))input_tokens=*input;
-    if(auto output=count(usage,"completion_tokens"))output_tokens=*output;
-    if(usage.contains("prompt_tokens_details") && usage["prompt_tokens_details"].is_object())if(auto cache=count(usage["prompt_tokens_details"],"cached_tokens"))cache_tokens=*cache;
+  if(chunk.contains("usage") && chunk["usage"].is_object()) {
+    auto& u=chunk["usage"];put(u,"prompt_tokens","input_tokens");put(u,"completion_tokens","output_tokens");
+    if(u.contains("prompt_tokens_details") && u["prompt_tokens_details"].is_object())put(u["prompt_tokens_details"],"cached_tokens","cached_tokens");
+    if(u.contains("completion_tokens_details") && u["completion_tokens_details"].is_object())put(u["completion_tokens_details"],"reasoning_tokens","reasoning_tokens");
   }
-  if (!chunk.contains("choices") || !chunk["choices"].is_array()) return;
-  for (auto& choice : chunk["choices"]) {
-    if (choice.value("index",0) != 0) continue;
-    saw_chunk = true;
-    if (choice.contains("finish_reason") && choice["finish_reason"].is_string()) finish_reason = choice["finish_reason"];
-    const auto& delta = choice.contains("delta") ? choice["delta"] : choice.value("message",Json::object());
-    if (delta.contains("content") && delta["content"].is_string()) content += delta["content"].get<std::string>();
-    for(auto* key:{"reasoning_content","reasoning"})if(delta.contains(key) && delta[key].is_string()){reasoning+=delta[key].get<std::string>();break;}
-    if (delta.contains("tool_calls")) for (auto& part : delta["tool_calls"]) {
-      int index = part.value("index",static_cast<int>(calls.size()));
-      if (index < 0 || index >= 64) throw std::runtime_error("Too many tool calls");
-      auto [it, inserted] = calls.try_emplace(index,Json{{"id",""},{"type","function"},{"function",{{"name",""},{"arguments",""}}}});
-      auto& call = it->second;
-      if (part.contains("id") && part["id"].is_string()) call["id"] = call["id"].get<std::string>() + part["id"].get<std::string>();
-      if (part.contains("function")) for (const auto* key : {"name","arguments"})
-        if (part["function"].contains(key) && part["function"][key].is_string())
-          call["function"][key] = call["function"][key].get<std::string>() + part["function"][key].get<std::string>();
-      (void)inserted;
+  if(!usage.empty())emit_({ProviderEventKind::Usage,"",usage});
+  if(!chunk.contains("choices"))return;
+  if(!chunk["choices"].is_array())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model choices");
+  for(auto& choice:chunk["choices"]) {
+    if(!choice.is_object())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model choice");
+    if(choice.contains("index") && !choice["index"].is_number_integer())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model choice index");
+    if(choice.contains("index") && choice["index"]!=0)continue; // Saga requests exactly one candidate.
+    bool full=!choice.contains("delta");
+    auto delta=full ? choice.value("message",Json::object()) : choice["delta"];
+    if(!delta.is_object())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model delta");
+    // Full messages are normalized as snapshots. The state owner reconciles
+    // them against its canonical buffers instead of duplicating those buffers.
+    {
+      for(auto [key,kind]:{std::pair{"reasoning_content",ProviderEventKind::Reasoning},{"reasoning",ProviderEventKind::Reasoning},{"content",ProviderEventKind::Text},{"commentary",ProviderEventKind::Commentary}}) {
+        auto it=delta.find(key);if(it==delta.end() || it->is_null())continue;
+        if(!it->is_string())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model text delta");
+        if(key==std::string_view("reasoning") && delta.contains("reasoning_content"))continue;
+        if(!it->get_ref<const std::string&>().empty()){emit_({kind,it->get<std::string>(),{{"snapshot",full}}});}
+      }
+      if(delta.contains("tool_calls")) {
+        if(!delta["tool_calls"].is_array())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model tool delta");
+        int fallback=0;
+        for(auto& part:delta["tool_calls"]) {
+          int ordinal=fallback++;
+          if(!part.is_object())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid model tool fragment");
+          int index=0;
+          auto id=part.contains("id") && part["id"].is_string()?part["id"].get<std::string>():std::string();
+          if(part.contains("index")) {
+            auto& value=part["index"];
+            if(!value.is_number_integer() || value<0 || value>=64)throw ProviderError(ProviderErrorKind::StreamParse,"Invalid tool call index");
+            index=value.get<int>();
+          }
+          else if(!id.empty() && tool_ids_.contains(id))index=tool_ids_.at(id);
+          else if(full)index=ordinal;
+          else if(!id.empty())index=next_tool_;
+          else if(tool_ids_.size()==1)index=tool_ids_.begin()->second;
+          else throw ProviderError(ProviderErrorKind::StreamParse,"Ambiguous tool call fragment without index or id");
+          if(index<0 || index>=64)throw ProviderError(ProviderErrorKind::StreamParse,"Too many tool calls");
+          next_tool_=std::max(next_tool_,index+1);if(!id.empty())tool_ids_[id]=index;
+          Json data={{"index",index},{"snapshot",full}};
+          if(part.contains("type") && !part["type"].is_null() && part["type"]!="function")throw ProviderError(ProviderErrorKind::StreamParse,"Unsupported tool call type");
+          if(part.contains("id") && !part["id"].is_null()){if(!part["id"].is_string())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid tool id");data["id"]=part["id"];}
+          if(part.contains("function") && !part["function"].is_null()) {
+            if(!part["function"].is_object())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid tool function");
+            for(auto key:{"name","arguments"})if(part["function"].contains(key) && !part["function"][key].is_null()){if(!part["function"][key].is_string())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid tool string");data[key]=part["function"][key];}
+          }
+          emit_({ProviderEventKind::ToolDelta,"",data});
+        }
+      }
+    }
+    if(choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
+      if(!choice["finish_reason"].is_string())throw ProviderError(ProviderErrorKind::StreamParse,"Invalid finish reason");
+      auto reason=choice["finish_reason"].get<std::string>();
+      finish_=reason=="stop"?FinishReason::Stop:reason=="tool_calls" || reason=="function_call"?FinishReason::ToolCall:reason=="length"?FinishReason::Length:reason=="content_filter"?FinishReason::ContentFilter:FinishReason::Unknown;
     }
   }
-  if (content.size() > 4*1024*1024) throw std::runtime_error("Completion exceeds limit");
-  if (reasoning.size() > 4*1024*1024) throw std::runtime_error("Reasoning exceeds limit");
-  for (auto& [_,call] : calls) if (call.dump().size() > 1024*1024) throw std::runtime_error("Tool arguments exceed limit");
 }
-Json Completion::message() const {
-  Json m = {{"role","assistant"},{"content",content.empty() && !calls.empty() ? Json() : Json(content)}};
+void OpenAIStreamAdapter::finish() {
+  if(closed_)throw std::logic_error("Provider stream terminated twice");
+  if(!has_finish())throw ProviderError(ProviderErrorKind::Interrupted,"Interrupted provider stream: no finish reason",true);
+  closed_=true;emit_({ProviderEventKind::Finished,"",Json::object(),finish_});
+}
+Json GenerationState::message() const {
+  auto public_text=commentary.empty()?content:commentary+(content.empty()?"":"\n\n"+content);
+  Json m = {{"role","assistant"},{"content",public_text.empty() && !calls.empty() ? Json() : Json(public_text)}};
   if(!reasoning.empty())m["reasoning_content"]=reasoning;
   if (!calls.empty()) {
     m["tool_calls"] = Json::array();
@@ -115,21 +158,28 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
     std::exception_ptr error;
     StreamCallback callback;
     std::function<void()> control;
-    bool done = false;
+    bool done = false, finished = false;
+    CURL* handle=nullptr;
+    std::chrono::steady_clock::time_point last_activity=std::chrono::steady_clock::now();
+    int idle_timeout=600;
     SseParser parser;
     explicit State(StreamCallback callback_arg) : callback(std::move(callback_arg)), parser([this](std::string_view data){
       if (data == "[DONE]") { done = true; return; }
       if (done) return;
-      callback(Json::parse(data));
+      Json chunk;try{chunk=Json::parse(data,[](int depth,Json::parse_event_t,Json&){if(depth>128)throw ProviderError(ProviderErrorKind::StreamParse,"Model JSON nesting exceeds limit");return true;});}catch(const Json::exception&){throw ProviderError(ProviderErrorKind::StreamParse,"Invalid JSON in model stream");}
+      if(chunk.contains("choices") && chunk["choices"].is_array())for(auto& choice:chunk["choices"])if(choice.is_object() && choice.contains("finish_reason") && choice["finish_reason"].is_string())finished=true;
+      callback(chunk);
     }) {}
   } state(cb);
-  state.control=control_;
+  state.control=control_;state.handle=curl.get();state.idle_timeout=config_.timeout_seconds;
   auto write_cb = +[](char* bytes, size_t size, size_t count, void* data)->size_t {
     auto& state_ref = *static_cast<State*>(data); size_t n = size*count;
     try {
+      state_ref.last_activity=std::chrono::steady_clock::now();
+      long status=0;curl_easy_getinfo(state_ref.handle,CURLINFO_RESPONSE_CODE,&status);
       if (state_ref.body.size()+n > 16*1024*1024) throw std::runtime_error("HTTP response exceeds limit");
-      state_ref.body.append(bytes,n);
-      if (state_ref.callback) state_ref.parser.feed({bytes,n});
+      if(!state_ref.callback || status>=300)state_ref.body.append(bytes,n);
+      if (state_ref.callback && status>=200 && status<300) state_ref.parser.feed({bytes,n});
       return n;
     } catch (...) { state_ref.error = std::current_exception(); return 0; }
   };
@@ -140,7 +190,10 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
     // Service local controls even when inference has not sent any SSE bytes yet.
     auto progress = +[](void* data,curl_off_t,curl_off_t,curl_off_t,curl_off_t)->int {
       auto& state_ref=*static_cast<State*>(data);
-      try { if(state_ref.control)state_ref.control(); if(state_ref.callback)state_ref.callback(Json::object()); return 0; }
+      try { if(state_ref.control)state_ref.control();
+        if(state_ref.callback && std::chrono::steady_clock::now()-state_ref.last_activity>std::chrono::seconds(state_ref.idle_timeout))throw ProviderError(ProviderErrorKind::Timeout,"Model stream idle timeout",true);
+        if(state_ref.callback)state_ref.callback(Json::object());
+        return 0; }
       catch (...) { state_ref.error=std::current_exception(); return 1; }
     };
     set(CURLOPT_NOPROGRESS,0L); set(CURLOPT_XFERINFOFUNCTION,progress); set(CURLOPT_XFERINFODATA,&state);
@@ -149,7 +202,7 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
   // Non-streaming inference sends no response bytes until generation finishes.
   // A low-speed limit mistakes legitimate model computation for a dead connection.
   long timeout = method == "GET" ? std::min(config_.timeout_seconds,30) : config_.timeout_seconds;
-  set(CURLOPT_TIMEOUT,timeout);
+  set(CURLOPT_TIMEOUT,cb ? 0L : timeout);
   set(CURLOPT_SSL_VERIFYPEER,config_.insecure_tls ? 0L : 1L);
   set(CURLOPT_SSL_VERIFYHOST,config_.insecure_tls ? 0L : 2L);
   set(CURLOPT_PROTOCOLS_STR,"http,https");
@@ -157,14 +210,14 @@ Json OpenAICompatibleBackend::request(std::string_view method, const std::string
   if (method == "POST") { serialized = body.dump(); set(CURLOPT_POST,1L); set(CURLOPT_POSTFIELDS,serialized.data()); set(CURLOPT_POSTFIELDSIZE,static_cast<long>(serialized.size())); }
   auto rc = curl_easy_perform(curl.get());
   if (state.error) std::rethrow_exception(state.error);
-  if (rc == CURLE_OPERATION_TIMEDOUT) throw std::runtime_error("Model request timed out (response limit " + std::to_string(timeout) + "s, connection limit 10s). Increase timeout_seconds for slow local models.");
-  if (rc != CURLE_OK) throw std::runtime_error(std::string("Model connection failed: ")+curl_easy_strerror(rc));
+  if (rc == CURLE_OPERATION_TIMEDOUT) throw ProviderError(ProviderErrorKind::Timeout,"Model request timed out (idle/response limit " + std::to_string(timeout) + "s, connection limit 10s)",true);
+  if (rc != CURLE_OK) throw ProviderError(ProviderErrorKind::Connection,std::string("Model connection failed: ")+curl_easy_strerror(rc),true);
   long status = 0; curl_easy_getinfo(curl.get(),CURLINFO_RESPONSE_CODE,&status);
   // Never include server bodies (may echo credentials) in error logs.
-  if (status < 200 || status >= 300) throw std::runtime_error("Model HTTP status " + std::to_string(status));
+  if (status < 200 || status >= 300) throw ProviderError(ProviderErrorKind::Http,"Model HTTP status " + std::to_string(status),status==408 || status==429 || status>=500);
   if (cb) {
     state.parser.finish();
-    if (!state.done) throw std::runtime_error("Interrupted SSE response: missing [DONE]");
+    if (!state.done && !state.finished) throw ProviderError(ProviderErrorKind::Interrupted,"Interrupted SSE response: missing terminal event",true);
     return Json::object();
   }
   try { return Json::parse(state.body); }
@@ -185,7 +238,9 @@ std::vector<ModelInfo> OpenAICompatibleBackend::models() {
   for (auto& m : r["data"]) {
     if (!m.contains("id") || !m["id"].is_string()) continue;
     if (m.value("owned_by","") == "llamacpp" && (m["id"] == config_.model || (config_.model.empty() && r["data"].size() == 1))) llama_cpp_ = true;
-    ModelInfo info; info.id = m["id"]; info.context_length = context_metadata(m); out.push_back(std::move(info));
+    ModelInfo info; info.id = m["id"]; info.context_length = context_metadata(m);
+    if(info.id==config_.model && m.contains("max_output_tokens") && m["max_output_tokens"].is_number_unsigned())output_limit_=m["max_output_tokens"].get<std::uint64_t>();
+    out.push_back(std::move(info));
   }
   if (out.empty()) throw std::runtime_error("Endpoint exposes no models");
   return out;
@@ -228,7 +283,7 @@ CapabilityReport OpenAICompatibleBackend::probe(Emit progress) {
   status("completion","Testing basic completion");
   auto basic = request("POST",api_ + "/chat/completions",body);
   report.connected = true;
-  Completion full; full.accept(basic); report.completion = !trim(full.content).empty();
+  GenerationState full; OpenAIStreamAdapter basic_adapter([&](auto& e){full.accept(e);});basic_adapter.feed(basic);basic_adapter.finish(); report.completion = !trim(full.content).empty();
   if (!report.completion) throw std::runtime_error("Incompatible backend: completion probe returned no answer");
   status("completion","Basic completion",true);
   body["messages"][0]["content"] = "Invoke saga_probe with ok=true.";
@@ -236,7 +291,7 @@ CapabilityReport OpenAICompatibleBackend::probe(Emit progress) {
   body["tool_choice"] = "required";
   body["max_tokens"] = llama_cpp_ ? 64 : 512;
   status("tools","Testing function calling");
-  Completion tool; tool.accept(request("POST",api_ + "/chat/completions",body));
+  GenerationState tool;OpenAIStreamAdapter tool_adapter([&](auto& e){tool.accept(e);});tool_adapter.feed(request("POST",api_ + "/chat/completions",body));tool_adapter.finish();
   if (tool.calls.size() == 1) {
     auto call = tool.message()["tool_calls"][0];
     auto args = Json::parse(call["function"]["arguments"].get<std::string>());
@@ -248,18 +303,36 @@ CapabilityReport OpenAICompatibleBackend::probe(Emit progress) {
   streaming.messages = Json::array({{{"role","user"},{"content","Reply only OK."}}}); streaming.max_tokens = llama_cpp_ ? 32 : 256;
   streaming.disable_thinking = llama_cpp_;
   status("streaming","Testing streamed completion");
-  Completion stream; chat(streaming,[&](auto& chunk){ stream.accept(chunk); });
-  report.streaming = stream.saw_chunk && !stream.content.empty() && !stream.finish_reason.empty();
+  GenerationState stream; generate(streaming,[&](auto& e){ stream.accept(e); });
+  report.streaming = stream.saw_activity && !stream.content.empty() && stream.finish_reason!=FinishReason::Unknown;
   if (!report.completion || !report.streaming || !report.tool_calls) throw std::runtime_error("Incompatible backend: basic completion, streaming, and valid tool calling are required");
   status("streaming","Streaming",true);
   return report;
 }
-void OpenAICompatibleBackend::chat(const ChatRequest& r,StreamCallback cb) {
+void OpenAICompatibleBackend::prepare() {
+  if(discovered_)return;
+  try{models();}catch(const TurnCancelled&){throw;}catch(const std::exception&){}
+  discovered_=true;
+}
+void OpenAICompatibleBackend::stream_chat(const ChatRequest& r,StreamCallback cb) {
   if (config_.model.empty()) throw std::runtime_error("No selected model");
   // Metadata only, once per backend. No generated capability tests on startup.
-  if(!discovered_){try{models();}catch(const std::exception&){}discovered_=true;}
+  prepare();
   Json body = {{"model",config_.model},{"messages",r.messages},{"stream",true},{"stream_options",{{"include_usage",true}}},{"max_tokens",r.max_tokens}};
   if(llama_cpp_){body["timings_per_token"]=true;body["return_progress"]=true;body["cache_prompt"]=true;body["chat_template_kwargs"]={{"preserve_thinking",true}};}
+  if(llama_cpp_ && r.enable_reasoning_control) {
+    // The documented control endpoint is probed with an impossible completion
+    // id. It performs no inference and cannot stop any real user generation.
+    if(!reasoning_control_checked_) {
+      reasoning_control_checked_=true;
+      auto previous_timeout=config_.timeout_seconds;config_.timeout_seconds=2;
+      try {auto result=request("POST",api_+"/chat/completions/control",{{"id","saga-capability-"+uuid()},{"model",config_.model},{"action","reasoning_end"}});capabilities_.reasoning_control=result.contains("success") && result["success"].is_boolean();}
+      catch(const TurnCancelled&){config_.timeout_seconds=previous_timeout;throw;}
+      catch(const std::exception&){}
+      config_.timeout_seconds=previous_timeout;
+    }
+    if(capabilities_.reasoning_control)body["reasoning_control"]=true;
+  }
   if (llama_cpp_ && r.disable_thinking) { body["chat_template_kwargs"]["enable_thinking"]=false; body["reasoning_effort"] = "none"; }
   if (!r.tools.empty()) body["tools"] = r.tools;
   if (r.forced_tool) {
@@ -279,5 +352,38 @@ void OpenAICompatibleBackend::chat(const ChatRequest& r,StreamCallback cb) {
       request("POST",api_ + "/chat/completions",body,wrapped);
     } else throw;
   }
+}
+}
+
+namespace saga {
+void OpenAICompatibleBackend::generate(const ChatRequest& r,ProviderCallback cb) {
+  std::uint64_t reasoning_bytes=0;
+  bool soft_sent=false,hard_sent=false;
+  OpenAIStreamAdapter adapter([&](const ProviderEvent& event){
+    cb(event);
+    if(event.kind!=ProviderEventKind::Reasoning)return;
+    reasoning_bytes=event.data.value("snapshot",false)?event.text.size():reasoning_bytes+event.text.size();auto tokens=(reasoning_bytes+2)/3;
+    if(r.reasoning_soft_tokens && tokens>=r.reasoning_soft_tokens && !soft_sent) {
+      soft_sent=true;cb({ProviderEventKind::Warning,"Reasoning soft budget reached",{{"tokens_estimate",tokens},{"threshold",r.reasoning_soft_tokens}}});
+    }
+    if(r.reasoning_hard_tokens && tokens>=r.reasoning_hard_tokens && !hard_sent) {
+      hard_sent=true;
+      bool ended=false;
+      if(r.enable_reasoning_control && capabilities_.reasoning_control && !adapter.provider_id().empty()) {
+        auto previous_timeout=config_.timeout_seconds;config_.timeout_seconds=2;
+        try {auto result=request("POST",api_+"/chat/completions/control",{{"id",adapter.provider_id()},{"model",config_.model},{"action","reasoning_end"}});ended=result.value("success",false);}
+        catch(const TurnCancelled&){config_.timeout_seconds=previous_timeout;throw;}
+        catch(const std::exception&){}
+        config_.timeout_seconds=previous_timeout;
+      }
+      cb({ProviderEventKind::Warning,ended?"Requested end of reasoning":"Reasoning hard budget reached; preserving the active stream",{{"tokens_estimate",tokens},{"control_requested",ended}}});
+    }
+  });
+  try {stream_chat(r,[&](const Json& chunk){adapter.feed(chunk);});}
+  catch(const ProviderError& error) {
+    if(!adapter.has_finish() || (error.kind!=ProviderErrorKind::Connection && error.kind!=ProviderErrorKind::Interrupted))throw;
+    cb({ProviderEventKind::Warning,"Transport ended after a valid terminal marker; retaining the generation"});
+  }
+  adapter.finish();
 }
 }

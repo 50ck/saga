@@ -48,21 +48,21 @@ void streaming() {
   for(size_t end=1;end<=public_json.size();++end){auto text=json_string_prefix(std::string_view(public_json).substr(0,end),"text");CHECK(Json::accept(Json(text).dump()));CHECK(std::string("**Public** 東京 \"quoted\" 😀\nNext").starts_with(text));}
   CHECK(json_string_prefix("{\"text\":\"\\uD83D\\uDE00\"}","text")=="😀");
   CHECK(json_string_prefix("{\"nested\":{\"text\":\"private\"},\"text\":\"public\"}","text")=="public");
-  Completion result;
-  result.accept(Json::parse(R"({"choices":[{"index":0,"delta":{"content":"hello","tool_calls":[{"index":0,"id":"call_1","function":{"name":"remember","arguments":"{\"que"}}]},"finish_reason":null}]})"));
-  result.accept(Json::parse(R"({"choices":[{"index":0,"delta":{"content":" world","tool_calls":[{"index":0,"function":{"arguments":"ry\":\"widget\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50}})"));
+  GenerationState result; OpenAIStreamAdapter result_adapter([&](const ProviderEvent& event){result.accept(event);});
+  result_adapter.feed(Json::parse(R"({"choices":[{"index":0,"delta":{"content":"hello","tool_calls":[{"index":0,"id":"call_1","function":{"name":"remember","arguments":"{\"que"}}]},"finish_reason":null}]})"));
+  result_adapter.feed(Json::parse(R"({"choices":[{"index":0,"delta":{"content":" world","tool_calls":[{"index":0,"function":{"arguments":"ry\":\"widget\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50}})"));
   auto message = result.message(); CHECK(result.content == "hello world");
-  result.accept({{"choices",Json::array({{{"delta",{{"reasoning_content","thought "}}}}})}});
-  result.accept({{"choices",Json::array({{{"delta",{{"reasoning_content","continued"}}}}})}});
+  result_adapter.feed({{"choices",Json::array({{{"delta",{{"reasoning_content","thought "}}}}})}});
+  result_adapter.feed({{"choices",Json::array({{{"delta",{{"reasoning_content","continued"}}}}})}});
   CHECK(result.message()["reasoning_content"]=="thought continued");
-  CHECK(Json::parse(message["tool_calls"][0]["function"]["arguments"].get<std::string>())["query"] == "widget"); CHECK(result.usage["prompt_tokens"] == 50);
-  Completion live;
-  live.accept({{"prompt_progress",{{"total",10000},{"processed",1500},{"cache",8500}}}});CHECK(live.input_tokens==10000 && live.cache_tokens==8500);
-  live.accept({{"timings",{{"prompt_n",1500},{"cache_n",8500},{"predicted_n",12}}}});CHECK(live.input_tokens==10000 && live.output_tokens==12);
-  live.accept({{"timings",{{"prompt_n",1500},{"cache_n",8500},{"predicted_n",19}}}});CHECK(live.input_tokens==10000 && live.output_tokens==19);
-  live.accept({{"timings",{{"prompt_n",1500},{"cache_n",8500},{"predicted_n",20}}},{"usage",{{"prompt_tokens",10000},{"completion_tokens",20},{"prompt_tokens_details",{{"cached_tokens",8500}}}}}});CHECK(live.input_tokens==10000 && live.output_tokens==20);
-  live.accept({{"timings",{{"prompt_n",-1},{"cache_n",8500},{"predicted_n",nullptr}}},{"usage",nullptr}});CHECK(live.input_tokens==10000 && live.output_tokens==20);
-  live.accept({{"usage",{{"prompt_tokens_details",{{"cached_tokens",0}}}}}});CHECK(live.cache_tokens==0);
+  CHECK(Json::parse(message["tool_calls"][0]["function"]["arguments"].get<std::string>())["query"] == "widget"); CHECK(result.usage["input_tokens"] == 50);
+  GenerationState live; OpenAIStreamAdapter live_adapter([&](const ProviderEvent& event){live.accept(event);});
+  live_adapter.feed({{"prompt_progress",{{"total",10000},{"processed",1500},{"cache",8500}}}});CHECK(live.input_tokens==10000 && live.cache_tokens==8500);
+  live_adapter.feed({{"timings",{{"prompt_n",1500},{"cache_n",8500},{"predicted_n",12}}}});CHECK(live.input_tokens==10000 && live.output_tokens==12);
+  live_adapter.feed({{"timings",{{"prompt_n",1500},{"cache_n",8500},{"predicted_n",19}}}});CHECK(live.input_tokens==10000 && live.output_tokens==19);
+  live_adapter.feed({{"timings",{{"prompt_n",1500},{"cache_n",8500},{"predicted_n",20}}},{"usage",{{"prompt_tokens",10000},{"completion_tokens",20},{"prompt_tokens_details",{{"cached_tokens",8500}}}}}});CHECK(live.input_tokens==10000 && live.output_tokens==20);
+  live_adapter.feed({{"timings",{{"prompt_n",-1},{"cache_n",8500},{"predicted_n",nullptr}}},{"usage",nullptr}});CHECK(live.input_tokens==10000 && live.output_tokens==20);
+  live_adapter.feed({{"usage",{{"prompt_tokens_details",{{"cached_tokens",0}}}}}});CHECK(live.cache_tokens==0);
   CHECK(OpenAICompatibleBackend::normalize("https://example.test/v1/").second == "https://example.test/v1");
   CHECK(OpenAICompatibleBackend::normalize("http://localhost:8000").second == "http://localhost:8000/v1");
   rejects([]{ OpenAICompatibleBackend::normalize("file:///etc/passwd"); });
@@ -76,10 +76,12 @@ void streaming() {
 class ProbeEndpoint : public OpenAICompatibleBackend {
   bool llama_;
 protected:
-  Json request(std::string_view method,const std::string&,const Json& body,StreamCallback callback) override {
+  Json request(std::string_view method,const std::string& url,const Json& body,StreamCallback callback) override {
     if (method == "GET") return {{"data",Json::array({{{"id","probe-model"},{"owned_by",llama_ ? "llamacpp" : "generic"},{"meta",{{"n_ctx",65536ULL}}}}})}};
     requests.push_back(body);
+    if(url.ends_with("/control"))return {{"success",true}};
     if (callback) {
+      if(reasoning_fixture)callback({{"id","fixture-completion"},{"choices",Json::array({{{"index",0},{"delta",{{"reasoning_content","hidden reasoning"}}},{"finish_reason",nullptr}}})}});
       callback({{"choices",Json::array({{{"index",0},{"delta",{{"content","OK"}}},{"finish_reason","stop"}}})}});
       return Json::object();
     }
@@ -88,7 +90,7 @@ protected:
     return {{"choices",Json::array({{{"index",0},{"message",message},{"finish_reason",message.contains("tool_calls") ? "tool_calls" : "stop"}}})}};
   }
 public:
-  Json requests = Json::array(); bool tool_support = true;
+  Json requests = Json::array(); bool tool_support = true,reasoning_fixture=false;
   explicit ProbeEndpoint(bool llama) : OpenAICompatibleBackend([]{ Config c; c.endpoint="http://probe.test/v1"; c.model="probe-model"; return c; }()),llama_(llama) {}
 };
 void capability_probe() {
@@ -102,20 +104,28 @@ void capability_probe() {
   CHECK(llama.requests[1]["tool_choice"] == "required");
   for (const auto& body : llama.requests) { CHECK(body["chat_template_kwargs"]["enable_thinking"] == false); CHECK(body["reasoning_effort"] == "none"); }
   ChatRequest chat; chat.messages = Json::array({{{"role","user"},{"content","Ordinary work"}}});
-  llama.chat(chat,[](const Json&){});
+  llama.generate(chat,[](const ProviderEvent&){});
   CHECK(llama.requests.back()["chat_template_kwargs"]["preserve_thinking"]==true);CHECK(!llama.requests.back()["chat_template_kwargs"].contains("enable_thinking")); CHECK(!llama.requests.back().contains("reasoning_effort"));
   CHECK(llama.requests.back()["cache_prompt"]==true);
   CHECK(llama.requests.back()["timings_per_token"]==true && llama.requests.back()["return_progress"]==true);
   chat.forced_tool = "submit_review";
   chat.tools = Json::array({function_tool("submit_review","Review",Json::object()),function_tool("unused","Unused",Json::object())});
-  llama.chat(chat,[](const Json&){});
+  llama.generate(chat,[](const ProviderEvent&){});
   CHECK(llama.requests.back()["tool_choice"] == "required"); CHECK(llama.requests.back()["tools"].size() == 1);
   CHECK(llama.requests.back()["tools"][0]["function"]["name"] == "submit_review");
   chat.forced_tool = "missing"; auto sent = llama.requests.size();
-  rejects([&]{ llama.chat(chat,[](const Json&){}); }); CHECK(llama.requests.size() == sent);
+  rejects([&]{ llama.generate(chat,[](const ProviderEvent&){}); }); CHECK(llama.requests.size() == sent);
   ProbeEndpoint generic(false); CHECK(generic.probe().tool_calls);
-  ChatRequest normal;normal.messages=Json::array({{{"role","user"},{"content","normal"}}});generic.chat(normal,[](const Json&){});CHECK(!generic.requests.back().contains("timings_per_token"));
+  ChatRequest normal;normal.messages=Json::array({{{"role","user"},{"content","normal"}}});generic.generate(normal,[](const ProviderEvent&){});CHECK(!generic.requests.back().contains("timings_per_token"));
   for (const auto& body : generic.requests) { CHECK(!body.contains("chat_template_kwargs")); CHECK(!body.contains("reasoning_effort")); }
+  ProbeEndpoint controlled(true);controlled.reasoning_fixture=true;
+  normal.enable_reasoning_control=true;normal.reasoning_soft_tokens=1;normal.reasoning_hard_tokens=1;
+  GenerationState state;int warnings=0;
+  controlled.generate(normal,[&](const ProviderEvent& e){state.accept(e);if(e.kind==ProviderEventKind::Warning)++warnings;});
+  CHECK(state.status==GenerationStatus::Completed && state.reasoning=="hidden reasoning" && warnings==2);
+  CHECK(controlled.capabilities().reasoning_control);
+  CHECK(std::count_if(controlled.requests.begin(),controlled.requests.end(),[](auto& body){return body.contains("action") && body["action"]=="reasoning_end";})==2);
+  CHECK(controlled.requests[1]["stream"]==true && controlled.requests[1]["reasoning_control"]==true);
   ProbeEndpoint incompatible(true); incompatible.tool_support = false;
   rejects([&]{ incompatible.probe(); }); CHECK(incompatible.requests.size() == 2);
 }
@@ -126,7 +136,7 @@ void persistence() {
   auto p = f.persona(a); CHECK(p->soul == "Identity A");
   rejects([&]{ f.persona(a); });
   auto q = f.persona(b); CHECK(q->soul == "Identity B");
-  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 7);
+  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 8);
   auto id = db->event("test.event",{{"text","immutable"}});
   Json single = id;
   CHECK(db->query("SELECT type FROM events WHERE id=?",{single})[0]["type"] == "test.event");
@@ -135,7 +145,7 @@ void persistence() {
   CHECK(q->db->query("SELECT * FROM events WHERE type='test.event'").empty());
   q->db->sql("ALTER TABLE facts DROP COLUMN project_id; UPDATE schema_version SET version=1");
   q->db->migrate();
-  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 7);
+  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 8);
   bool scoped_column = false;
   for (const auto& column : q->db->query("PRAGMA table_info(facts)")) if (column["name"] == "project_id") scoped_column = true;
   CHECK(scoped_column);

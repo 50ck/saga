@@ -1,4 +1,5 @@
 #include "check.hpp"
+#include "mock_model.hpp"
 #include <saga/web.hpp>
 #include <saga/persona.hpp>
 #include <saga/runtime.hpp>
@@ -63,7 +64,7 @@ void storage() {
   web.settings(false);auto cached=web.dispatch("web_read",{{"source_id",id}},session,0);CHECK(cached["source_id"]==id);CHECK(network==2);rejects([&]{web.dispatch("web_search",{{"query","rules"}},session,0);});CHECK(network==2);
   web.settings(true);web.service([&]{web.settings(false);});rejects([&]{web.dispatch("web_read",{{"url","https://example.com/new"}},session,0);});CHECK(network==2);
   PersonaContext other(paths,registry.create("Other synthetic persona",""),root/"project");CHECK(other.db->query("SELECT id FROM web_sources").empty());
-  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==7);
+  persona.db->migrate();CHECK(persona.db->query("SELECT version FROM schema_version")[0]["version"]==8);
 }
 void proof_and_failure_gates() {
   auto root=fs::temp_directory_path()/("saga-web-proof-"+uuid());
@@ -104,7 +105,7 @@ void proof_and_failure_gates() {
   CHECK(fetches==network_before+1);network_before=fetches;tools.web().settings(true);
   tools.web().begin_turn(p.session,p.task);tools.service([]{throw TurnCancelled();});bool cancelled=false;try{tools.execute("web_read",{{"url","https://docs.example.com/rules"}});}catch(const TurnCancelled&){cancelled=true;}CHECK(cancelled && fetches==network_before);
 }
-class ResearchBackend final : public ModelBackend {
+class ResearchBackend final : public MockChatBackend {
   int step_=0;
   Json doc_,search_;Id question_=0,task_=0,check_=0;
 public:
@@ -145,7 +146,7 @@ void runtime_research() {
   CHECK(live_command_allowed("web",{{"enabled",false}}));runtime.command("web",{{"enabled",false}});CHECK(runtime.command("status")["web"]["enabled"]==false);
 }
 
-class NoResearchBackend final : public ModelBackend {
+class NoResearchBackend final : public MockChatBackend {
 public:
   ModelInfo discover() override{return {"fixture",65536,true,true,false};}
   CapabilityReport probe() override{return {true,true,true,true};}
