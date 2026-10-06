@@ -21,6 +21,29 @@ static std::string fts_query(const std::vector<std::string>& ws) {
   for (auto& w : ws) { if (!out.empty()) out += " OR "; out += '"' + w + '"'; }
   return out;
 }
+namespace {
+const std::map<std::string,std::string> memory_tables={{"episode","episodes"},{"journal","journal_entries"},{"fact","facts"},{"belief","beliefs"},{"praxis","praxis"},{"artifact","artifacts"},{"failed_strategy","failed_strategies"}};
+Json memory_reference(const Json &row,const std::string &kind) {
+  return {{"kind",kind},{"id",row["id"]}};
+}
+Json memory_actions(const Json &row,const std::string &kind) {
+  Json actions=Json::array({{{"tool","recall_memory"},{"arguments",{{"kind",kind},{"memory_id",row["id"]}}}}});
+  if(row.contains("session_id") && !row["session_id"].is_null())actions.push_back({{"tool","recall_session"},{"arguments",{{"session_id",row["session_id"]}}}});
+  if(row.contains("source_event_id") && !row["source_event_id"].is_null())actions.push_back({{"tool","recall_event"},{"arguments",{{"event_id",row["source_event_id"]}}}});
+  return actions;
+}
+}
+Json Memory::recall(const std::string &kind,Id id,Id offset,Id limit) {
+  auto table=memory_tables.find(kind);
+  if(table==memory_tables.end() || id<=0)throw std::runtime_error("Use a returned memory_ref kind and memory_id; event/session IDs are separate namespaces");
+  if(offset<0 || limit<1 || limit>12000)throw std::runtime_error("Invalid memory page; maximum 12000 bytes");
+  auto rows=p_.db->query("SELECT * FROM "+table->second+" WHERE id=?",{id});
+  if(rows.empty())return {{"error","No memory at this typed reference; repeat remember/know rather than guessing IDs"},{"error_type","MemoryReferenceError"},{"memory_ref",{{"kind",kind},{"id",id}}}};
+  auto text=rows[0].dump();size_t begin=std::min(static_cast<size_t>(offset),text.size()),end=std::min(begin+static_cast<size_t>(limit),text.size());
+  while(begin && begin<text.size() && (static_cast<unsigned char>(text[begin])&0xc0)==0x80)--begin;
+  while(end<text.size() && (static_cast<unsigned char>(text[end])&0xc0)==0x80)++end;
+  return {{"memory_ref",memory_reference(rows[0],kind)},{"retrieval_actions",memory_actions(rows[0],kind)},{"content",text.substr(begin,end-begin)},{"offset",begin},{"next_offset",end},{"total_bytes",text.size()},{"complete",end==text.size()},{"hash",digest(text)},{"historical",true},{"untrusted",true}};
+}
 Json Memory::search(std::string kind, std::string query, bool deep) {
   if (query.size() > 4096) throw std::runtime_error("Memory query exceeds limit");
   auto ws = words(query);
@@ -105,6 +128,11 @@ Json Memory::search(std::string kind, std::string query, bool deep) {
   std::sort(results.begin(),results.end(),[](const Json& a,const Json& b){ return a["score"].get<double>() > b["score"].get<double>(); });
   while (results.size() > (deep ? 16U : 8U)) results.erase(results.end()-1);
   for (auto& row : results) if (row["memory_type"] == "episode") p_.db->exec("UPDATE episodes SET recall_count=recall_count+1,last_recalled_at=?,accessibility=min(1,accessibility+0.1) WHERE id=?",{now(),row["id"]});
+  for(auto &row:results) {
+    auto type=row["memory_type"].get<std::string>();
+    row["memory_ref"]=memory_reference(row,type);
+    row["retrieval_actions"]=memory_actions(row,type);
+  }
   Json diagnostic = {{"query",query},{"depth",deep ? "deep" : "normal"},{"kind",kind},{"results",results}};
   p_.db->exec("INSERT INTO retrieval_diagnostics(query,depth,kind,results_json,created_at) VALUES(?,?,?,?,?)",{query,diagnostic["depth"],kind,results.dump(),now()});
   p_.db->event("memory.recalled",diagnostic,p_.session,p_.task);

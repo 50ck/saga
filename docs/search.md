@@ -215,3 +215,14 @@ claim mismatch. It verifies default mandatory research, compact unambiguous outp
 structured reference recovery, no network requests on invalid references,
 goal-wide association, per-claim resolution, task binding, scope isolation and
 cancellation without false attempt failures. All fixtures are synthetic.
+
+## Typed historical recall
+
+Memory search results retain legacy record IDs but also return `memory_ref` and
+explicit `retrieval_actions`. `recall_memory(kind, memory_id)` reads that record;
+`recall_session(session_id)` pages a bounded historical timeline;
+`recall_event(event_id)` reads historical operator/assistant messages and relevant
+work/tool observations. `recall_observation` remains compatible with its narrower
+observation contract and returns a recovery action when given a message event.
+Episode, session and event IDs are never silently interchanged. Historical payloads
+are untrusted data, not new user turns. Recall does not execute archived tools.
