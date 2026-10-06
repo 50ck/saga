@@ -191,6 +191,33 @@ int main() {
     runtime->chat("Continue from the saved handoff",emit);
     CHECK(log->back().dump().find("checkpoint_id")!=std::string::npos);
     CHECK(log->back().dump().find("Continue from the saved handoff")!=std::string::npos);
+    // Unfinished work remains discoverable without becoming a new session's task.
+    auto unfinished=runtime->command("tool",{{"name","task_create"},{"arguments",{{"title","Earlier session work"},{"objective","Preserve this unfinished assignment"},{"risk","low"},{"checks",Json::array({"Observed completion"})}}}})["id"].get<Id>();
+    auto previous_session=runtime->persona().session;
+    auto fresh=runtime->command("new");
+    CHECK(runtime->persona().session!=previous_session && runtime->persona().task==0);
+    CHECK(fresh["status"]["task"].empty());
+    auto wake=runtime->command("state");
+    CHECK(std::any_of(wake["unfinished"].begin(),wake["unfinished"].end(),[&](const Json& task){return task["id"]==unfinished;}));
+    auto greeting_events=events.size();
+    runtime->chat("hello again",emit);
+    CHECK(runtime->command("status")["task"].empty());
+    CHECK(runtime->persona().db->query("SELECT task_id FROM model_calls ORDER BY id DESC LIMIT 1")[0]["task_id"].is_null());
+    CHECK(events.back()["type"]=="turn.finished");
+    size_t usage_events=0;
+    for(size_t i=greeting_events;i<events.size();++i)if(events[i]["type"]=="context.usage"){++usage_events;CHECK(events[i]["payload"]["active_task"].empty());}
+    CHECK(usage_events>0);
+    auto resumed=runtime->command("tool",{{"name","task_update"},{"arguments",{{"id",unfinished},{"status","blocked"}}}});
+    CHECK(!resumed.contains("error"));
+    CHECK(runtime->command("status")["task"][0]["id"]==unfinished);
+    CHECK(runtime->command("status")["task"][0]["status"]=="blocked");
+    runtime->close("user_exit"); runtime.reset();
+    runtime=activate(b); runtime->start(emit);
+    CHECK(runtime->persona().task==0 && runtime->command("status")["task"].empty());
+    CHECK(runtime->persona().db->query("SELECT status FROM tasks WHERE id=?",{unfinished})[0]["status"]=="blocked");
+    CHECK(runtime->persona().db->query("SELECT status FROM task_checks WHERE task_id=?",{unfinished})[0]["status"]=="unresolved");
+    runtime->chat("hello in a new session",emit);
+    CHECK(runtime->persona().task==0 && runtime->command("status")["task"].empty());
     runtime->close("user_exit"); runtime.reset();
     CHECK(std::any_of(events.begin(),events.end(),[](auto& e){ return e["type"]=="assistant.completed"; }));
     fs::remove_all(root); std::cout << "PASS complete runtime lifecycle: streamed tool execution, approval, proofs, persistence, reflection, isolation, model replacement, new session and crash recovery\n"; return 0;

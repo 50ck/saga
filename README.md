@@ -256,7 +256,10 @@ preserves abandoned sessions and writes provisional diaries locally on wake.
 Selection, session switching and attached maintenance never generate model
 completions. Detached daemon maintenance performs pending reflection and memory
 extraction later. Wake restores recent
-life, project state, tasks, commitments, goals and open loops. A daemon scheduler
+life, project state, tasks, commitments, goals and open loops.
+New sessions keep unfinished tasks available as continuity rather than activating
+one automatically. The footer displays the current task; an earlier task appears
+there only after it is selected again to resume work. A daemon scheduler
 maintains inactive identities, retries reflection/extraction, calibrates confidence
 and queues restrained reminders. Attached TUIs can receive idle notifications.
 

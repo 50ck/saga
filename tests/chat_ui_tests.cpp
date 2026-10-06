@@ -101,6 +101,9 @@ int main(int argc,char** argv) {
     view.event("context.usage",{{"output_tokens",1},{"streaming",false}});
     CHECK(chat_utf8(view.activity(true))==view.name+" is running a tool...");
     CHECK(view.activity(false).empty());view.phase="respond";
+    view.event("session.started",{{"session_id",2}});
+    CHECK(view.task.empty() && view.agent_status["task"].empty());
+    CHECK(chat_utf8(view.status(120)).find("Inspect tmux")==std::string::npos);
     auto wide=view.lines(100); auto narrow=view.lines(20); CHECK(narrow.size() > wide.size());
     for (int width : {6,12,20,40,80,120}) {
       for (const auto& line : view.lines(width)) CHECK(chat_columns(line) <= width);

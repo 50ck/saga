@@ -111,7 +111,7 @@ std::vector<std::wstring> chat_wrap(std::wstring_view text,int width) {
 }
 void ChatView::event(const std::string& type,const Json& p) {
   if(!approval_id.empty() && approval.value("kind","")=="edit" && (type=="help" || type=="result" || type=="command.error" || type=="permissions.menu"))approval_hidden=true;
-  if (type == "session.started") { name=p.value("name",name); model=p.value("model",model); context=p.value("context_length",context); }
+  if (type == "session.started") { name=p.value("name",name); model=p.value("model",model); context=p.value("context_length",context); task.clear(); agent_status["task"]=Json::array(); }
   else if (type == "assistant.delta") partial += p.value("content","");
   else if(type=="help")entries.push_back({"Saga",p.at("content").get<std::string>(),false,0,0,{},true,true});
   else if (type == "assistant.completed") { auto text=p.value("content","");if(!trim(text).empty())entries.push_back({name,text,false,0,0,{},true});else entries.push_back({"Saga","The model returned an empty response."});partial.clear(); }
