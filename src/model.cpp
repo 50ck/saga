@@ -209,6 +209,7 @@ ModelInfo OpenAICompatibleBackend::discover() {
   return info;
 }
 Json function_tool(std::string name,std::string description,Json properties,Json required) {
+  if(required.is_null())required=Json::array();
   return {{"type","function"},{"function",{{"name",std::move(name)},{"description",std::move(description)},
     {"parameters",{{"type","object"},{"properties",std::move(properties)},{"required",std::move(required)},{"additionalProperties",false}}}}}};
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include <saga/memory.hpp>
 #include <saga/model.hpp>
+#include <saga/web.hpp>
 namespace saga {
 struct ProcessResult {
   int exit_code = -1;
@@ -17,6 +18,7 @@ using Approve = std::function<bool(const std::string&,const Json&)>;
 class Tools {
   PersonaContext& p_;
   Memory& memory_;
+  WebResearch web_;
   Approve approve_;
   std::function<void()> service_;
   Emit output_;
@@ -24,12 +26,13 @@ class Tools {
   fs::path safe_path(const std::string& path, bool write) const;
   Json dispatch(const std::string& name, const Json& args);
 public:
-  Tools(PersonaContext& p,Memory& memory,Approve approve) : p_(p),memory_(memory),approve_(std::move(approve)) {}
+  Tools(PersonaContext& p,Memory& memory,Approve approve,Config config = {},WebTransport transport = fetch_public_web) : p_(p),memory_(memory),web_(*p.db,std::move(config),std::move(transport)),approve_(std::move(approve)) {}
+  WebResearch& web() {return web_;}
   static Json definitions();
   static void validate(const Json& args, const Json& schema);
   Json execute(const std::string& name,const Json& args,Emit emit = {});
   Json environment();
   Json permissions(const std::optional<std::string>& mode = {});
-  void service(std::function<void()> callback) { service_=std::move(callback); }
+  void service(std::function<void()> callback) { service_=callback;web_.service(std::move(callback)); }
 };
 }

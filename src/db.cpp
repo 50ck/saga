@@ -66,7 +66,7 @@ void Database::transaction(const std::function<void()>& operation) {
 void Database::migrate() {
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  if (version > 4) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if (version > 7) throw std::runtime_error("Database schema is newer than this Saga binary");
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -84,6 +84,36 @@ void Database::migrate() {
     sql("CREATE TABLE IF NOT EXISTS steering_messages(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),source_event_id INTEGER NOT NULL REFERENCES events(id),content TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','delivered','cancelled')),created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);");
     sql("UPDATE schema_version SET version=4");
   });
+  if (version < 5) transaction([&]{
+    bool typed_checks=false;
+    for(const auto& column:query("PRAGMA table_info(task_checks)"))if(column["name"]=="kind")typed_checks=true;
+    if(!typed_checks)sql("ALTER TABLE task_checks ADD COLUMN kind TEXT NOT NULL DEFAULT 'execution' CHECK(kind IN ('execution','research'))");
+    sql(R"SQL(
+      CREATE TABLE IF NOT EXISTS web_sources(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),task_id INTEGER REFERENCES tasks(id),kind TEXT NOT NULL CHECK(kind IN ('search','document')),engine TEXT NOT NULL,url TEXT NOT NULL,title TEXT NOT NULL,query TEXT NOT NULL DEFAULT '',retrieved_at INTEGER NOT NULL,content_hash TEXT NOT NULL,text TEXT NOT NULL,truncated INTEGER NOT NULL DEFAULT 0,source_event_id INTEGER NOT NULL REFERENCES events(id));
+      CREATE INDEX IF NOT EXISTS web_sources_url ON web_sources(url,id);
+      CREATE TABLE IF NOT EXISTS research_questions(id INTEGER PRIMARY KEY,session_id INTEGER NOT NULL REFERENCES sessions(id),task_id INTEGER REFERENCES tasks(id),assumption_id INTEGER REFERENCES assumptions(id),question TEXT NOT NULL,required INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','supported','contradicted','unverified')),conclusion TEXT NOT NULL DEFAULT '',sources_json TEXT NOT NULL DEFAULT '[]' CHECK(json_valid(sources_json)),disclosed INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+      INSERT OR IGNORE INTO runtime_settings VALUES('web_enabled','true',0);
+      CREATE TRIGGER IF NOT EXISTS web_sources_no_update BEFORE UPDATE ON web_sources BEGIN SELECT RAISE(ABORT,'Web source snapshots are immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS web_sources_no_delete BEFORE DELETE ON web_sources BEGIN SELECT RAISE(ABORT,'Web source snapshots are immutable'); END;
+      UPDATE schema_version SET version=5;
+    )SQL");
+  });
+  if(version<6)transaction([&]{sql(R"SQL(
+    CREATE TABLE IF NOT EXISTS web_source_documents(source_id INTEGER PRIMARY KEY REFERENCES web_sources(id),document_json TEXT NOT NULL,diagnostics_json TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS web_http_cache(url_hash TEXT PRIMARY KEY,url TEXT NOT NULL,final_url TEXT NOT NULL,status INTEGER NOT NULL,content_type TEXT NOT NULL,headers_json TEXT NOT NULL,body TEXT NOT NULL,updated_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS web_instances(origin TEXT NOT NULL,mount_path TEXT NOT NULL,descriptor_json TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(origin,mount_path));
+    CREATE TABLE IF NOT EXISTS web_templates(origin TEXT NOT NULL,text_hash TEXT NOT NULL,structure_hash TEXT NOT NULL,simhash TEXT NOT NULL,distinct_pages INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(origin,text_hash,structure_hash));
+    CREATE TABLE IF NOT EXISTS web_template_pages(origin TEXT NOT NULL,text_hash TEXT NOT NULL,structure_hash TEXT NOT NULL,page_hash TEXT NOT NULL,PRIMARY KEY(origin,text_hash,structure_hash,page_hash));
+    CREATE TABLE IF NOT EXISTS web_document_cache(url_hash TEXT PRIMARY KEY,body_hash TEXT NOT NULL,document_json TEXT NOT NULL,diagnostics_json TEXT NOT NULL,updated_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS web_document_fingerprints(content_hash TEXT PRIMARY KEY,simhash TEXT NOT NULL,url_hash TEXT NOT NULL,last_seen_at INTEGER NOT NULL);
+    UPDATE schema_version SET version=6;
+  )SQL");});
+  if(version<7)transaction([&]{sql(R"SQL(
+    CREATE TABLE IF NOT EXISTS web_search_cursors(token TEXT PRIMARY KEY,cursor_json TEXT NOT NULL,created_at INTEGER NOT NULL);
+    CREATE TRIGGER IF NOT EXISTS web_source_documents_no_update BEFORE UPDATE ON web_source_documents BEGIN SELECT RAISE(ABORT,'Canonical source snapshots are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS web_source_documents_no_delete BEFORE DELETE ON web_source_documents BEGIN SELECT RAISE(ABORT,'Canonical source snapshots are immutable'); END;
+    UPDATE schema_version SET version=7;
+  )SQL");});
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {
   return exec("INSERT INTO events(ts,session_id,task_id,type,payload_json) VALUES(?,?,?,?,?)",

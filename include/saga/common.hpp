@@ -15,7 +15,7 @@ using Json = nlohmann::json;
 namespace fs = std::filesystem;
 using Id = std::int64_t;
 using Emit = std::function<void(const std::string&, const Json&)>;
-inline constexpr int runtime_context_revision=5;
+inline constexpr int runtime_context_revision=7;
 struct TurnCancelled : std::runtime_error { TurnCancelled() : std::runtime_error("Stopped by user") {} };
 std::string json_string_prefix(std::string_view source,std::string_view key);
 bool live_command_allowed(std::string_view name,const Json& arguments = Json::object());
@@ -47,6 +47,10 @@ struct Config {
   std::uint64_t context_length = 0, generation_reserve = 8192, safety_margin = 2048;
   bool allow_small_context = false, insecure_tls = false;
   int timeout_seconds = 600, max_tool_rounds = 24;
+  std::string search_engine = "duckduckgo";
+  int web_search_limit = 4, web_read_limit = 8;
+  bool web_allow_private_network=false;
+  size_t web_output_tokens=4096;
   double lexical_weight = 1, entity_weight = 0.6, project_weight = 1,
          goal_weight = 0.6, salience_weight = 0.5, recency_weight = 0.3,
          confidence_weight = 0.4, accessibility_weight = 0.3;

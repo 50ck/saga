@@ -17,6 +17,26 @@ struct Fixture {
   Config config() { Config c; c.endpoint = "http://127.0.0.1:9999"; c.model = "test-model"; c.context_length = 65536; return c; }
   std::unique_ptr<PersonaContext> persona(Json meta) { return std::make_unique<PersonaContext>(paths,meta,project); }
 };
+void nested_research_context() {
+  Fixture fixture;Registry registry(fixture.paths);auto p=fixture.persona(registry.create("Context fixture",""));
+  auto& db=*p->db;p->session=db.exec("INSERT INTO sessions(started_at,status) VALUES(?,'active')",{now()});
+  Json user={{"role","user"},{"content","Research modern rotation rules before implementing the terminal game."}};
+  db.exec("INSERT INTO messages(session_id,ts,role,content_json) VALUES(?,?,'user',?)",{p->session,now(),user.dump()});
+  Json args={{"query","SRS modern tetris rotation rules"}},calls=Json::array({{{"id","search-call"},{"type","function"},{"function",{{"name","web_search"},{"arguments",args.dump()}}}}});
+  Json assistant={{"role","assistant"},{"content",nullptr},{"tool_calls",calls}};
+  db.exec("INSERT INTO messages(session_id,ts,role,content_json) VALUES(?,?,'assistant',?)",{p->session,now(),assistant.dump()});
+  Json observation={{"results",Json::array()},{"next_cursor",std::string(8192,'x')}};
+  for(int i=0;i<10;++i)observation["results"].push_back({{"title",std::string(512,'t')},{"snippet",std::string(2048,'s')},{"url","https://docs.example.org/"+std::to_string(i)}});
+  auto event=db.event("tool.completed",{{"tool","web_search"},{"result",observation}},p->session);observation["source_event_id"]=event;
+  Json tool={{"role","tool"},{"tool_call_id","search-call"},{"content",observation.dump()}};
+  db.exec("INSERT INTO messages(session_id,ts,role,content_json) VALUES(?,?,'tool',?)",{p->session,now(),tool.dump()});
+  Memory memory(*p,fixture.config());ContextBuilder context(*p,memory,fixture.config());auto request=context.build();
+  CHECK(estimate_tokens(request.messages.dump())+estimate_tokens(request.tools.dump())<fixture.config().input_budget());
+  auto found=std::find_if(request.messages.begin(),request.messages.end(),[](auto& m){return m["role"]=="tool";});CHECK(found!=request.messages.end());
+  auto projected=Json::parse((*found)["content"].get<std::string>());CHECK(projected["context_excerpt"]==true);CHECK(projected["source_event_id"]==event);CHECK(projected.dump().size()<17000);
+  CHECK(Json::parse(db.query("SELECT content_json FROM messages WHERE session_id=? AND role='tool'",{p->session})[0]["content_json"].get<std::string>())["content"]==observation.dump());
+  CHECK(estimate_tokens(std::string(16000,'a'))<16000);
+}
 void streaming() {
   std::vector<std::string> frames;
   SseParser parser([&](std::string_view s){ frames.emplace_back(s); });
@@ -106,7 +126,7 @@ void persistence() {
   auto p = f.persona(a); CHECK(p->soul == "Identity A");
   rejects([&]{ f.persona(a); });
   auto q = f.persona(b); CHECK(q->soul == "Identity B");
-  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 4);
+  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 7);
   auto id = db->event("test.event",{{"text","immutable"}});
   Json single = id;
   CHECK(db->query("SELECT type FROM events WHERE id=?",{single})[0]["type"] == "test.event");
@@ -115,7 +135,7 @@ void persistence() {
   CHECK(q->db->query("SELECT * FROM events WHERE type='test.event'").empty());
   q->db->sql("ALTER TABLE facts DROP COLUMN project_id; UPDATE schema_version SET version=1");
   q->db->migrate();
-  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 4);
+  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 7);
   bool scoped_column = false;
   for (const auto& column : q->db->query("PRAGMA table_info(facts)")) if (column["name"] == "project_id") scoped_column = true;
   CHECK(scoped_column);
@@ -379,7 +399,7 @@ void config_and_ipc() {
 }
 }
 int main() {
-  std::vector<std::pair<std::string,std::function<void()>>> tests = {{"streaming",streaming},{"capability probe and progress",capability_probe},{"persistence and isolation",persistence},{"guarded and unrestricted host permissions",host_permissions},{"reviewed edits and workspaces",reviewed_edits},{"tools, proof gates, praxis and context",gates_and_praxis},{"configuration and IPC",config_and_ipc}};
+  std::vector<std::pair<std::string,std::function<void()>>> tests = {{"nested research context",nested_research_context},{"streaming",streaming},{"capability probe and progress",capability_probe},{"persistence and isolation",persistence},{"guarded and unrestricted host permissions",host_permissions},{"reviewed edits and workspaces",reviewed_edits},{"tools, proof gates, praxis and context",gates_and_praxis},{"configuration and IPC",config_and_ipc}};
   int failed = 0;
   for (auto& [name,test] : tests) { try { test(); std::cout << "PASS " << name << '\n'; } catch (const std::exception& e) { ++failed; std::cerr << "FAIL " << name << ": " << e.what() << '\n'; } }
   return failed ? 1 : 0;

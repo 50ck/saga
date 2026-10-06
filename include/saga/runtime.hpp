@@ -1,11 +1,12 @@
 #pragma once
 #include <saga/tools.hpp>
 namespace saga {
-enum class CognitiveMode { Respond, Recall, Deliberate, Plan, Act, Verify, Reflect, Learn, Ask, Wait };
+enum class CognitiveMode { Respond, Research, Recall, Deliberate, Plan, Act, Verify, Reflect, Learn, Ask, Wait };
 std::string mode_name(CognitiveMode mode);
 class ExecutiveController {
 public:
   static CognitiveMode route(std::string_view input);
+  static bool research_requested(std::string_view input);
   static bool needs_review(const Json& task,const Json& self);
 };
 class ContextBuilder {
@@ -43,7 +44,7 @@ class Runtime {
   void review(Emit emit);
   void mode(CognitiveMode mode,Emit emit);
 public:
-  Runtime(std::unique_ptr<PersonaContext> persona,Config config,std::unique_ptr<ModelBackend> backend,Approve approve);
+  Runtime(std::unique_ptr<PersonaContext> persona,Config config,std::unique_ptr<ModelBackend> backend,Approve approve,WebTransport transport = fetch_public_web);
   ~Runtime();
   void start(Emit emit = {});
   void chat(std::string input,Emit emit);

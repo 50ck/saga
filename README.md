@@ -16,9 +16,12 @@ backend is an OpenAI-compatible HTTP API, including servers such as llama.cpp.
 ## Build and run
 
 Linux, a C++23 compiler, CMake, SQLite with FTS5/JSON support, libcurl, wide
-ncurses and MD4C are required. Prefer the distribution's development packages
+ncurses and MD4C are required. Web research requires libcurl 7.85+
+with asynchronous DNS support. Prefer the distribution's development packages
 (for Markdown, `libmd4c-dev` on Debian/Ubuntu or `md4c` on Arch Linux).
-Stable C ABI declarations support systems with only the shared libraries.
+Stable C ABI declarations support SQLite, curl, ncurses and MD4C systems with only
+the shared libraries. Lexbor 3.0.0 is vendored and linked statically; no libxml2
+or web browser dependency is required.
 The nlohmann JSON header is vendored with its MIT license.
 
 ```sh
@@ -69,7 +72,7 @@ are never modified. Unchanged bubbles are cached; resizing rebuilds layout.
 Strikes use a combining stroke through the text, and italic appearance depends
 on terminal support. Public `report_progress` commentary streams separately from completion claims; commands stream bounded stdout/stderr while running. Empty model replies get one recovery attempt and then a visible error, never an empty bubble. `/steer PROMPT` queues instructions for the next model call in the same session, after the current command and approval finish. `/stop`, Ctrl+C or Esc interrupt active work and cancel queued steering while preserving completed changes.
 
-`/help`, `/status`, `/permissions` and inspection commands
+`/help`, `/status`, `/permissions`, `/web` and inspection commands
 remain available while the agent waits for the model, streams a reply, runs a tool
 or waits for approval. This includes `/memory`, `/know`, `/praxis`, `/artifacts`,
 `/journal`, `/goals`, `/tasks`, `/self`, `/project`, `/state`, and `/name` or `/soul`
@@ -422,3 +425,186 @@ author and committer identities verified before every commit.
 
 See [LICENSE](LICENSE) for the project's license. The vendored nlohmann JSON
 header retains its own [MIT license](third_party/nlohmann/LICENSE).
+
+## Public web research
+
+Saga provides native `web_search`, `web_fetch` and `web_read` tools, independent of shell and
+host permissions. Public read-only access is enabled automatically for each
+persona. `/web` shows the engine and current budgets; `/web off` cancels an active
+web request and prevents subsequent native network operations. `/web on` enables
+it again. These controls, `/status`, `/help`, steering and cancellation work while
+research is active. Disabling native access does not change host shell permissions;
+the cognitive prompt forbids bypassing that decision through shell commands.
+
+DuckDuckGo is the first engine. It uses the public non-JavaScript HTML interface
+and falls back once to Lite for a server error or missing endpoint. These are
+website interfaces, not a guaranteed search API: markup can change, queries can
+be throttled, and bot challenges can interrupt access. Saga reports challenges,
+rate limits, unrecognized markup and empty results distinctly and does not solve
+CAPTCHA or silently switch engines. No API key or browser is required.
+
+Search accepts quoted phrases, `site:`, `-site:`, `intitle:`, `inurl:`, `filetype:`,
+and term emphasis/exclusion. The adapter supplies engine-specific strategy guidance
+and enforces explicit domain constraints against result hostnames. DuckDuckGo
+can return related matches or imperfect operator results, so the agent must read
+sources and verify its constraints. Bangs and first-result redirects are unsupported.
+See [DuckDuckGo search syntax](https://duckduckgo.com/duckduckgo-help-pages/results/syntax).
+
+The cognitive cycle is: recall relevant knowledge, identify a concrete gap,
+search, read primary documentation, compare sources, record findings, implement,
+and verify through observed execution. Explicit research requests and recorded
+critical external assumptions create persistent research requirements. The runtime
+requires an attempt and an accounted outcome before implementation. This is a
+bounded safeguard, not a guarantee that the model will recognize every knowledge
+gap or correctly interpret every source. Stable trivial questions do not require
+searching merely because they are absent from memory.
+
+`research_question` records a gap; `research_resolve` requires exact passages from
+fetched document snapshots for supported or contradicted findings. Failed research
+is disclosed before reversible work continues. Critical unverified or contradicted
+research blocks verified completion; high-risk implementation stays gated. A search
+snippet cannot substantiate a researched conclusion, and documentation cannot pass
+an implementation/execution proof obligation. Explicit research checks use
+`task_add_check` with `kind: "research"` and a quoted document passage. Learned
+procedures remain candidates until experience validates them.
+
+Each persona owns its immutable source snapshots, research questions, source
+URLs, retrieval timestamps, content hashes and excerpts. Compaction preserves
+references and research conclusions; `web_read(source_id)` retrieves stored
+passages even with network access disabled. `refresh: true` creates a new snapshot.
+Repeated evidence from the same source URL does not increase confidence as though
+it came from independent sources. Search and page content remain untrusted data,
+never instructions to change permissions or execute commands.
+
+V1 reads HTML and plain text, including headings, lists, code and tables. PDF,
+authenticated sites and JavaScript-dependent content are unsupported. Requests
+use verified TLS, public HTTP/HTTPS destinations, address checks at connection
+time, validated redirects, no ambient proxies, and no model credentials. Each
+request has a 30-second deadline, five-redirect limit and 2 MiB decompressed body
+limit. Canonical content is bounded to 256 KiB. `web_fetch(url, query,
+max_output_tokens)` selects source sections locally, defaulting to 2,048 and
+allowing up to 4,096 estimated tokens. `web_read` also accepts a stored source ID
+and a focus query. Raw HTML, HTTP responses and API payloads never enter the
+model context. Older snapshots retain compatibility with byte-based excerpts.
+
+Global configuration additions in Saga's `config.toml`:
+
+```toml
+search_engine = "duckduckgo"
+web_search_limit = 4
+web_read_limit = 8
+web_output_tokens = 4096
+web_allow_private_network = false
+```
+
+These are per-turn network budgets, in addition to the existing tool-round budget.
+Cached source excerpts do not consume page-fetch budget. A search defaults to five
+results, with a maximum of ten. Changing the selected engine requires restarting
+the daemon; additional engines implement `SearchEngine` and register in
+`make_search_engine`. HTTP transport, document extraction, cognitive tools and
+persistence are shared. No dynamic plugin loader is required.
+
+The deterministic web tests use synthetic HTML and a mocked HTTP transport,
+including a research-to-compile-and-execute workflow. CTest never requires live
+DuckDuckGo. Optional live diagnostics (built with `BUILD_TESTING=ON`):
+
+```sh
+./build/saga_web_smoke 'site:duckduckgo.com "advanced syntax"'
+./build/saga_web_smoke --read https://duckduckgo.com/duckduckgo-help-pages/results/syntax
+```
+
+These commands contact the public Internet and return a nonzero status on a
+challenge, access failure or parsing failure. They do not load any persona data.
+
+## Deterministic document acquisition
+
+`WebAcquisitionEngine` is compiled into Saga's normal runtime. All sources produce
+`CanonicalDocument` before the agent sees content:
+
+```text
+HTTP → representation inspection → instance detection → API/raw or Lexbor HTML
+→ typed blocks → sanitization → normalization → deduplication
+→ local BM25F section selection → compact Markdown with provenance
+```
+
+The public interface is in `include/saga/web/acquisition.hpp`; implementation is
+in `src/web/`. It reuses Saga's exception-based errors, curl transport, JSON and
+persona-owned SQLite connection. Platform handlers share composed helpers in
+`sources.cpp` rather than a separate class hierarchy or plugin registry.
+GitHub/GitHub Enterprise, GitLab, Forgejo/Gitea, Discourse and
+MediaWiki handlers prefer public APIs. Forge handlers support repository, file,
+directory, issue, review, commit and release routes. Review diffs are fetched
+when the focus query requests a diff or patch. API failures fall back to an
+already downloaded textual page. Self-hosted instances use weighted metadata,
+asset and structural signals, evidence-derived mount paths and bounded JSON
+probes. Ordinary articles incur no platform probes.
+
+Lexbor parses HTML once. A block graph preserves headings, paragraphs, lists,
+definitions, quotations, code, tables and captions. Prose, documentation,
+discussion, reference and listing profiles use centralized readability, density,
+semantic, continuity and template weights. Strict, balanced and recall passes
+are evaluated against coverage, extracted size, link density and boilerplate.
+Scripts and hidden controls are removed; navigation, sidebars and footers receive
+penalties. Warning asides and related source sections remain available. Markdown
+is parsed directly with the existing MD4C dependency. Unicode NFC is supplied
+by Lexbor; iconv handles declared charsets. Code and diffs preserve whitespace.
+
+Technical tokenization retains flags, qualified identifiers, filenames and
+manual-page names. BM25F weights titles/headings above prose, expands useful
+section context, and selects complete semantic units within a conservative
+token estimate. Large focused code blocks use complete source-line windows;
+large focused tables select source rows. Extraction and reduction never use
+an LLM, embeddings, subprocesses or JavaScript execution.
+
+Persona-local SQLite tables cache HTTP bodies/validators, instance detections,
+canonical documents, content fingerprints and site-template observations.
+Conditional GET honors ETag and Last-Modified. HTTP and document caches are
+bounded to 128 entries; source snapshots remain immutable life evidence.
+Opaque search-pagination state is also cached locally behind short cursor IDs,
+instead of being passed through the model context.
+Template repetition increases a penalty rather than erasing historical content.
+Structured extraction diagnostics and fallback reasons are retained separately
+from the compact agent view.
+
+Default limits: 2 MiB decompressed responses, five redirects, ten-second connect
+timeout, thirty-second per-request deadline, 256 KiB canonical documents,
+64 KiB code blocks, 100 table rows/posts, twelve table columns, 8,000 semantic
+blocks, 100,000 DOM nodes and depth 128. `WebLimits` centralizes internal limits.
+The advanced `web_allow_private_network` setting permits LAN acquisition; its
+default is false. TLS verification stays enabled, ambient proxies and model
+credentials are excluded, and resolved socket addresses and every redirect are
+checked. Diagnostic URLs omit query strings.
+
+The TUI uses `•` activity markers, displays the submitted search query and shows
+`Visited title (URL)` for completed reads. Context accounting now shares one
+conservative estimator between its input guard and live display. Nested tool
+observations receive bounded context projections; full observations stay in
+append-only events. This fixes premature budget errors caused by counting each
+byte as one token while displaying roughly one token per three bytes.
+
+Tests include a synthetic regression corpus in `tests/web/corpus`, platform/API
+mocks, sanitizer/encoding/tokenizer/retrieval checks, cache and SSRF boundaries,
+context-budget regressions and deterministic mutation smoke tests. A native local
+HTTP test checks redirects, conditional requests, response limits and negotiation;
+it skips when the environment forbids local sockets. Run:
+
+```sh
+ctest --test-dir build --output-on-failure
+./build/saga_acquisition_tests --benchmark
+cmake -S . -B build-asan -DSAGA_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-asan -j
+ctest --test-dir build-asan --output-on-failure
+```
+
+Sanitizer builds require installed compiler ASan/UBSan runtime libraries and also
+instrument the vendored HTML parser. Fixtures are synthetic; no persona data or
+real conversations are included.
+
+Known limits: no authenticated acquisition, PDFs, browser challenges or JavaScript
+rendering. Dynamic shells fail explicitly. Forge routes assume one URL segment
+for a branch/ref unless the segment is percent-encoded; ambiguous branch paths
+fall back to HTML. API collection pages are bounded; exhaustive pagination is
+not claimed. Generic discussion pages retain source paragraphs unless reliable
+author/reply structure is supplied by a platform API. Extraction weights are
+heuristics calibrated against the synthetic corpus, not guarantees for every
+site layout. Conservative token estimates may reduce context utilization.

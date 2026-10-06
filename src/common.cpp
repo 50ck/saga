@@ -1,4 +1,5 @@
 #include <saga/common.hpp>
+#include <saga/web.hpp>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
@@ -14,7 +15,7 @@ namespace saga {
 bool live_command_allowed(std::string_view name,const Json& arguments) {
   if (!arguments.is_object()) return false;
   if (name == "name" || name == "soul" || name == "project") return arguments.empty();
-  return name == "diff" || name == "stop" || name == "steer" || name == "status" || name == "permissions" || name == "memory" || name == "journal" ||
+  return name == "web" || name == "diff" || name == "stop" || name == "steer" || name == "status" || name == "permissions" || name == "memory" || name == "journal" ||
     name == "goals" || name == "tasks" || name == "self" || name == "project" || name == "state";
 }
 std::string json_string_prefix(std::string_view source,std::string_view key) {
@@ -126,9 +127,11 @@ std::string trim(std::string_view s) {
   return first == std::string_view::npos ? "" : std::string(s.substr(first, last - first + 1));
 }
 size_t estimate_tokens(std::string_view s) {
-  // ponytail: byte upper estimate sacrifices utilization without a model tokenizer.
-  // A tokenizer-aware estimator can reclaim capacity; provider usage wins for display.
-  return s.size() + 8;
+  // Conservative approximation, not a byte count disguised as a token count.
+  // Non-ASCII and symbol-heavy text receive extra capacity; API usage wins.
+  size_t symbols=0,non_ascii=0;
+  for(unsigned char c:s) { symbols+=std::ispunct(c)!=0; non_ascii+=c>=128; }
+  return (s.size()+1)/2 + symbols/4 + non_ascii/2 + 8;
 }
 std::string digest(std::string_view s) {
   // Non-cryptographic content fingerprint for metrics, never used for security.
@@ -213,6 +216,11 @@ Config Config::load(const Paths& paths) {
       else if (k == "insecure_tls") c.insecure_tls = Json::parse(v).get<bool>();
       else if (k == "timeout_seconds") c.timeout_seconds = Json::parse(v).get<int>();
       else if (k == "max_tool_rounds") c.max_tool_rounds = Json::parse(v).get<int>();
+      else if (k == "search_engine") c.search_engine = Json::parse(v).get<std::string>();
+      else if (k == "web_search_limit") c.web_search_limit = Json::parse(v).get<int>();
+      else if (k == "web_read_limit") c.web_read_limit = Json::parse(v).get<int>();
+      else if (k == "web_allow_private_network") c.web_allow_private_network = Json::parse(v).get<bool>();
+      else if (k == "web_output_tokens") c.web_output_tokens = Json::parse(v).get<size_t>();
       else if (k == "lexical_weight") c.lexical_weight = Json::parse(v).get<double>();
       else if (k == "entity_weight") c.entity_weight = Json::parse(v).get<double>();
       else if (k == "project_weight") c.project_weight = Json::parse(v).get<double>();
@@ -232,6 +240,8 @@ void Config::save(const Paths& p) const {
   Json fields = {{"endpoint",endpoint},{"api_key",api_key},{"model",model},{"context_length",context_length},
     {"generation_reserve",generation_reserve},{"safety_margin",safety_margin},{"allow_small_context",allow_small_context},
     {"insecure_tls",insecure_tls},{"timeout_seconds",timeout_seconds},{"max_tool_rounds",max_tool_rounds},
+    {"search_engine",search_engine},{"web_search_limit",web_search_limit},{"web_read_limit",web_read_limit},
+    {"web_allow_private_network",web_allow_private_network},{"web_output_tokens",web_output_tokens},
     {"lexical_weight",lexical_weight},{"entity_weight",entity_weight},{"project_weight",project_weight},{"goal_weight",goal_weight},
     {"salience_weight",salience_weight},{"recency_weight",recency_weight},{"confidence_weight",confidence_weight},{"accessibility_weight",accessibility_weight}};
   for (auto it = fields.begin(); it != fields.end(); ++it) s << it.key() << " = " << it.value().dump() << '\n';
@@ -243,6 +253,8 @@ void Config::validate() const {
     throw std::runtime_error("Saga requires at least 65,536 tokens of effective context. Detected: " + std::to_string(context_length) + ".");
   if (context_length <= generation_reserve || context_length - generation_reserve <= safety_margin)
     throw std::runtime_error("Generation reserve and safety margin leave no input budget");
+  (void)make_search_engine(search_engine); // The provider registry owns engine validation.
+  if (web_search_limit < 1 || web_search_limit > 100 || web_read_limit < 1 || web_read_limit > 100 || web_output_tokens<128 || web_output_tokens>4096) throw std::runtime_error("Invalid web research limits");
   if (timeout_seconds < 1 || timeout_seconds > 1800 || max_tool_rounds < 1 || max_tool_rounds > 100)
     throw std::runtime_error("Invalid runtime limits");
 }

@@ -1,5 +1,6 @@
 #include <saga/tools.hpp>
 #include <saga/edit.hpp>
+#include <saga/web/acquisition.hpp>
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -221,6 +222,13 @@ Json Tools::definitions() {
     add(name,"Retrieve persistent " + std::string(name) + " evidence. One deep recall escalation is available.",{{"query",str()},{"depth",{{"type","string"},{"enum",{"normal","deep"}}}}},{"query"});
   add("inspect_open_loops","Retrieve unresolved work",Json::object(),{});
   add("recall_observation","Retrieve an archived observation by its provenance event ID; offset and limit page the original JSON text",{{"event_id",integer()},{"offset",integer()},{"limit",integer()}},{"event_id"});
+  auto strings=Json{{"type","array"},{"items",str()}};
+  auto citations=Json{{"type","array"},{"items",{{"type","object"},{"properties",{{"source_id",integer()},{"quote",str()}}},{"required",{"source_id","quote"}},{"additionalProperties",false}}}};
+  add("web_search","Search the selected public web engine using its advanced syntax. Snippets are discovery only; use web_read for evidence. Domain constraints are enforced locally. No host shell approval is needed. Respect /web and bounded research budgets.",{{"query",str()},{"limit",integer()},{"cursor",str()},{"include_domains",strings},{"exclude_domains",strings}},{"query"});
+  add("web_read","Acquire a public document through deterministic extraction, platform APIs and local section retrieval. URL or source_id is required. Supply query to focus on the current knowledge gap. HTML/API payloads never enter cognition. Stored snapshots remain available; refresh creates a new snapshot. offset/limit support older excerpts.",{{"url",str()},{"source_id",integer()},{"query",str()},{"max_output_tokens",integer()},{"offset",integer()},{"limit",integer()},{"refresh",boolean()}},{});
+  add("web_fetch","Fetch a public document as compact, sanitized, untrusted source sections. Use query for local BM25F retrieval; max_output_tokens bounds output. Platform acquisition and cleanup are automatic. No browser, JavaScript execution or model summarization is used.",{{"url",str()},{"query",str()},{"max_output_tokens",integer()}},{"url"});
+  add("research_question","Record a concrete external knowledge gap. Set required=true for critical assumptions or explicit user research requests.",{{"question",str()},{"required",boolean()}},{"question"});
+  add("research_resolve","Account for a research question with supported, contradicted or unverified findings. Supported/contradicted conclusions require fetched document source IDs and exact quotes. An attempted search/read is required before marking required research unverified unless web access is disabled.",{{"id",integer()},{"status",{{"type","string"},{"enum",{"supported","contradicted","unverified"}}}},{"conclusion",str()},{"sources",citations}},{"id","status","conclusion","sources"});
   add("observe_environment","Safely inspect the current project, git state, clock and machine",Json::object(),{});
   add("file_read","Read a file in the active project or this identity's artifacts",{{"path",str()}},{"path"});
   add("file_write","Create or replace a UTF-8 project/artifact file. Present a complete diff for approval in modes 1/3; apply automatically in 2/4. Track history only after writing.",{{"path",str()},{"content",str()},{"description",str()}},{"path","content","description"});
@@ -229,12 +237,12 @@ Json Tools::definitions() {
   add("shell_exec","Run a shell command. execution=sandbox (default) is automatic, project/scratch only, no network. execution=host follows /permissions: 1/2 use private-storage guards; 3/4 run as the daemon's OS user without Saga isolation, asking approval only in 3. Use host for desktop DBus/notify-send, tmux, network or files outside the project. Unrestricted host can access all files and processes accessible to that user. timeout <=120 seconds; no detached processes.",{{"command",str()},{"timeout_seconds",integer()},{"execution",{{"type","string"},{"enum",{"sandbox","host"}}}}},{"command"});
   add("task_create","Create an explicit task and required proof obligations",{{"title",str()},{"objective",str()},{"risk",{{"type","string"},{"enum",{"low","medium","high"}}}},{"domain",str()},{"checks",{{"type","array"},{"items",str()}}}},{"title","objective","risk","checks"});
   add("task_update","Select or update a task; completion is gated on evidence and required checks",{{"id",integer()},{"status",{{"type","string"},{"enum",{"active","blocked","verifying","completed","abandoned"}}}}},{"id","status"});
-  add("task_add_check","Refine the current task's definition of done with a specific proof obligation",{{"description",str()}},{"description"});
-  add("check_resolve","Resolve a proof obligation using observed tool output or an explicit user confirmation",{{"check_id",integer()},{"source_event_id",integer()},{"passed",boolean()},{"explanation",str()}},{"check_id","source_event_id","passed","explanation"});
-  add("record_assumption","Record an unverified assumption",{{"statement",str()},{"impact",{{"type","string"},{"enum",{"low","high"}}}},{"verification_method",str()}},{"statement","impact","verification_method"});
-  add("resolve_assumption","Resolve an assumption using observed evidence",{{"id",integer()},{"source_event_id",integer()},{"confirmed",boolean()}},{"id","source_event_id","confirmed"});
+  add("task_add_check","Refine the current task's definition of done with a specific proof obligation",{{"description",str()},{"kind",{{"type","string"},{"enum",{"execution","research"}}}}},{"description"});
+  add("check_resolve","Resolve a proof obligation using observed tool output or an explicit user confirmation",{{"check_id",integer()},{"source_event_id",integer()},{"passed",boolean()},{"explanation",str()},{"quote",str()}},{"check_id","source_event_id","passed","explanation"});
+  add("record_assumption","Record an unverified assumption",{{"statement",str()},{"impact",{{"type","string"},{"enum",{"low","high"}}}},{"verification_method",str()},{"requires_research",boolean()}},{"statement","impact","verification_method"});
+  add("resolve_assumption","Resolve an assumption using observed evidence",{{"id",integer()},{"source_event_id",integer()},{"confirmed",boolean()},{"quote",str()}},{"id","source_event_id","confirmed"});
   add("record_hypothesis","Store a hypothesis separately from facts",{{"statement",str()}},{"statement"});
-  add("resolve_hypothesis","Confirm or reject a hypothesis using evidence",{{"id",integer()},{"source_event_id",integer()},{"confirmed",boolean()}},{"id","source_event_id","confirmed"});
+  add("resolve_hypothesis","Confirm or reject a hypothesis using evidence",{{"id",integer()},{"source_event_id",integer()},{"confirmed",boolean()},{"quote",str()}},{"id","source_event_id","confirmed"});
   add("record_prediction","Predict a diagnostic outcome before acting; model confidence is weak metadata",{{"statement",str()},{"expected_outcome",str()},{"confidence",{{"type","number"}}},{"domain",str()}},{"statement","expected_outcome","confidence","domain"});
   add("record_observation","Compare a prediction with actual tool output",{{"prediction_id",integer()},{"source_event_id",integer()},{"statement",str()},{"matched",boolean()}},{"prediction_id","source_event_id","statement","matched"});
   add("learn_fact","Learn a semantic fact with provenance; use correction=true for explicit user correction",{{"subject",str()},{"predicate",str()},{"object",str()},{"source_event_id",integer()},{"correction",boolean()},{"scope",{{"type","string"},{"enum",{"global","project"}}}}},{"subject","predicate","object","source_event_id"});
@@ -352,7 +360,8 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
     p_.db->event("tool.cancelled",{{"run_id",run},{"tool",name}},p_.session,p_.task);
     if(emit)emit("tool.cancelled",{{"run_id",run},{"tool",name}});
     throw;
-  } catch (const std::exception& e) { result = {{"error",e.what()}}; }
+  } catch (const web::Error& e) { result = {{"error",e.what()},{"error_type",web::error_name(e.code)}}; }
+  catch (const std::exception& e) { result = {{"error",e.what()}}; }
   bool failed = result.contains("error") || (result.contains("exit_code") && result["exit_code"] != 0);
   p_.db->exec("UPDATE internal_state SET frustration=max(0,min(1,frustration+?)),confidence=max(0.05,min(0.95,confidence+?)),engagement=min(1,engagement+0.02),satisfaction=max(0,min(1,satisfaction+?)),updated_at=? WHERE id=1",{failed ? 0.15 : -0.03,failed ? -0.08 : 0.02,failed ? -0.1 : 0.03,now()});
   auto type = failed ? "tool.failed" : "tool.completed";
@@ -360,12 +369,32 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
     {now()-started,failed ? "failed" : "completed",result.value("exit_code",Json()),result.value("stdout_size",result.value("stdout",std::string()).size()),result.value("stderr_size",result.value("stderr",std::string()).size()),failed ? Json(result.value("error",std::string("nonzero_exit"))) : Json(),digest(result.dump()),run});
   Id ev = p_.db->event(type,{{"run_id",run},{"tool",name},{"result",result}},p_.session,p_.task);
   result["source_event_id"] = ev;
-  if (p_.task && name!="report_progress") memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
+  if (p_.task && name!="report_progress" && !name.starts_with("web_") && !name.starts_with("research_")) memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
   if (emit && name!="report_progress") emit(type,{{"run_id",run},{"tool",name},{"result",result}});
   return result;
 }
 Json Tools::dispatch(const std::string& name,const Json& a) {
   auto db = p_.db.get();
+  if(name.starts_with("web_") || name.starts_with("research_"))return web_.dispatch(name,a,p_.session,p_.task);
+  bool implementation=name=="file_write" || name=="file_edit" || name=="shell_exec";
+  if(implementation)web_.account_for_pending(p_.session,p_.task,events_);
+  web_.disclose_failures(p_.session,p_.task,events_);
+  auto pending=web_.unresolved_required(p_.session,p_.task);
+  if(name=="file_write" || name=="file_edit" || name=="shell_exec")for(auto& q:pending)if(q["status"]=="pending")return {{"error","Required research must be attempted and accounted for before implementation. Use web_search/web_read and research_resolve, or disclose disabled access."},{"research",pending}};
+  if(implementation && !pending.empty() && p_.task) {
+    auto risk=db->query("SELECT risk FROM tasks WHERE id=?",{p_.task});
+    if(!risk.empty() && risk[0]["risk"]=="high")return {{"error","High-risk implementation is blocked by unresolved critical research; safe inspection may continue"},{"research",pending}};
+  }
+  auto documentation = [&](const Json& origin) {
+    if(origin["type"]!="tool.completed")return false;
+    auto payload=Json::parse(origin["payload_json"].get<std::string>());
+    return (payload.value("tool","")=="web_read" || payload.value("tool","")=="web_fetch") && payload.value("result",Json::object()).value("kind","")=="document";
+  };
+  auto quoted_document = [&](const Json& origin) {
+    auto payload=Json::parse(origin["payload_json"].get<std::string>());auto result=payload.at("result");
+    auto rows=db->query("SELECT text FROM web_sources WHERE id=? AND kind='document'",{result.at("source_id")});
+    auto quote=a.value("quote","");if(rows.empty() || quote.empty() || rows[0]["text"].get_ref<const std::string&>().find(quote)==std::string::npos)throw std::runtime_error("Document evidence requires an exact quote present in its stored source");
+  };
   if(name=="report_progress") {if(trim(a["text"].get<std::string>()).empty())throw std::runtime_error("Progress text cannot be empty");return {{"published",true}};}
   auto source = [&](Id event,bool user_only = false) {
     auto rows = db->query("SELECT * FROM events WHERE id=? AND session_id=?",{event,p_.session});
@@ -374,7 +403,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if (!user_only && rows[0]["type"] != "user.message") {
       auto payload = Json::parse(rows[0]["payload_json"].get<std::string>());
       auto tool = payload.value("tool","");
-      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "file_edit" && tool != "observe_environment")
+      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "file_edit" && tool != "observe_environment" && !documentation(rows[0]))
         throw std::runtime_error("Cognitive tool acknowledgements are not external observations");
     }
     return rows[0];
@@ -544,6 +573,8 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     if (a["status"] == "completed") {
       auto checks = db->query("SELECT * FROM task_checks WHERE task_id=? AND required=1 AND status!='passed'",{id});
       auto assumptions = db->query("SELECT * FROM assumptions WHERE task_id=? AND status='unresolved' AND impact_if_wrong='high'",{id});
+      auto research=db->query("SELECT * FROM research_questions WHERE required=1 AND status!='supported' AND task_id=?",{id});
+      if (!research.empty()) return {{"error","Critical research remains unverified"},{"research",research}};
       if (!checks.empty() || !assumptions.empty()) return {{"error","Required proof obligations or high-impact assumptions remain unresolved"},{"checks",checks},{"assumptions",assumptions}};
     }
     p_.task = id;
@@ -553,7 +584,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
   }
   if (name == "task_add_check") {
     active_task();
-    auto id = db->exec("INSERT INTO task_checks(task_id,description) VALUES(?,?)",{p_.task,a["description"]});
+    auto id = db->exec("INSERT INTO task_checks(task_id,description,kind) VALUES(?,?,?)",{p_.task,a["description"],a.value("kind","execution")});
     db->exec("UPDATE tasks SET status='verifying',completed_at=NULL WHERE id=? AND status='completed'",{p_.task});
     event("task.check_added",{{"check_id",id},{"description",a["description"]}}); return {{"check_id",id}};
   }
@@ -572,28 +603,37 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     }
     if (passed && origin["type"] == "tool.failed") throw std::runtime_error("Failed tool output cannot pass a check");
     if (origin["type"] == "tool.completed") {
+      if(documentation(origin)) {
+        if(rows[0]["kind"]!="research")throw std::runtime_error("Documentation cannot pass an implementation/execution check");
+        quoted_document(origin);
+      } else if(rows[0]["kind"]=="research")throw std::runtime_error("Research checks require a fetched document passage or explicit user confirmation");
       auto tool = payload.value("tool","");
-      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "file_edit" && tool != "observe_environment") throw std::runtime_error("Proof must be externally observed, not a cognitive tool acknowledgement");
+      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "file_edit" && tool != "observe_environment" && !documentation(origin)) throw std::runtime_error("Proof must be externally observed, not a cognitive tool acknowledgement");
     }
-    Id evidence_id = memory_.evidence("check",a["check_id"],origin["type"] == "user.message" ? "user confirmed" : "output observed",passed,sid,1,0.9);
+    Id evidence_id = memory_.evidence("check",a["check_id"],origin["type"] == "user.message" ? "user confirmed" : documentation(origin) ? "documentation" : "output observed",passed,sid,1,documentation(origin) ? 0.3 : 0.9);
     db->exec("UPDATE task_checks SET status=?,evidence_id=? WHERE id=?",{passed ? "passed" : "failed",evidence_id,a["check_id"]});
     event("task.check_resolved",a); return {{"evidence_id",evidence_id}};
   }
   if (name == "record_assumption") {
     active_task(); auto ev = event("assumption.created",a);
-    auto id = db->exec("INSERT INTO assumptions(task_id,statement,impact_if_wrong,verification_method,source_event_id,created_at) VALUES(?,?,?,?,?,?)",{p_.task,a["statement"],a["impact"],a["verification_method"],ev,now()}); return {{"id",id}};
+    auto id = db->exec("INSERT INTO assumptions(task_id,statement,impact_if_wrong,verification_method,source_event_id,created_at) VALUES(?,?,?,?,?,?)",{p_.task,a["statement"],a["impact"],a["verification_method"],ev,now()});
+    auto method=lower(a["verification_method"].get<std::string>());bool external=a.value("requires_research",false);
+    for(auto* term:{"internet","web","documentation","search","online","external specification"})if(method.find(term)!=std::string::npos)external=true;
+    if(external)web_.question(a["statement"],a["impact"]=="high",p_.session,p_.task,id);
+    return {{"id",id}};
   }
   if (name == "record_hypothesis") {
     active_task(); auto ev = event("hypothesis.created",a);
     auto id = db->exec("INSERT INTO hypotheses(task_id,statement,source_event_id,created_at) VALUES(?,?,?,?)",{p_.task,a["statement"],ev,now()}); return {{"id",id}};
   }
   if (name == "resolve_assumption" || name == "resolve_hypothesis") {
-    active_task(); source(a["source_event_id"]);
+    active_task(); auto origin=source(a["source_event_id"]);
+    if(documentation(origin))quoted_document(origin);
     std::string table = name == "resolve_assumption" ? "assumptions" : "hypotheses";
     auto id = a["id"].get<Id>();
     if (db->query("SELECT id FROM " + table + " WHERE id=? AND task_id=?",{id,p_.task}).empty()) throw std::runtime_error("Unknown epistemic state on current task");
     db->exec("UPDATE " + table + " SET status=? WHERE id=?",{a["confirmed"].get<bool>() ? "confirmed" : "rejected",id});
-    memory_.evidence(table,id,"observation",a["confirmed"],a["source_event_id"]); event(table + ".resolved",a); return {{"id",id}};
+    memory_.evidence(table,id,"observation",a["confirmed"],a["source_event_id"],1,documentation(origin) ? 0.3 : 0.8); event(table + ".resolved",a); return {{"id",id}};
   }
   if (name == "record_prediction") {
     active_task(); auto ev = event("prediction.created",a);
@@ -601,6 +641,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
   }
   if (name == "record_observation") {
     active_task(); auto origin = source(a["source_event_id"]);
+    if(documentation(origin))throw std::runtime_error("Documentation is not a diagnostic execution observation");
     auto prediction = db->query("SELECT * FROM predictions WHERE id=? AND task_id=?",{a["prediction_id"],p_.task});
     if (prediction.empty() || prediction[0]["created_at"].get<Id>() > origin["ts"].get<Id>()) throw std::runtime_error("Prediction must precede observation and belong to current task");
     auto id = db->exec("INSERT INTO observations(task_id,prediction_id,statement,matched,source_event_id,created_at) VALUES(?,?,?,?,?,?)",{p_.task,a["prediction_id"],a["statement"],a["matched"],a["source_event_id"],now()});
@@ -610,7 +651,7 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
   if (name == "record_belief") {
     auto origin = source(a["source_event_id"]);
     auto id = db->exec("INSERT INTO beliefs(statement,domain,reasoning_confidence,source_event_id,created_at,updated_at) VALUES(?,?,?,?,?,?)",{a["statement"],a["domain"],std::clamp(a.value("reasoning_confidence",0.5),0.05,0.95),a["source_event_id"],now(),now()});
-    memory_.evidence("belief",id,"initial supporting observation",true,a["source_event_id"],0.5,origin["type"] == "tool.completed" ? 0.8 : 0.5);
+    memory_.evidence("belief",id,"initial supporting observation",true,a["source_event_id"],0.5,documentation(origin) ? 0.3 : origin["type"] == "tool.completed" ? 0.8 : 0.5);
     auto confidence = memory_.confidence("belief",id);
     db->exec("UPDATE beliefs SET evidence_confidence=?,operational_confidence=? WHERE id=?",{confidence,confidence,id});
     event("belief.created",{{"id",id},{"belief",a}}); return {{"id",id},{"evidence_confidence",confidence}};
@@ -620,10 +661,11 @@ Json Tools::dispatch(const std::string& name,const Json& a) {
     std::string type = a["target_type"],table = type == "hypothesis" ? "hypotheses" : type == "belief" ? "beliefs" : type + "s";
     Id id = a["target_id"]; bool support = a["support"];
     if (db->query("SELECT id FROM " + table + " WHERE id=?",{id}).empty()) throw std::runtime_error("Unknown epistemic target");
-    std::string kind = origin["type"] == "user.message" ? "user statement" : "output observed";
+    std::string kind = origin["type"] == "user.message" ? "user statement" : documentation(origin) ? "documentation" : "output observed";
     auto prior = db->query("SELECT id FROM evidence WHERE target_type=? AND target_id=? AND kind=? AND direction=? AND source_event_id=?",{type,id,kind,support ? "support" : "against",a["source_event_id"]});
     if (!prior.empty()) return {{"id",prior[0]["id"]},{"already_recorded",true},{"evidence_confidence",memory_.confidence(type,id)}};
-    auto proof = memory_.evidence(type,id,kind,support,a["source_event_id"],1,0.75);
+    if(documentation(origin) && type=="task")throw std::runtime_error("Documentation supports claims, not task execution confidence");
+    auto proof = memory_.evidence(type,id,kind,support,a["source_event_id"],1,documentation(origin) ? 0.3 : 0.75);
     auto confidence = memory_.confidence(type,id);
     if (type == "fact") db->exec("UPDATE facts SET confidence=? WHERE id=?",{confidence,id});
     if (type == "belief") db->exec("UPDATE beliefs SET evidence_confidence=?,operational_confidence=?,status=?,updated_at=? WHERE id=?",{confidence,confidence,support ? (confidence >= 0.65 ? "supported" : "unresolved") : "contested",now(),id});

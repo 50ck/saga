@@ -76,6 +76,7 @@ struct Client {
         else if (t == "context.usage" && !p.value("streaming",false)) std::cout << "\n[" << (p.value("approximate",true) ? "~" : "") << p.value("used_tokens",p.value("input_tokens",0ULL)+p.value("output_tokens",0ULL)) << "/" << p.value("context_length",0ULL) << " tokens]\n";
         else if (t == "tool.started") std::cout << "\n[" << display_text(p.value("tool","")) << "]\n";
         else if (t == "tool.failed") std::cout << "[tool failed]\n";
+        else if(t=="research.warning")std::cout<<"\n"<<display_text(p.value("content",""))<<'\n';
         else if (t == "notification") std::cout << "\n" << display_text(p.value("description","")) << '\n';
       }
     }
@@ -152,6 +153,7 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
   Json args = Json::object();
   if(name=="diff") {args["event_id"]=std::stoll(arg);}
   else if (name == "steer") {args["content"]=arg;}
+  else if (name == "web" && !arg.empty()) {auto value=lower(arg);if(value!="on" && value!="off")throw std::runtime_error("Use /web, /web on or /web off");args["enabled"]=value=="on";}
   else if (name == "memory" || name == "know" || name == "praxis" || name == "artifacts") {
     args = {{"query",arg},{"kind",name == "know" ? "know" : name == "praxis" ? "know_how" : name == "artifacts" ? "recall_artifact" : "remember"},{"deep",true}}; name = "memory";
   } else if (name == "project" && !arg.empty()) args = {{"path",arg}};
@@ -173,6 +175,9 @@ Action local_command(Client& client,const std::string& input,const fs::path& cwd
       auto status=name == "status" ? result : result["status"];
       if (callback) { callback("agent.status",status); callback("result",format_agent_status(status)); }
       else if (!client.json_output) std::cout << display_text(format_agent_status(status)) << '\n';
+    } else if (name == "web") {
+      auto text=std::string("Public web: ")+(result.value("enabled",true) ? "on" : "off")+" · engine: "+result.value("engine","duckduckgo")+"\nSearches: "+std::to_string(result.value("searches",0))+"/"+std::to_string(result.value("search_limit",4))+" · reads: "+std::to_string(result.value("reads",0))+"/"+std::to_string(result.value("read_limit",8))+"\nUse /web on or /web off. Public HTML/text access is automatic and separate from host permissions.";
+      if(callback){callback("web.changed",result);callback("result",text);}else if(!client.json_output)std::cout<<text<<'\n';
     } else if (name == "permissions") {
       if (callback) { callback(arg.empty() ? "permissions.menu" : "permissions.changed",result); if (!arg.empty()) callback("result","Host permissions: "+result["label"].get<std::string>()); }
       else if (!client.json_output) std::cout << "Host permissions: " << result["label"].get<std::string>()

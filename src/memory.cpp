@@ -1,4 +1,5 @@
 #include <saga/memory.hpp>
+#include <saga/web.hpp>
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -124,7 +125,7 @@ Id Memory::evidence(std::string type,Id id,std::string kind,bool support,Id sour
   return p_.db->query("SELECT id FROM evidence WHERE target_type=? AND target_id=? AND kind=? AND direction=? AND source_event_id=?",{type,id,kind,support ? "support" : "against",source})[0]["id"];
 }
 double Memory::confidence(std::string type,Id id,double prior) {
-  auto rows = p_.db->query("SELECT direction,max(weight*reliability) AS strength FROM evidence WHERE target_type=? AND target_id=? GROUP BY source_event_id,direction",{type,id});
+  auto rows = p_.db->query("SELECT e.direction,max(e.weight*e.reliability) AS strength FROM evidence e LEFT JOIN events v ON v.id=e.source_event_id LEFT JOIN web_sources w ON w.id=CASE WHEN json_extract(v.payload_json,'$.tool')='web_read' THEN json_extract(v.payload_json,'$.result.source_id') END WHERE e.target_type=? AND e.target_id=? GROUP BY coalesce('web:'||w.url,'event:'||e.source_event_id),e.direction",{type,id});
   double support = prior*2, total = 2;
   for (auto& e : rows) { double w = e["strength"]; total += w; if (e["direction"] == "support") support += w; }
   double result = support/total;
@@ -142,11 +143,12 @@ Id Memory::fact(const std::string& subject,const std::string& predicate,const st
     auto existing = p_.db->query("SELECT * FROM facts WHERE subject=? AND predicate=? AND valid_to IS NULL AND coalesce(project_id,0)=?",{subject,predicate,project});
     auto origin = p_.db->query("SELECT type,payload_json FROM events WHERE id=?",{source});
     if (origin.empty()) throw std::runtime_error("Fact requires provenance");
+    bool document=origin[0]["type"]=="tool.completed" && Json::parse(origin[0]["payload_json"].get<std::string>()).value("tool","")=="web_read";
     bool explicit_user = origin[0]["type"] == "user.message" && lower(origin[0]["payload_json"].get<std::string>()).find(lower(object)) != std::string::npos;
     if (correction && !explicit_user) throw std::runtime_error("Correction requires a user message");
     if (!existing.empty() && existing[0]["object"] == object) {
       result = existing[0]["id"];
-      auto ev = evidence("fact",result,explicit_user ? "user stated" : "inferred",true,source,1,explicit_user ? 0.95 : 0.3);
+      auto ev = evidence("fact",result,explicit_user ? "user stated" : document ? "documentation" : "inferred",true,source,1,explicit_user ? 0.95 : 0.3);
       p_.db->exec("INSERT OR IGNORE INTO fact_evidence(fact_id,evidence_id) VALUES(?,?)",{result,ev});
       p_.db->exec("UPDATE facts SET last_confirmed_at=?,confidence=? WHERE id=?",{now(),confidence("fact",result),result});
       return;
@@ -161,7 +163,7 @@ Id Memory::fact(const std::string& subject,const std::string& predicate,const st
         p_.db->exec("UPDATE facts SET confidence=? WHERE id=?",{confidence("fact",old["id"]),old["id"]});
       }
     }
-    auto ev = evidence("fact",result,explicit_user ? "user stated" : "inferred",true,source,correction ? 2 : 1,explicit_user ? 0.95 : 0.3);
+    auto ev = evidence("fact",result,explicit_user ? "user stated" : document ? "documentation" : "inferred",true,source,correction ? 2 : 1,explicit_user ? 0.95 : 0.3);
     p_.db->exec("INSERT OR IGNORE INTO fact_evidence(fact_id,evidence_id) VALUES(?,?)",{result,ev});
     p_.db->exec("UPDATE facts SET confidence=? WHERE id=?",{confidence("fact",result),result});
     p_.db->event("fact.learned",{{"id",result},{"source",source}},p_.session,p_.task);
@@ -245,7 +247,7 @@ Json Memory::wake() {
     {"unfinished",p_.db->query("SELECT id,title,status FROM tasks WHERE status IN ('planned','active','blocked','verifying') AND (project_id IS NULL OR project_id=?) LIMIT 12",{p_.project})},
     {"commitments",p_.db->query("SELECT description,due_condition FROM commitments WHERE status='active' ORDER BY priority DESC LIMIT 8")},
     {"goals",p_.db->query("SELECT * FROM goals WHERE status='active' AND (project_id IS NULL OR project_id=?) ORDER BY priority DESC LIMIT 8",{p_.project})},
-    {"open_loops",search("inspect_open_loops","")},{"self",self()},{"project",project_context()}};
+    {"research",p_.db->query("SELECT id,task_id,substr(question,1,512) AS question,required,status,substr(conclusion,1,1024) AS conclusion FROM research_questions WHERE status IN ('pending','unverified','contradicted') AND (task_id IS NULL OR task_id IN (SELECT id FROM tasks WHERE project_id=?)) ORDER BY id DESC LIMIT 12",{p_.project})},{"open_loops",search("inspect_open_loops","")},{"self",self()},{"project",project_context()}};
 }
 Json Memory::handoff() {
   auto rows=p_.db->query("SELECT id,through_message_id,state_json FROM context_checkpoints WHERE session_id=? ORDER BY id DESC LIMIT 1",{p_.session});
@@ -270,12 +272,13 @@ Json Memory::checkpoint(std::string reason,Id through,const Json& working) {
     {"last_user_request",objective.empty() ? Json("") : Json::parse(objective[0]["content_json"].get<std::string>())["content"]},
     {"task",task},{"checks",db.query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})},
     {"assumptions",db.query("SELECT * FROM assumptions WHERE task_id=? AND status='unresolved'",{p_.task})},
+    {"research",research_context(db,p_.session,p_.task)},
     {"hypotheses",db.query("SELECT * FROM hypotheses WHERE task_id=? AND status='unresolved'",{p_.task})},
     {"decisions",project_context()["decisions"]},{"recent_dialogue",excerpts},{"working",working},
     {"tool_observations",db.query("SELECT id AS source_event_id,type,json_extract(payload_json,'$.tool') AS tool FROM events WHERE session_id=? AND type IN ('tool.completed','tool.failed') ORDER BY id DESC LIMIT 8",{p_.session})},
     {"next_steps","Continue the objective; satisfy unresolved checks and assumptions before claiming completion."}};
   Json snapshot={{"context",context},{"soul_hash",digest(p_.soul)},{"self",self()},{"project",project_context()}};
-  for (auto* table : {"facts","beliefs","hypotheses","assumptions","predictions","observations","evidence","praxis","self_beliefs","developed_traits","relationship_beliefs","goals","intentions","commitments","open_loops","curiosities","artifacts","tasks","task_checks"}) {
+  for (auto* table : {"facts","beliefs","hypotheses","assumptions","predictions","observations","evidence","praxis","self_beliefs","developed_traits","relationship_beliefs","goals","intentions","commitments","open_loops","curiosities","artifacts","tasks","task_checks","research_questions","web_sources"}) {
     // The checkpoint references typed records; the original records are never flattened or deleted.
     snapshot["cognitive_records"][table]=db.query(std::string("SELECT id FROM ")+table);
   }

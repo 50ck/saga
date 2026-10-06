@@ -1,0 +1,208 @@
+[
+  {
+    "fixture": "article.html",
+    "required": [
+      "Article title",
+      "actual article body"
+    ],
+    "forbidden": [
+      "Navigation",
+      "Privacy Policy"
+    ],
+    "profile": "prose"
+  },
+  {
+    "fixture": "messy_news.html",
+    "required": [
+      "Research report",
+      "actual article body"
+    ],
+    "forbidden": [
+      "Sign in",
+      "Subscribe",
+      "Buy now"
+    ],
+    "profile": "prose"
+  },
+  {
+    "fixture": "documentation.html",
+    "required": [
+      "Installation",
+      "Configuration",
+      "--force",
+      "--no-mmap"
+    ],
+    "forbidden": [
+      "Cookie settings"
+    ],
+    "profile": "documentation"
+  },
+  {
+    "fixture": "api_docs.html",
+    "required": [
+      "std::vector",
+      "--force",
+      "size()"
+    ],
+    "forbidden": [],
+    "profile": "reference"
+  },
+  {
+    "fixture": "blog.html",
+    "required": [
+      "Blog experiment",
+      "Second paragraph"
+    ],
+    "forbidden": [],
+    "profile": "prose"
+  },
+  {
+    "fixture": "forum.html",
+    "required": [
+      "First participant",
+      "Second participant"
+    ],
+    "forbidden": [],
+    "profile": "discussion"
+  },
+  {
+    "fixture": "wiki.html",
+    "required": [
+      "Wiki subject",
+      "History",
+      "Additional source"
+    ],
+    "forbidden": []
+  },
+  {
+    "fixture": "listing.html",
+    "required": [
+      "Available documentation",
+      "Guide 0"
+    ],
+    "forbidden": [],
+    "profile": "listing"
+  },
+  {
+    "fixture": "huge_navigation.html",
+    "required": [
+      "Important body",
+      "actual article body"
+    ],
+    "forbidden": [
+      "Navigation item"
+    ]
+  },
+  {
+    "fixture": "cookie_banner.html",
+    "required": [
+      "Real content",
+      "actual article body"
+    ],
+    "forbidden": [
+      "Accept all cookies",
+      "Cookie settings"
+    ]
+  },
+  {
+    "fixture": "warning_aside.html",
+    "required": [
+      "Warning: this flag",
+      "--force"
+    ],
+    "forbidden": []
+  },
+  {
+    "fixture": "siblings.html",
+    "required": [
+      "Split article",
+      "actual article body",
+      "Second sibling"
+    ],
+    "forbidden": []
+  },
+  {
+    "fixture": "sidebar.html",
+    "required": [
+      "Reference",
+      "actual article body"
+    ],
+    "forbidden": [
+      "Product menu",
+      "Subscribe"
+    ]
+  },
+  {
+    "fixture": "code_heavy.html",
+    "required": [
+      "int main(void)",
+      "  return 0;",
+      "--no-mmap"
+    ],
+    "forbidden": [],
+    "profile": "documentation"
+  },
+  {
+    "fixture": "tables.html",
+    "required": [
+      "-v",
+      "n_ctx",
+      "65536"
+    ],
+    "forbidden": [],
+    "profile": "reference"
+  },
+  {
+    "fixture": "spa.html",
+    "required": [],
+    "forbidden": [],
+    "error": true
+  },
+  {
+    "fixture": "malformed.html",
+    "required": [
+      "actual text",
+      "Second recovered"
+    ],
+    "forbidden": []
+  },
+  {
+    "fixture": "wrong_type.html",
+    "required": [
+      "Wrong MIME",
+      "actual article body"
+    ],
+    "forbidden": [],
+    "content_type": "text/plain"
+  },
+  {
+    "fixture": "markdown.md",
+    "required": [
+      "Markdown source",
+      "--force",
+      "  return 0;"
+    ],
+    "forbidden": [
+      "bad()",
+      "internal comment"
+    ],
+    "content_type": "text/markdown"
+  },
+  {
+    "fixture": "balanced.html",
+    "required": [
+      "Short note",
+      "meaningful explanation"
+    ],
+    "forbidden": [],
+    "mode": "balanced"
+  },
+  {
+    "fixture": "recall.html",
+    "required": [
+      "Short recovered content"
+    ],
+    "forbidden": [],
+    "mode": "recall"
+  }
+]

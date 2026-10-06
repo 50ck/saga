@@ -40,6 +40,7 @@ std::string command_help(std::string_view query) {
     {"fact","JSON","Knowledge edits","Record a user-supplied fact with provenance. Required JSON fields: subject, predicate and object. Optional scope: global or project.","/fact {\"subject\":\"machine\",\"predicate\":\"OS\",\"object\":\"FreeBSD\"}"},
     {"correct","JSON","Knowledge edits","Correct a fact using the same JSON fields as /fact. Keep the old validity interval and preserve correction history.","/correct {\"subject\":\"machine\",\"predicate\":\"OS\",\"object\":\"Void Linux\"}"},
     {"permissions","[1|2|3|4]","Runtime and permissions","Set permissions for this persona. 1 asks before guarded host operations (default); 2 automatically approves guarded host. 3 asks before unrestricted host operations; 4 allows unrestricted host without approval (DANGEROUS). File edits and workspace changes also ask in modes 1/3 and run automatically in 2/4. Sandbox shell actions stay automatic. Unrestricted host removes Saga's filesystem, seccomp and no_new_privs restrictions; it can access private Saga storage and uses your OS user privileges. Aliases: ask, always, host-ask, host-always.","/permissions\n/permissions ask\n/permissions always\n/permissions 3\n/permissions 4\n/permissions host-ask\n/permissions host-always"},
+    {"web","[on|off]","Runtime and permissions","Show or toggle public read-only web access for this persona. Searches and HTML/text reads run automatically, separately from host permissions. Switching off cancels active web requests; stored source excerpts remain accessible. Works while the agent is busy.","/web\n/web off\n/web on"},
     {"status","","Runtime and permissions","Show the agent's name, SOUL path, mode, task, context progress, compaction count, permission mode and memory counts. During generation, context usage is approximate.","/status"},
     {"help","[command]","Runtime and permissions","Show commands by section, or detailed help and examples for one command. /quit is an alias for /exit.","/help\n/help permissions\n/help /memory"}
   };
@@ -52,7 +53,7 @@ std::string command_help(std::string_view query) {
     out << "**/" << help.name << (std::string_view(help.args).empty() ? "" : " ") << help.args << "** — " << help.description << '\n';
   }
   if (!command.empty()) return "Unknown command: /"+command+". Use /help to see available commands.";
-  out << "\nUse **/help command** for details and examples. **/help**, **/status**, **/permissions** and inspection commands work while the agent is busy. Permission changes apply to subsequent host actions and edits; pending approvals still require **y/n**. Session changes, edits and **/compact** require the current turn to finish.\n\nMouse wheel or **Page Up/Down** scroll; **F2** toggles selection/copy mode; arrows edit; **Ctrl-U** clears input."; return out.str();
+  out << "\nUse **/help command** for details and examples. **/help**, **/status**, **/permissions**, **/web** and inspection commands work while the agent is busy. Permission changes apply to subsequent host actions and edits; pending approvals still require **y/n**. Session changes, edits and **/compact** require the current turn to finish.\n\nMouse wheel or **Page Up/Down** scroll; **F2** toggles selection/copy mode; arrows edit; **Ctrl-U** clears input."; return out.str();
 }
 std::string format_agent_status(const Json& data) {
   auto usage=data.value("usage",Json::object()); auto used=usage.value("used_tokens",usage.value("input_tokens",0ULL)+usage.value("output_tokens",0ULL));
@@ -66,6 +67,8 @@ std::string format_agent_status(const Json& data) {
   if(usage.contains("cached_input_tokens"))out << "\nPrompt cache: " << usage["cached_input_tokens"] << " tokens reused / " << usage.value("input_tokens",0ULL) << " input";
   out << "\nInput budget: " << data.value("input_budget",0ULL) << " · generation reserve: " << data.value("generation_reserve",0ULL) << " · safety: " << data.value("safety_margin",0ULL);
   auto permissions=data.value("permissions",Json::object()); out << "\nHost permissions: " << permissions.value("label","Ask always");
+  if(data.contains("web")) {auto web=data["web"];out<<"\nPublic web: "<<(web.value("enabled",true) ? "on" : "off")<<" · "<<web.value("engine","duckduckgo")<<" · searches "<<web.value("searches",0)<<'/'<<web.value("search_limit",4)<<" · reads "<<web.value("reads",0)<<'/'<<web.value("read_limit",8);}
+  if(data.contains("research")) {int unresolved=0;for(auto& q:data["research"])if(q.value("status","")!="supported")++unresolved;out<<"\nResearch questions: "<<data["research"].size()<<" · unresolved "<<unresolved;}
   auto tasks=data.value("task",Json::array()); if (!tasks.empty()) out << "\nTask: " << tasks[0].value("title","") << " (" << tasks[0].value("status","") << ')';
   if (data.contains("memory")) { out << "\n\nPersistent memory:\n"; for (auto& [key,value] : data["memory"].items()) out << "  " << key << ": " << value << '\n'; }
   return out.str();
@@ -137,10 +140,12 @@ void ChatView::event(const std::string& type,const Json& p) {
     entries.push_back({"Saga",p.value("message","Stopped. Completed work is preserved.")});
   }
   else if (type == "tool.started") {
-    phase="act";generating=false;
+    auto tool=p.value("tool","");phase=tool.starts_with("web_") || tool.starts_with("research_") ? "research" : "act";generating=false;
     if (!partial.empty()) { entries.push_back({name,std::exchange(partial,""),false,0,0,{},true}); }
-    auto tool=p.value("tool",""); auto args=p.value("arguments",Json::object());
+    auto args=p.value("arguments",Json::object());
     std::string text=name+(tool == "shell_exec" ? " is opening a terminal..." : " is using "+tool+"...");
+    if(tool=="web_search"){auto engine=agent_status.value("web",Json::object()).value("engine","duckduckgo");text=name+" is searching "+(engine=="duckduckgo" ? "DuckDuckGo" : engine)+"...\n"+args.value("query","");}
+    if(tool=="web_read" || tool=="web_fetch")text=name+" is reading a source...\n"+(args.contains("url") ? args["url"].get<std::string>() : "Source "+std::to_string(args.value("source_id",0LL)));
     if (tool != "shell_exec" && args.contains("path")) text += "\n"+args.at("path").get<std::string>();
     entries.push_back({"",text,true,p.value("run_id",0LL),now(),tool == "shell_exec" ? args.value("command","") : ""});
   } else if (type == "tool.completed" || type == "tool.failed" || type=="tool.cancelled") {
@@ -149,6 +154,22 @@ void ChatView::event(const std::string& type,const Json& p) {
       std::ostringstream s; s << std::fixed << std::setprecision(1) << (now()-it->started)/1000.0 << "s";
       auto& text=it->command.empty() ? it->text : it->command;
       text += "  "+s.str()+(type == "tool.failed" ? " · failed" : type=="tool.cancelled"?" · cancelled":""); it->started=0; break;
+    }
+    if(type=="tool.completed" && p.value("tool","")=="web_search") {
+      auto result=p.value("result",Json::object());
+      for(auto it=entries.rbegin();it!=entries.rend();++it)if(it->activity && it->run==run){
+        auto query=result.value("submitted_query",result.value("query",""));
+        if(!query.empty()) {
+          auto first=it->text.find('\n'),elapsed=it->text.rfind("  ");
+          auto suffix=elapsed==std::string::npos ? std::string() : it->text.substr(elapsed);
+          it->text=it->text.substr(0,first)+"\n"+query+suffix;
+        }
+        break;
+      }
+    }
+    if(type=="tool.completed" && (p.value("tool","")=="web_read" || p.value("tool","")=="web_fetch")) {
+      auto result=p.value("result",Json::object());
+      for(auto it=entries.rbegin();it!=entries.rend();++it)if(it->activity && it->run==run){it->text+="\nVisited "+result.value("title","")+" ("+result.value("url","")+")";break;}
     }
     if(!std::any_of(entries.begin(),entries.end(),[](auto& entry){return entry.activity && entry.started;}))phase="respond";
     if (type == "tool.failed") {
@@ -186,6 +207,8 @@ void ChatView::event(const std::string& type,const Json& p) {
   } else if (type == "permissions.menu") {
     permission_menu=true; agent_status["permissions"]=p;
     entries.push_back({"Saga","Execution permissions (this persona)\nCurrent: "+p.value("label","")+"\n\nGuarded host:\n1. Ask before guarded host operations (default).\n2. Automatically approve guarded host operations.\n\nUnrestricted host:\n3. Sandbox automatic; ask before unrestricted host operations.\n4. Allow unrestricted host operations without approval (DANGEROUS).\n\nUnrestricted host runs as your OS user without Saga isolation, including access to private Saga storage. System/container restrictions still apply.\nChoose 1, 2, 3 or 4 and press Enter. File edits/workspace changes also ask in 1/3 and are automatic in 2/4. Sandbox shell actions stay automatic."});
+  } else if(type=="web.changed") {agent_status["web"]=p;
+  } else if(type=="research.warning") {entries.push_back({"Saga",p.value("content","")});
   } else if (type == "permissions.changed") { agent_status["permissions"]=p; permission_menu=false;
   } else if (type == "notification") entries.push_back({"Saga",p.value("description","")});
   else if (type == "command.error") entries.push_back({"Saga",p.value("message","Command failed")});
@@ -322,11 +345,11 @@ std::vector<ChatLine> ChatView::styled_lines(int width) const {
   auto append=[&](const ChatEntry& entry) {
     auto& cache=markdown_cache[index++];
     if (entry.activity) {
-      for (auto& line : chat_wrap(chat_wide(entry.text),width-2)) { auto text=L"┊ "+line; result.push_back({text,{{0,text.size(),ChatColor::Activity}}}); }
+      for (auto& line : chat_wrap(chat_wide(entry.text),width-2)) { auto text=L"• "+line; result.push_back({text,{{0,text.size(),ChatColor::Activity}}}); }
       if (!entry.command.empty()) {
         auto command=chat_wide(entry.command); auto colors=shell_highlight(command); size_t offset=0;
         for (auto& line : chat_wrap(command,width-4)) {
-          ChatLine row{(offset == 0 ? L"┊ $ " : L"┊   ")+line,{{0,2,ChatColor::Activity},{2,2,ChatColor::Prompt}}};
+          ChatLine row{(offset == 0 ? L"• $ " : L"•   ")+line,{{0,2,ChatColor::Activity},{2,2,ChatColor::Prompt}}};
           for (auto& span : colors) { auto begin=std::max(span.start,offset),end=std::min(span.start+span.length,offset+line.size()); if (end>begin) row.spans.push_back({4+begin-offset,end-begin,span.color}); }
           result.push_back(std::move(row)); offset += line.size(); if (offset<command.size() && command[offset] == L'\n') ++offset;
         }
@@ -390,7 +413,7 @@ std::wstring ChatView::activity(bool busy) const {
   if(!busy && !activity_started)return {};
   if(phase=="prepare_operation")return chat_wide(name+" is preparing "+operation+"...");
   if(generating)return chat_wide(name+(generated_tokens ? " is typing..." : " is preparing context..."));
-  return chat_wide(name+(phase=="act" ? " is running a tool..." : phase=="verify" ? " is verifying..." : phase=="reflect" ? " is saving memory..." : " is preparing context..."));
+  return chat_wide(name+(phase=="research" ? " is researching..." : phase=="act" ? " is running a tool..." : phase=="verify" ? " is verifying..." : phase=="reflect" ? " is saving memory..." : " is preparing context..."));
 }
 namespace {
 struct Terminal {
