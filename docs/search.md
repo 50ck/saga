@@ -135,9 +135,24 @@ A concrete additional `research_question` creates its own external goal. Goal st
 is derived from its claims: unknown, partially established, established,
 not established or contradicted.
 
+`research_plan` returns only its current plan, with explicit `plan_id`, `goal_id`
+and `claim_id` fields. For explicit operator research, omitted goal `required`
+inherits true; explicit false still denotes an optional goal, and at least one
+required goal must remain. Proposed claims are unverified hypotheses, not facts.
+The result no longer repeats every historical plan and the entire decomposition.
+
+`goal_id` on web tools associates one search/read with all claims in that goal.
+`question_id` selects a single returned `claim_id`; when both are supplied, the
+claim must belong to the goal. IDs are never interpreted as ordinal numbers or
+silently remapped across namespaces. `research_resolve.id` always names one claim.
+Unknown or out-of-scope references fail before network/budget use and return a
+structured `ResearchReferenceError` with available goal/claim references.
+`research_status` retrieves the active reference catalog for recovery/resumption.
+
 `question_id` on web tools associates queries and source reads with a claim. With
 one pending claim, older calls can infer that association. With multiple claims,
-association is explicit. `research_attempts` stores outcomes separately from claim
+association is explicit. Goal-level attempts are recorded for each selected claim,
+without asserting that any of them has been verified. `research_attempts` stores outcomes separately from claim
 status and source snapshots. A failed backend or search never evaluates a claim,
 invalidates previously fetched evidence or marks every outstanding goal unverified.
 Supported/contradicted conclusions require exact quotes from immutable fetched
@@ -156,7 +171,11 @@ Legacy whole-request questions are retained as non-required audit records by the
 schema migration.
 
 The context builder and cognitive checkpoints carry goal/claim IDs and the
-structured decomposition. Existing personas, tool names, source snapshots and
+structured decomposition. Reference IDs survive generic context reduction.
+Lookups consistently include session-level claims and the active task's claims;
+unrelated tasks from the same session do not leak into reference validation or
+resolution. Research created before task setup follows the new task just as it
+follows later workspace changes. Existing personas, tool names, source snapshots and
 research conclusions remain compatible. Infrastructure health, pacing and latency
 stay in the runtime event journal, not model conversation history.
 
@@ -189,3 +208,10 @@ reads, granular evidence resolution, shell preflight and the next generation's
 reasoning activity. It verifies one turn/task/user dispatch and retained evidence.
 The separate failure regression proves a completely unavailable search can still
 be followed by successful direct acquisition and claim verification.
+
+The reference-contract regression seeds four legacy claims, creates three goals
+with eleven new claims, and reproduces the observed `1/2/3` goal versus `5–15`
+claim mismatch. It verifies default mandatory research, compact unambiguous output,
+structured reference recovery, no network requests on invalid references,
+goal-wide association, per-claim resolution, task binding, scope isolation and
+cancellation without false attempt failures. All fixtures are synthetic.

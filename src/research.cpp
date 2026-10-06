@@ -34,11 +34,11 @@ Id WebResearch::question(const std::string &text, bool required, Id session, Id 
   return id;
 }
 Json research_context(Database &db, Id session, Id task) {
-  return db.query("SELECT id,goal_id,task_id,assumption_id,substr(question,1,512) AS "
+  return db.query("SELECT id,id AS claim_id,goal_id,task_id,assumption_id,substr(question,1,160) AS "
                   "question,required,status,substr(conclusion,1,1024) AS conclusion,(SELECT "
                   "json_group_array(json_extract(value,'$.source_id')) FROM "
                   "json_each(sources_json)) AS source_ids,disclosed FROM research_questions WHERE "
-                  "session_id=? OR (task_id IS NOT NULL AND task_id=?) ORDER BY id DESC LIMIT 30",
+                  "((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY status='pending' DESC,updated_at DESC,id DESC LIMIT 64",
                   {session, task});
 }
 Json WebResearch::questions(Id session, Id task) const {
@@ -75,7 +75,7 @@ void WebResearch::account_for_pending(Id session, Id task, const Emit &emit) {
     for(auto &claim:unresolved_required(session,task)) if(claim["status"]=="pending")
       db_.exec("UPDATE research_questions SET status='unverified',conclusion='Public web access is disabled.',updated_at=? WHERE id=?",{now(),claim["id"]});
     if(plan_pending(session,task)) {
-      db_.exec("UPDATE research_plans SET status='unverified' WHERE status='pending' AND (session_id=? OR task_id=?)",{session,task});
+      db_.exec("UPDATE research_plans SET status='unverified' WHERE status='pending' AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?))",{session,task});
       if(emit)emit("research.warning",{{"content","Public web access is disabled; external requirements remain unverified."}});
     }
   }
@@ -92,11 +92,11 @@ bool WebResearch::plan_pending(Id session,Id task) const {
 }
 Json research_plan_context(Database &db,Id session,Id task) {
   Json result=Json::array();
-  for(auto &row:db.query("SELECT id,status,decomposition_json FROM research_plans WHERE session_id=? OR task_id=? ORDER BY id DESC LIMIT 8",{session,task})) {
-    row["decomposition"]=Json::parse(row["decomposition_json"].get<std::string>());row.erase("decomposition_json");
-    row["goals"]=db.query("SELECT id,question,required FROM research_goals WHERE plan_id=?",{row["id"]});
+  for(auto &row:db.query("SELECT id AS plan_id,status,decomposition_json FROM research_plans WHERE ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id DESC LIMIT 8",{session,task})) {
+    row["decomposition"]=Json::parse(row["decomposition_json"].get<std::string>());row.erase("decomposition_json");row["decomposition"].erase("goals");
+    row["goals"]=db.query("SELECT id AS goal_id,question,required FROM research_goals WHERE plan_id=?",{row["plan_id"]});
     for(auto &goal:row["goals"]) {
-      goal["claims"]=db.query("SELECT id,question AS proposition,status,required FROM research_questions WHERE goal_id=?",{goal["id"]});
+      goal["claims"]=db.query("SELECT id AS claim_id,id AS question_id,question AS proposition,status,required FROM research_questions WHERE goal_id=?",{goal["goal_id"]});
       bool supported=!goal["claims"].empty(),contradicted=false,pending=false,partial=false;
       for(auto &claim:goal["claims"]) {supported=supported && claim["status"]=="supported";contradicted=contradicted || claim["status"]=="contradicted";pending=pending || claim["status"]=="pending";partial=partial || claim["status"]=="supported";}
       goal["status"]=supported ? "established" : contradicted ? "contradicted" : partial ? "partially_established" : pending ? "unknown" : "not_established";
@@ -106,7 +106,26 @@ Json research_plan_context(Database &db,Id session,Id task) {
   return result;
 }
 Json WebResearch::plan(const Json &args,Id session,Id task) {
+  auto normalized=args;
+  auto pending=db_.query("SELECT id FROM research_plans WHERE status IN ('pending','unverified') AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) AND (?='' OR turn_id=?) ORDER BY id DESC LIMIT 1",{session,task,turn_,turn_});
+  bool explicit_research=!pending.empty();
+  if(!turn_.empty()) {
+    auto existing=db_.query("SELECT user_source_event_id FROM research_plans WHERE turn_id=?",{turn_});
+    explicit_research=explicit_research || (!existing.empty() && !existing[0]["user_source_event_id"].is_null());
+  }
   auto intent=args.at("intent").get<std::string>();auto goals=args.at("goals");
+  if(goals.is_array())for(auto &goal:goals)if(goal.is_object() && !goal.contains("required"))goal["required"]=explicit_research;
+  normalized["goals"]=goals;
+  auto output=[&](Id id,bool reused=false) {
+    Json result={{"plan_id",id},{"goals",Json::array()},{"reference_help","Use goal_id on web tools to research a whole goal, or question_id with a returned claim_id for one claim. research_resolve.id is a claim_id; never use a plan_id or goal_id there."}};
+    for(auto &entry:research_plan_context(db_,session,task))if(entry["plan_id"]==id)result["goals"]=entry["goals"];
+    for(auto &goal:result["goals"]) {
+      goal["question"]=utf8_excerpt(goal["question"].get<std::string>(),160);
+      for(auto &claim:goal["claims"])claim["proposition"]=utf8_excerpt(claim["proposition"].get<std::string>(),160);
+    }
+    if(reused)result["reused"]=true;
+    return result;
+  };
   if(trim(intent).empty() || intent.size()>512 || !goals.is_array() || goals.empty() || goals.size()>8)
     throw std::runtime_error("Research decomposition requires a concise intent and 1–8 external goals");
   for(auto *name:{"operator_constraints","desired_actions"}) {
@@ -132,44 +151,83 @@ Json WebResearch::plan(const Json &args,Id session,Id task) {
   if(!turn_.empty()) {
     auto previous=db_.query("SELECT id,decomposition_json FROM research_plans WHERE turn_id=? AND status='ready'",{turn_});
     if(!previous.empty()) {
-      if(previous[0]["decomposition_json"]!=args.dump())throw std::runtime_error("This turn already has a research plan; add newly discovered gaps with research_question");
-      return {{"plan_id",previous[0]["id"]},{"plans",research_plan_context(db_,session,task)},{"reused",true}};
+      if(previous[0]["decomposition_json"]!=normalized.dump())throw std::runtime_error("This turn already has a research plan; add newly discovered gaps with research_question");
+      return output(previous[0]["id"],true);
     }
   }
-  auto pending=db_.query("SELECT id FROM research_plans WHERE status='pending' AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id DESC LIMIT 1",{session,task});
   Id plan_id=0;
   db_.transaction([&]{
     plan_id=pending.empty() ? db_.exec("INSERT INTO research_plans(session_id,task_id,turn_id,created_at) VALUES(?,?,?,?)",{session,task ? Json(task):Json(),turn_.empty() ? Json():Json(turn_),now()}) : pending[0]["id"].get<Id>();
     bool any_required=false;for(auto &goal:goals)any_required=any_required || goal.value("required",false);
-    if(!pending.empty() && !any_required)throw std::runtime_error("Explicit research needs at least one required external goal");
+    if(explicit_research && !any_required)throw std::runtime_error("Explicit research needs at least one required external goal");
     for(auto &goal:goals) {
       auto id=db_.exec("INSERT INTO research_goals(plan_id,session_id,task_id,question,required,created_at) VALUES(?,?,?,?,?,?)",{plan_id,session,task ? Json(task):Json(),goal["question"],goal.value("required",false),now()});
       for(auto &claim:goal["claims"])db_.exec("INSERT INTO research_questions(session_id,task_id,goal_id,question,required,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",{session,task ? Json(task):Json(),id,claim,goal.value("required",false),now(),now()});
     }
-    db_.exec("UPDATE research_plans SET status='ready',decomposition_json=? WHERE id=?",{args.dump(),plan_id});
+    db_.exec("UPDATE research_plans SET status='ready',decomposition_json=? WHERE id=?",{normalized.dump(),plan_id});
     db_.event("research.decomposed",{{"plan_id",plan_id},{"goals",goals.size()},{"claims",claims}},session,task);
   });
-  return {{"plan_id",plan_id},{"plans",research_plan_context(db_,session,task)}};
+  return output(plan_id);
+}
+Json WebResearch::references(Id session,Id task) const {
+  auto claims=research_context(db_,session,task);
+  Json result={{"available_claims",Json::array()},{"available_goals",Json::array()},
+    {"reference_help","question_id (or research_resolve.id) identifies one claim. goal_id identifies a goal for a web search/read. These namespaces are distinct; use returned IDs, not ordinal numbers."}};
+  std::map<Id,Json> goals;
+  for(auto &claim:claims) {
+    result["available_claims"].push_back({{"claim_id",claim["claim_id"]},{"question_id",claim["claim_id"]},{"goal_id",claim["goal_id"]},{"question",utf8_excerpt(claim["question"].get<std::string>(),80)},{"status",claim["status"]}});
+    if(claim["goal_id"].is_null())continue;
+    Id id=claim["goal_id"];
+    if(!goals.contains(id)) {
+      auto row=db_.query("SELECT question FROM research_goals WHERE id=?",{id});
+      goals[id]={{"goal_id",id},{"question",row.empty() ? std::string():utf8_excerpt(row[0]["question"].get<std::string>(),80)},{"claim_ids",Json::array()}};
+    }
+    goals[id]["claim_ids"].push_back(claim["claim_id"]);
+  }
+  for(auto &[id,goal]:goals)result["available_goals"].push_back(std::move(goal));
+  return result;
+}
+Json WebResearch::lookup_claim(Id id,Id session,Id task) const {
+  auto rows=db_.query("SELECT * FROM research_questions WHERE id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?))",{id,session,task});
+  if(rows.empty())throw ResearchReferenceError("Unknown claim_id in the active research scope. A goal_id cannot be used as question_id; use goal_id explicitly or choose a returned claim_id.",references(session,task));
+  return rows[0];
 }
 Json WebResearch::dispatch(const std::string &name,const Json &args,Id session,Id task,const Emit &emit) {
-  Id claim=args.value("question_id",Id(0));
-  Id goal=0;
   bool web=name=="web_search" || name=="web_read" || name=="web_fetch";
-  if(web && !claim) {
-    auto pending=db_.query("SELECT id FROM research_questions WHERE status='pending' AND (session_id=? OR task_id=?) ORDER BY id",{session,task});
-    if(pending.size()==1)claim=pending[0]["id"];
+  if(!web)return dispatch_operation(name,args,session,task,emit);
+  Id claim=args.value("question_id",Id(0)),goal=args.value("goal_id",Id(0));
+  if((args.contains("question_id") && claim<=0) || (args.contains("goal_id") && goal<=0))
+    throw ResearchReferenceError("Research references must be positive returned IDs; omit a reference for unassociated discovery.",references(session,task));
+  Json selected=Json::array();
+  if(goal) {
+    if(db_.query("SELECT id FROM research_goals WHERE id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?))",{goal,session,task}).empty())
+      throw ResearchReferenceError("Unknown goal_id in the active research scope.",references(session,task));
+    selected=db_.query("SELECT id FROM research_questions WHERE goal_id=? AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id",{goal,session,task});
+    if(selected.empty())throw ResearchReferenceError("This research goal has no active claims.",references(session,task));
   }
-  if(web && claim && db_.query("SELECT id FROM research_questions WHERE id=? AND (session_id=? OR task_id=?)",{claim,session,task}).empty())throw std::runtime_error("Unknown research claim for this search/source operation");
-  if(web && claim) {auto row=db_.query("SELECT goal_id FROM research_questions WHERE id=?",{claim});if(!row[0]["goal_id"].is_null())goal=row[0]["goal_id"];}
-  Emit tagged=[&](const std::string &type,const Json &data){if(emit){auto payload=data;if(claim)payload["claim_id"]=claim;if(goal)payload["research_goal_id"]=goal;emit(type,payload);}};
+  if(claim) {
+    auto row=lookup_claim(claim,session,task);
+    if(goal && row["goal_id"]!=goal)throw ResearchReferenceError("question_id does not belong to the supplied goal_id.",references(session,task));
+    if(!row["goal_id"].is_null())goal=row["goal_id"];
+    selected=Json::array({{{"id",claim}}});
+  }else if(!goal) {
+    auto pending=db_.query("SELECT id,goal_id FROM research_questions WHERE status='pending' AND ((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY id",{session,task});
+    if(pending.size()==1) {claim=pending[0]["id"];if(!pending[0]["goal_id"].is_null())goal=pending[0]["goal_id"];selected=Json::array({{{"id",claim}}});}
+  }
+  Json ids=Json::array();for(auto &row:selected)ids.push_back(row["id"]);
+  Emit tagged=[&](const std::string &type,const Json &data){if(emit){auto payload=data;if(claim)payload["claim_id"]=claim;if(goal)payload["research_goal_id"]=goal;if(!ids.empty())payload["claim_ids"]=ids;emit(type,payload);}};
   auto record=[&](bool succeeded,Id source){
-    if(!web || !claim)return;
-    auto event=db_.event("research.attempt",{{"claim_id",claim},{"research_goal_id",goal},{"operation",name},{"succeeded",succeeded},{"source_id",source}},session,task);
-    db_.exec("INSERT INTO research_attempts(claim_id,operation,source_id,succeeded,source_event_id,created_at) VALUES(?,?,?,?,?,?)",{claim,name,source ? Json(source):Json(),succeeded,event,now()});
+    db_.transaction([&]{for(auto &row:selected) {
+      auto event=db_.event("research.attempt",{{"claim_id",row["id"]},{"research_goal_id",goal},{"operation",name},{"succeeded",succeeded},{"source_id",source}},session,task);
+      db_.exec("INSERT INTO research_attempts(claim_id,operation,source_id,succeeded,source_event_id,created_at) VALUES(?,?,?,?,?,?)",{row["id"],name,source ? Json(source):Json(),succeeded,event,now()});
+    }});
   };
   try {
     auto result=dispatch_operation(name,args,session,task,tagged);
-    record(true,result.value("source_id",Id(0)));return result;
+    record(true,result.value("source_id",Id(0)));
+    if(goal)result["goal_id"]=goal;
+    if(!ids.empty())result["claim_ids"]=ids;
+    return result;
   }catch(const TurnCancelled &){throw;}
    catch(...) {record(false,0);throw;}
 }
@@ -178,9 +236,10 @@ void WebResearch::rebind_task(Id previous,Id next,const std::string &turn) {
   db_.transaction([&]{
     db_.exec("UPDATE research_plans SET task_id=? WHERE turn_id=?",{next,turn});
     db_.exec("UPDATE research_goals SET task_id=? WHERE plan_id IN (SELECT id FROM research_plans WHERE turn_id=?)",{next,turn});
-    db_.exec("UPDATE research_questions SET task_id=? WHERE goal_id IN (SELECT id FROM research_goals WHERE plan_id IN (SELECT id FROM research_plans WHERE turn_id=?)) OR (task_id=? AND session_id=(SELECT session_id FROM turns WHERE id=?) AND created_at>=(SELECT started_at FROM turns WHERE id=?))",{next,turn,previous,turn,turn});
+    db_.exec("UPDATE research_questions SET task_id=? WHERE goal_id IN (SELECT id FROM research_goals WHERE plan_id IN (SELECT id FROM research_plans WHERE turn_id=?)) OR (coalesce(task_id,0)=? AND session_id=(SELECT session_id FROM turns WHERE id=?) AND created_at>=(SELECT started_at FROM turns WHERE id=?))",{next,turn,previous,turn,turn});
     db_.exec("UPDATE research_goals SET task_id=? WHERE id IN (SELECT goal_id FROM research_questions WHERE task_id=?)",{next,next});
   });
+  if(turn_==turn)task_=next;
 }
 
 }

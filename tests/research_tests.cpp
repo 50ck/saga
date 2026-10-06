@@ -102,7 +102,7 @@ void failure_is_not_verification() {
   auto user=p.db->event("user.message",{{"content","Implement a program with C in /tmp/widget; inspect modern rules."}},session);
   rejects([&]{research.question("Implement a program with C in /tmp/widget; inspect modern rules.",true,session,0);});
   Json plan={{"intent","Implement a program"},{"operator_constraints",{"C","/tmp/widget"}},{"desired_actions",{"Compile"}},{"goals",Json::array({{{"question","Modern rules"},{"required",true},{"claims",{"Modern rotation rule?"}}}})}};
-  auto result=research.dispatch("research_plan",plan,session,0);CHECK(result["plans"][0]["goals"][0]["claims"].size()==1);CHECK(user>0);
+  auto result=research.dispatch("research_plan",plan,session,0);CHECK(result["goals"][0]["claims"].size()==1);CHECK(user>0);
   auto first_task=p.db->exec("INSERT INTO tasks(session_id,title,objective,status,risk,created_at) VALUES(?,'first','fixture','active','low',?)",{session,now()});
   auto second_task=p.db->exec("INSERT INTO tasks(session_id,title,objective,status,risk,created_at) VALUES(?,'second','fixture','active','low',?)",{session,now()});
   auto turn=uuid();p.db->exec("INSERT INTO turns(id,session_id,status,phase,started_at) VALUES(?,?,'active','thinking',?)",{turn,session,now()});
@@ -123,5 +123,104 @@ void failure_is_not_verification() {
   CHECK(p.db->query("SELECT risk FROM tasks WHERE id=?",{first["id"]})[0]["risk"]=="high");
   auto invalid=plan;invalid["goals"][0]["claims"]={"Implement a program with C in /tmp/widget; inspect modern rules."};auto before=p.db->query("SELECT id FROM research_goals").size();rejects([&]{research.plan(invalid,session,0);});CHECK(p.db->query("SELECT id FROM research_goals").size()==before);
 }
+void reference_contract() {
+  Fixture f;Registry registry(f.paths);PersonaContext p(f.paths,registry.create("Reference fixture",""),f.root/"project");Config config;
+  config.endpoint="http://example.invalid";config.model="fixture";config.context_length=65536;config.search_engines={"duckduckgo"};
+  auto &db=*p.db;
+  auto old_session=db.exec("INSERT INTO sessions(started_at,status) VALUES(?,'completed')",{now()});
+  for(int i=0;i<4;++i)db.exec("INSERT INTO research_questions(session_id,question,required,status,created_at,updated_at) VALUES(?,?,1,'pending',?,?)",{old_session,"Legacy gap "+std::to_string(i),now(),now()});
+  p.session=db.exec("INSERT INTO sessions(started_at,status) VALUES(?,'active')",{now()});
+  p.project=db.exec("INSERT INTO projects(name,root_path,created_at,last_seen_at) VALUES('Fixture',?,?,?)",{p.project_root.string(),now(),now()});
+  p.turn=uuid();db.exec("INSERT INTO turns(id,session_id,status,phase,started_at) VALUES(?,?,'active','thinking',?)",{p.turn,p.session,now()});
+  auto user=db.event("user.message",{{"content","Resume the terminal game; research its rules, implement and compile it."}},p.session);
+  int requests=0;
+  Memory memory(p,config);Tools tools(p,memory,[](auto&,auto&){return true;},config,[&](auto &url,auto&,auto &control){++requests;if(control)control();if(url.find("duckduckgo")!=std::string::npos)return response(url,"<p class='no-results'>No results found</p>");return response(url,"<main><p>Fixture rule text.</p></main>");});
+  tools.web().begin_turn(p.session,0,p.turn);tools.web().require_plan(user,p.turn,p.session,0);
+  Json plan={{"intent","Build the game"},{"operator_constraints",{"C","minimal dependencies"}},{"desired_actions",{"Compile it"}},{"goals",Json::array({
+    {{"question","Rotation rules"},{"claims",{"Rotation states?","Kick ordering?","Piece groups?","Transition table?"}}},
+    {{"question","Randomization rules"},{"claims",{"Bag contents?","Bag shuffle?","Preview behavior?"}}},
+    {{"question","Twist rules"},{"claims",{"Corner test?","Mini classification?","Scoring?","Rotation requirement?"}}}})}};
+  auto result=tools.execute("research_plan",plan);CHECK(!result.contains("error"));CHECK(result["goals"].size()==3 && !result.contains("plans"));
+  CHECK(result["goals"][0]["goal_id"]==1);CHECK(result["goals"][0]["claims"][0]["claim_id"]==5);
+  CHECK(db.query("SELECT id FROM research_questions WHERE session_id=? AND required=1",{p.session}).size()==11);
+  CHECK(tools.execute("research_plan",plan)["reused"]==true);CHECK(db.query("SELECT id FROM research_goals").size()==3);
+  for(Id wrong:{1,2,3}) {
+    auto error=tools.execute("web_search",{{"query","Fixture query "+std::to_string(wrong)},{"question_id",wrong}});
+    CHECK(error["error_type"]=="ResearchReferenceError");CHECK(error["available_claims"].size()==11);CHECK(error["available_goals"].size()==3);
+    CHECK(std::none_of(error["available_claims"].begin(),error["available_claims"].end(),[](auto &c){return c["claim_id"].template get<Id>()<5;}));
+  }
+  CHECK(requests==0);CHECK(db.query("SELECT id FROM research_attempts").empty());
+  auto unresolved=tools.execute("research_resolve",{{"id",1},{"status","unverified"},{"conclusion","Cannot verify"},{"sources",Json::array()}});
+  CHECK(unresolved["error_type"]=="ResearchReferenceError");
+  for(Id goal:{1,2,3}) {
+    auto search=tools.execute("web_search",{{"query","Goal query "+std::to_string(goal)},{"goal_id",goal}});
+    CHECK(!search.contains("error"));CHECK(search["goal_id"]==goal);
+  }
+  CHECK(requests==3);CHECK(db.query("SELECT id FROM research_attempts WHERE succeeded=1").size()==11);
+  CHECK(db.query("SELECT id FROM research_questions WHERE session_id=? AND status='pending'",{p.session}).size()==11);
+  auto mismatch=tools.execute("web_search",{{"query","Wrong goal"},{"goal_id",1},{"question_id",9}});CHECK(mismatch["error_type"]=="ResearchReferenceError");CHECK(requests==3);
+  auto source=tools.execute("web_read",{{"url","https://rules.example.com/rotation"},{"goal_id",1}});CHECK(source["claim_ids"].size()==4);
+  CHECK(db.query("SELECT id FROM research_attempts WHERE source_id=?",{source["source_id"]}).size()==4);
+  auto unsupported=tools.execute("research_resolve",{{"id",5},{"status","supported"},{"conclusion","Claim proved"},{"sources",Json::array()}});CHECK(unsupported.contains("error"));
+  auto task=tools.execute("task_create",{{"title","Resume game"},{"objective","Fixture"},{"risk","low"},{"checks",{"Compile"}}});CHECK(!task.contains("error"));
+  CHECK(db.query("SELECT id FROM research_questions WHERE task_id=?",{p.task}).size()==11);
+  CHECK(db.query("SELECT task_id FROM research_plans WHERE id=?",{result["plan_id"]})[0]["task_id"]==p.task);
+  auto other_task=db.exec("INSERT INTO tasks(session_id,title,objective,status,created_at) VALUES(?,'Other','Unrelated','active',?)",{p.session,now()});
+  auto unrelated=tools.web().question("Unrelated workspace gap?",true,p.session,other_task);
+  CHECK(tools.execute("web_search",{{"query","Unrelated"},{"question_id",unrelated}})["error_type"]=="ResearchReferenceError");
+  CHECK(tools.execute("research_resolve",{{"id",unrelated},{"status","unverified"},{"conclusion","Not relevant"},{"sources",Json::array()}})["error_type"]=="ResearchReferenceError");
+  auto status=tools.execute("research_status",Json::object());CHECK(status["available_claims"].size()==11);
+  auto context=research_plan_context(db,p.session,p.task);CHECK(context.size()==1 && context[0]["plan_id"]==result["plan_id"]);CHECK(!context[0]["decomposition"].contains("goals"));
+  ContextBuilder builder(p,memory,config);
+  builder.build({{"large_observation",std::string(40000,'x')}});
+  auto attention=Json::parse(db.query("SELECT payload_json FROM events WHERE type='context.attention' ORDER BY id DESC LIMIT 1")[0]["payload_json"].get<std::string>());
+  CHECK(attention["state"]["research_references"].size()==11);
+  for(auto &ref:attention["state"]["research_references"])CHECK(ref["claim_id"].get<Id>()>=5 && ref["claim_id"].get<Id>()<=15);
+  CHECK(tools.execute("web_read",{{"url","https://rules.example.com/rotation"},{"goal_id",1},{"question_id",5}})["claim_ids"].size()==1);
+  auto attempts=db.query("SELECT id FROM research_attempts").size();tools.web().service([]{throw TurnCancelled();});
+  bool cancelled=false;try{tools.execute("web_read",{{"url","https://rules.example.com/cancel"},{"goal_id",1}});}catch(const TurnCancelled &){cancelled=true;}
+  CHECK(cancelled && db.query("SELECT id FROM research_attempts").size()==attempts);
 }
-int main(){try{complete_regression();failure_is_not_verification();return 0;}catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}}
+
+void plan_defaults() {
+  Fixture f;Registry registry(f.paths);PersonaContext p(f.paths,registry.create("Defaults fixture",""),f.root/"project");
+  auto session=p.db->exec("INSERT INTO sessions(started_at,status) VALUES(?,'active')",{now()});
+  WebResearch research(*p.db,Config{});research.begin_turn(session,0);
+  Json args={{"intent","Inspect a technical topic"},{"operator_constraints",Json::array()},{"desired_actions",Json::array()},
+    {"goals",Json::array({{{"question","Optional external gap?"},{"claims",{"Optional rule?"}}}})}};
+  CHECK(research.plan(args,session,0)["goals"][0]["required"]==0);
+  auto turn=uuid();p.db->exec("INSERT INTO turns(id,session_id,status,phase,started_at) VALUES(?,?,'active','thinking',?)",{turn,session,now()});
+  auto user=p.db->event("user.message",{{"content","Research an external specification."}},session);
+  research.begin_turn(session,0,turn);research.require_plan(user,turn,session,0);
+  auto optional=args;optional["goals"][0]["required"]=false;
+  auto before=p.db->query("SELECT id FROM research_questions").size();rejects([&]{research.plan(optional,session,0);});
+  CHECK(research.plan_pending(session,0));CHECK(p.db->query("SELECT id FROM research_questions").size()==before);
+  args["goals"][0]["claims"]=Json::array();
+  for(int i=0;i<32;++i)args["goals"][0]["claims"].push_back("Rule "+std::to_string(i)+" "+std::string(450,'r'));
+  auto result=research.plan(args,session,0);CHECK(result["goals"][0]["claims"].size()==32 && result.dump().size()<16000);
+  CHECK(result["goals"][0]["required"]==1);CHECK(research.plan(args,session,0)["reused"]==true);
+  auto stored=Json::parse(p.db->query("SELECT decomposition_json FROM research_plans WHERE id=?",{result["plan_id"]})[0]["decomposition_json"].get<std::string>());
+  CHECK(stored["goals"][0]["claims"][0].get<std::string>().size()>450);
+}
+
+void orphan_binding_and_disabled_plan() {
+  Fixture f;Registry registry(f.paths);PersonaContext p(f.paths,registry.create("Binding fixture",""),f.root/"project");Config config;
+  config.endpoint="http://example.invalid";config.model="fixture";config.context_length=65536;
+  p.session=p.db->exec("INSERT INTO sessions(started_at,status) VALUES(?,'active')",{now()});
+  p.project=p.db->exec("INSERT INTO projects(name,root_path,created_at,last_seen_at) VALUES('Fixture',?,?,?)",{p.project_root.string(),now(),now()});
+  p.turn=uuid();p.db->exec("INSERT INTO turns(id,session_id,status,phase,started_at) VALUES(?,?,'active','thinking',?)",{p.turn,p.session,now()});
+  Memory memory(p,config);Tools tools(p,memory,[](auto&,auto&){return true;},config);auto &web=tools.web();web.begin_turn(p.session,0,p.turn);
+  auto question=tools.execute("research_question",{{"question","Additional external gap?"},{"required",true}});CHECK(question["claim_id"]==question["id"] && question.contains("goal_id"));
+  CHECK(!tools.execute("task_create",{{"title","Fixture"},{"objective","Inspect"},{"risk","low"},{"checks",{"Checked"}}}).contains("error"));
+  CHECK(p.db->query("SELECT task_id FROM research_questions WHERE id=?",{question["id"]})[0]["task_id"]==p.task);
+  auto user=p.db->event("user.message",{{"content","Research the external reference."}},p.session,p.task);web.require_plan(user,p.turn,p.session,p.task);
+  web.settings(false);web.account_for_pending(p.session,p.task,{});CHECK(p.db->query("SELECT status FROM research_plans WHERE turn_id=?",{p.turn})[0]["status"]=="unverified");
+  web.settings(true);
+  Json plan={{"intent","Inspect the reference"},{"operator_constraints",Json::array()},{"desired_actions",Json::array()},
+    {"goals",Json::array({{{"question","Reference behavior?"},{"claims",{"Documented behavior?"}}}})}};
+  auto result=tools.execute("research_plan",plan);CHECK(!result.contains("error"));CHECK(result["goals"][0]["required"]==1);
+  CHECK(p.db->query("SELECT id FROM research_plans WHERE turn_id=?",{p.turn}).size()==1);
+}
+
+}
+int main(){try{complete_regression();failure_is_not_verification();reference_contract();plan_defaults();orphan_binding_and_disabled_plan();return 0;}catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}}

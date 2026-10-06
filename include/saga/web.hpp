@@ -68,6 +68,11 @@ std::unique_ptr<SearchEngine> make_search_engine(const std::string &name,
                                                  WebTransport transport = fetch_public_web);
 Json research_context(Database &, Id session, Id task);
 Json research_plan_context(Database &, Id session, Id task);
+struct ResearchReferenceError : std::runtime_error {
+  Json references;
+  ResearchReferenceError(std::string message, Json available)
+      : std::runtime_error(std::move(message)), references(std::move(available)) {}
+};
 class WebResearch {
   Database &db_;
   Config config_;
@@ -79,6 +84,7 @@ class WebResearch {
   std::string turn_;
   std::function<void()> service_;
   void network_control();
+  Json lookup_claim(Id, Id session, Id task) const;
   Json dispatch_operation(const std::string &, const Json &, Id, Id, const Emit &);
   Json source_excerpt(Id id, Id offset, Id limit, const std::optional<std::string> &query = {},
                       Id tokens = 0);
@@ -99,6 +105,7 @@ public:
   Json plan(const Json &, Id session, Id task);
   Id question(const std::string &text, bool required, Id session, Id task, Id assumption = 0);
   Json questions(Id session, Id task) const;
+  Json references(Id session, Id task) const;
   Json unresolved_required(Id session, Id task) const;
   void disclose_failures(Id session, Id task, const Emit &emit);
   void account_for_pending(Id session, Id task, const Emit &emit);

@@ -462,15 +462,14 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
   session_ = session;
   task_ = task;
   if (name == "research_plan")return plan(args,session,task);
-  if (name == "research_question")
-    return {{"id", question(args.at("question"), args.value("required", false), session, task)}};
+  if (name == "research_status")return references(session,task);
+  if (name == "research_question") {
+    auto id=question(args.at("question"), args.value("required", false), session, task);
+    return {{"id",id},{"claim_id",id},{"question_id",id},{"goal_id",lookup_claim(id,session,task)["goal_id"]}};
+  }
   if (name == "research_resolve") {
     auto id = args.at("id").get<Id>();
-    auto rows =
-        db_.query("SELECT * FROM research_questions WHERE id=? AND (session_id=? OR task_id=?)",
-                  {id, session, task});
-    if (rows.empty())
-      throw std::runtime_error("Unknown research question in this session/task");
+    auto claim = lookup_claim(id,session,task);
     auto status = args.at("status").get<std::string>(),
          conclusion = args.at("conclusion").get<std::string>();
     auto citations = args.at("sources");
@@ -491,7 +490,7 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
           source[0]["text"].get_ref<const std::string &>().find(quote) == std::string::npos)
         throw std::runtime_error("Citation quote is not present in the source snapshot");
     }
-    if (status == "unverified" && rows[0]["required"] == 1 && settings()["enabled"].get<bool>()) {
+    if (status == "unverified" && claim["required"] == 1 && settings()["enabled"].get<bool>()) {
       auto attempts=db_.query("SELECT id FROM research_attempts WHERE claim_id=? LIMIT 1",{id});
       if (attempts.empty())
         throw std::runtime_error(
