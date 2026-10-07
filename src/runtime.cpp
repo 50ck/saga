@@ -328,36 +328,53 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
   std::map<int,std::string> progress_text,preparing;
   std::map<ProviderEventKind,std::string> pending;
   std::map<int,Json> pending_tools;
+  std::map<ProviderEventKind,std::pair<size_t,size_t>> event_counts;
   std::string last_channel;
+  std::string public_delta;
   size_t pending_bytes=0;
   bool terminal_recorded=false;
   bool buffer_completion=purpose=="chat" && (p_->task || tools_.web().plan_pending(p_->session,p_->task) || !tools_.web().unresolved_required(p_->session,p_->task).empty());
-  auto last_update=std::chrono::steady_clock::now();
+  auto last_checkpoint=std::chrono::steady_clock::now(),last_ui=last_checkpoint;
+  // These values cannot change inside one provider request. Fetch them once,
+  // rather than issuing SQLite queries for every visible usage update.
+  auto compactions=p_->db->query("SELECT count(*) AS n FROM context_checkpoints WHERE session_id=?",{p_->session})[0]["n"];
+  auto active_task=p_->task?p_->db->query("SELECT title FROM tasks WHERE id=?",{p_->task}):Json::array();
   auto usage=[&](bool streaming) {
     auto input=generation.input_tokens.value_or(estimated),output=generation.output_tokens.value_or((generation.generated_bytes()+2)/3);
     usage_={{"input_tokens",input},{"output_tokens",output},{"used_tokens",input+output},{"context_length",config_.context_length},{"approximate",!generation.input_tokens || !generation.output_tokens},{"streaming",streaming},
-      {"compactions",p_->db->query("SELECT count(*) AS n FROM context_checkpoints WHERE session_id=?",{p_->session})[0]["n"]},
-      {"active_task",p_->task?p_->db->query("SELECT title FROM tasks WHERE id=?",{p_->task}):Json::array()}};
+      {"compactions",compactions},{"active_task",active_task}};
     if(turn_){usage_["turn_input_tokens"]=turn_->input_tokens+input;usage_["turn_output_tokens"]=turn_->output_tokens+output;}
     if(generation.cache_tokens)usage_["cached_input_tokens"]=*generation.cache_tokens;
     if(generation.reasoning_tokens)usage_["reasoning_tokens"]=*generation.reasoning_tokens;
     journal("context.usage",usage_,emit,false);
-    if(turn_)p_->db->exec("UPDATE turns SET input_tokens=?,output_tokens=?,sequence_number=? WHERE id=?",{turn_->input_tokens+input,turn_->output_tokens+output,turn_->sequence,turn_->id});
+    last_ui=std::chrono::steady_clock::now();
+    // Presentation is independent of the durable checkpoint interval.
+    if(!public_delta.empty()) {
+      journal("assistant.delta",{{"content",public_delta}},emit,false);
+      public_delta.clear();
+    }
   };
   auto flush=[&](bool terminal) {
+    usage(!terminal);
+    if(!event_counts.empty()) {
+      Json counts=Json::array();
+      for(auto& [kind,count]:event_counts)counts.push_back({{"kind",static_cast<int>(kind)},{"events",count.first},{"text_bytes",count.second}});
+      trace("provider","provider.events.normalized",{{"counts",counts},{"checkpoint",true}},DebugProfile::Trace,"TRACE",false);
+      event_counts.clear();
+    }
+    p_->db->transaction([&] {
     for(auto& [kind,text]:pending)if(!text.empty()) {
       auto channel=kind==ProviderEventKind::Reasoning?"reasoning.delta":kind==ProviderEventKind::Commentary?"commentary.delta":"assistant.text.delta";
       journal(channel,{{"content",text}}, {},true);
-      // Hidden reasoning never travels to the normal terminal client.
-      if(kind==ProviderEventKind::Text && !buffer_completion && config_.stream_assistant_text && emit)journal("assistant.delta",{{"content",text}},emit,false);
       text.clear();
     }
     for(auto& [index,data]:pending_tools){data["index"]=index;data["tool_call_id"]=generation.calls.at(index)["id"];journal("tool.call.arguments.delta",data);}
     pending_tools.clear();pending_bytes=0;
     p_->db->exec("UPDATE generations SET status=?,state_json=?,ended_at=? WHERE id=?",{generation_status_name(generation.status),generation.checkpoint().dump(),terminal?Json(now()):Json(),id});
-    usage(!terminal);
     p_->db->exec("UPDATE model_calls SET input_tokens=?,output_tokens=?,approximate=? WHERE id=?",{usage_["input_tokens"],usage_["output_tokens"],usage_["approximate"],id});
-    last_update=std::chrono::steady_clock::now();
+    if(turn_)p_->db->exec("UPDATE turns SET input_tokens=?,output_tokens=?,sequence_number=? WHERE id=?",{usage_["turn_input_tokens"],usage_["turn_output_tokens"],turn_->sequence,turn_->id});
+    });
+    last_checkpoint=std::chrono::steady_clock::now();
   };
   usage(true);
   try {
@@ -365,7 +382,7 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
       check_control();
       if(auto log=debug_logger())log->sample();
       if(event.kind==ProviderEventKind::Heartbeat)return;
-      trace("provider","provider.event.normalized",{{"kind",static_cast<int>(event.kind)},{"text_bytes",event.text.size()},{"data_keys",event.data.is_object()?event.data.size():0}},DebugProfile::Trace,"TRACE",false);
+      auto& count=event_counts[event.kind];++count.first;count.second+=event.text.size();
       size_t before_text=event.kind==ProviderEventKind::Reasoning?generation.reasoning.size():event.kind==ProviderEventKind::Commentary?generation.commentary.size():generation.content.size();
       std::map<std::string,size_t> before_tool;
       if(event.kind==ProviderEventKind::ToolDelta){auto it=generation.calls.find(event.data.at("index").get<int>());if(it!=generation.calls.end())for(auto key:{"name","arguments"})before_tool[key]=it->second["function"][key].get_ref<const std::string&>().size();}
@@ -385,6 +402,8 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
           journal(channel+".started",{{"model_call_id",id}},emit);
         }
         pending[event.kind]+=accepted_text;pending_bytes+=accepted_text.size();
+        // Hidden reasoning never travels to the normal terminal client.
+        if(event.kind==ProviderEventKind::Text && !buffer_completion && config_.stream_assistant_text && emit)public_delta+=accepted_text;
       }
       if(event.kind==ProviderEventKind::ToolDelta) {
         int index=event.data.at("index");auto& tool=generation.calls.at(index);
@@ -398,10 +417,11 @@ GenerationState Runtime::call(ChatRequest request,const std::string& purpose,Emi
         } else if(purpose=="chat" && !name.empty() && preparing[index]!=name){preparing[index]=name;journal("operation.preparing",{{"tool",name},{"model_call_id",id}},emit,false);}
       }
       if(event.kind==ProviderEventKind::Warning)journal("provider.warning",{{"message",event.text},{"details",event.data}},emit);
-      if(event.kind==ProviderEventKind::Finished || pending_bytes>=4096 || std::chrono::steady_clock::now()-last_update>=std::chrono::milliseconds(100))flush(event.kind==ProviderEventKind::Finished);
+      auto elapsed=std::chrono::steady_clock::now();
+      if(event.kind==ProviderEventKind::Finished || pending_bytes>=4096 || elapsed-last_checkpoint>=std::chrono::seconds(1))flush(event.kind==ProviderEventKind::Finished);
+      else if(elapsed-last_ui>=std::chrono::milliseconds(100))usage(true);
     });
     if(!generation.terminal)throw ProviderError(ProviderErrorKind::Interrupted,"Provider did not terminate generation",true);
-    flush(true);
     for(auto& [index,tool]:generation.calls) {
       if(generation.status==GenerationStatus::OutputLimit) {journal("tool.call.incomplete",{{"index",index},{"tool_call_id",tool["id"]},{"reason","output_limit"}},emit);continue;}
       journal("tool.call.ready",{{"index",index},{"tool_call_id",tool["id"]},{"tool",tool["function"]["name"]}},emit);

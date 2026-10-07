@@ -103,6 +103,19 @@ void run_scenario(std::vector<Segment> segments,int expected_tools,int continuat
 }
 void runtime_tests() {
   {Fixture f;
+    Segment burst;for(int i=0;i<1000;++i)burst.events.push_back({ProviderEventKind::Reasoning,"reason "});
+    burst.events.push_back({ProviderEventKind::Text,"finished"});
+    burst.events.push_back({ProviderEventKind::Finished,"",Json::object(),FinishReason::Stop});
+    auto r=f.runtime(std::make_unique<ScriptBackend>(std::vector<Segment>{burst}));r->chat("hello",f.emit());
+    auto& db=*r->persona().db;auto state=Json::parse(db.query("SELECT state_json FROM generations")[0]["state_json"].get<std::string>());
+    CHECK(state["reasoning"].get<std::string>().size()==7000 && state["content"]=="finished");
+    // Many fast deltas share bounded durable writes without losing provider data.
+    auto saved=db.query("SELECT payload_json FROM events WHERE type='reasoning.delta'");
+    CHECK(saved.size()<10);std::string thought;for(auto& row:saved)thought+=Json::parse(row["payload_json"].get<std::string>())["content"].get<std::string>();
+    CHECK(thought==state["reasoning"].get<std::string>());
+    CHECK(std::count_if(f.events.begin(),f.events.end(),[](auto& e){return e["type"]=="reasoning.started";})==1);
+  }
+  {Fixture f;
     atomic_write(f.root/"project/existing.txt",std::string(12000,'d'));
     std::vector<Segment> segments;for(int i=0;i<10;++i)segments.push_back(tool("read-"+std::to_string(i),"file_read",{{"path","existing.txt"}}));segments.push_back(answer());
     auto backend=std::make_unique<ScriptBackend>(std::move(segments));auto* script=backend.get();auto r=f.runtime(std::move(backend));r->chat("hello",f.emit());
