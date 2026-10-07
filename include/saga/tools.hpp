@@ -14,6 +14,13 @@ struct ProcessResult {
 bool shell_sandbox_available();
 ProcessResult run_process(const fs::path& cwd, const fs::path& scratch, const std::vector<std::string>& argv, int timeout_seconds = 30,
                           bool host = false,const std::vector<fs::path>& private_roots = {},const Json& environment = Json::object(),bool unrestricted = false,const std::function<void()>& service = {},const std::function<void(std::string_view,std::string_view)>& output = {});
+enum class ActionKind { Communication, Recall, Research, Inspection, Mutation, Verification, Planning, Learning };
+struct ActionDescriptor {
+  std::string name;
+  Json arguments;
+  ActionKind kind = ActionKind::Learning;
+  bool task_work = false, read_only = false;
+};
 using Approve = std::function<bool(const std::string&,const Json&)>;
 class Tools {
   PersonaContext& p_;
@@ -31,6 +38,7 @@ class Tools {
 public:
   Tools(PersonaContext& p,Memory& memory,Approve approve,Config config = {},WebTransport transport = fetch_public_web) : p_(p),memory_(memory),web_(*p.db,std::move(config),std::move(transport)),approve_(std::move(approve)) {}
   WebResearch& web() {return web_;}
+  static ActionDescriptor action(const std::string& name,const Json& args);
   static const Json& definitions();
   static const Json& prompt_definitions();
   static void validate(const Json& args, const Json& schema);

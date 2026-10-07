@@ -59,7 +59,7 @@ CognitiveMode ExecutiveController::route(std::string_view input) {
 }
 bool ExecutiveController::research_requested(std::string_view input) {
   auto text=lower(std::string(input));
-  for(auto* signal:{"search online","search the web","search on duckduckgo","look up","research ","check the documentation","check the docs","latest version","current api","busca en internet","buscar en internet","busca por internet","investiga en internet","revisa las reglas","consulta la documentación"})if(text.find(signal)!=std::string::npos)return true;
+  for(auto* signal:{"search online","search the web","search on duckduckgo","look up","research ","investiga ","investigate ","check the documentation","check the docs","latest version","current api","busca en internet","buscar en internet","busca por internet","investiga en internet","revisa las reglas","consulta la documentación"})if(text.find(signal)!=std::string::npos)return true;
   return false;
 }
 bool ExecutiveController::needs_review(const Json& task,const Json& self) {
@@ -598,6 +598,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
   Json attention = {{"user_source_event_id",user_event}};
   auto route = ExecutiveController::route(input);trace("cognition","cognition.routed",{{"module",mode_name(route)},{"trigger","operator_request"}},DebugProfile::Trace);mode(route,emit);
   bool task_work = route == CognitiveMode::Plan;
+  attention["routing_hint"]={{"mode",mode_name(route)},{"source","operator_language_heuristic"},{"authoritative",false}};
   if (route == CognitiveMode::Recall) {
     auto recall = memory_.search("remember",Memory::retrieval_query(input));
     if (recall["weak_match"].get<bool>() && !recall["results"].empty()) recall = memory_.search("remember",Memory::retrieval_query(input),true);
@@ -607,9 +608,8 @@ void Runtime::chat_turn(std::string input,Emit emit) {
     attention["praxis"] = memory_.search("know_how",Memory::retrieval_query(input));
     if (!p_->task || p_->db->query("SELECT status FROM tasks WHERE id=?",{p_->task})[0]["status"] == "completed")
     {
-      auto text = lower(input); bool high_risk = false;
-      for (auto* signal : {"migration","delete","deploy","production","drop database"}) if (text.find(signal) != std::string::npos) high_risk = true;
-      tools_.execute("task_create",{{"title",utf8_excerpt(input,100)},{"objective",input},{"risk",high_risk ? "high" : "low"},{"checks",Json::array({"Objective satisfied with observed evidence"})}},emit);
+      // Routing is an attention hint, not a risk classification of operator prose.
+      tools_.execute("task_create",{{"title",utf8_excerpt(input,100)},{"objective",input},{"risk","low"},{"checks",Json::array({"Objective satisfied with observed evidence"})}},emit);
     }
   }
   bool requested_research=ExecutiveController::research_requested(input);
@@ -697,11 +697,14 @@ void Runtime::chat_turn(std::string input,Emit emit) {
             break;
           }
           auto args = Json::parse(call["function"]["arguments"].get<std::string>());
-          mode(name.starts_with("web_") || name.starts_with("research_") ? CognitiveMode::Research : name.find("check") != std::string::npos || name == "record_observation" ? CognitiveMode::Verify : CognitiveMode::Act,emit);
+          auto action=Tools::action(name,args);
+          auto cognitive=action.kind==ActionKind::Research?CognitiveMode::Research:action.kind==ActionKind::Recall?CognitiveMode::Recall:action.kind==ActionKind::Verification?CognitiveMode::Verify:action.kind==ActionKind::Learning?CognitiveMode::Learn:CognitiveMode::Act;
+          trace("runtime","action.classified",{{"invocation",name},{"action",action.name},{"task_work",action.task_work},{"read_only",action.read_only}},DebugProfile::Trace);
+          mode(cognitive,emit);
           phase(TurnPhase::ExecutingTool,emit);
           result = tools_.execute(name,args,emit);
-          if(name.starts_with("web_") || name.starts_with("research_")){research_work=true;if(emit)emit("agent.status",command("status"));}
-          if (name == "file_write" || name == "file_edit" || name == "shell_exec" || name.starts_with("task_") || name == "check_resolve") task_work = true;
+          if(action.kind==ActionKind::Research){research_work=true;if(emit)emit("agent.status",command("status"));}
+          if(action.task_work)task_work=true;
         } catch (const TurnCancelled&) {
           for (size_t j=i;j<message["tool_calls"].size();++j) {
             auto& skipped=message["tool_calls"][j];

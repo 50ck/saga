@@ -370,6 +370,27 @@ Json Tools::environment() {
   }
   return result;
 }
+ActionDescriptor Tools::action(const std::string& name,const Json& args) {
+  if(name=="tool_invoke" && args.is_object() && args.contains("name") && args["name"].is_string() && args.contains("arguments")) {
+    auto target=args["name"].get<std::string>();
+    if(target!="tool_invoke" && target!="tool_schema")return action(target,args["arguments"]);
+  }
+  static const std::map<std::string,ActionKind> kinds=[] {
+    std::map<std::string,ActionKind> result;
+    for(auto* n:{"report_progress"})result[n]=ActionKind::Communication;
+    for(auto* n:{"remember","know","know_how","deep_recall","recall_artifact","inspect_self","inspect_open_loops","recall_observation","recall_memory","recall_session","recall_event"})result[n]=ActionKind::Recall;
+    for(auto* n:{"web_search","web_read","web_fetch","research_plan","research_status","research_question","research_resolve","research_revise"})result[n]=ActionKind::Research;
+    for(auto* n:{"file_read","observe_environment","tool_schema"})result[n]=ActionKind::Inspection;
+    for(auto* n:{"file_write","file_edit","shell_exec","project_open","run_skill"})result[n]=ActionKind::Mutation;
+    for(auto* n:{"check_resolve","record_observation","resolve_assumption","resolve_hypothesis"})result[n]=ActionKind::Verification;
+    for(auto* n:{"task_create","task_update","task_add_check","record_assumption","record_prediction","record_hypothesis"})result[n]=ActionKind::Planning;
+    return result;
+  }();
+  auto found=kinds.find(name);auto kind=found==kinds.end()?ActionKind::Learning:found->second;
+  bool task=kind==ActionKind::Mutation || kind==ActionKind::Verification || kind==ActionKind::Planning;
+  bool read=kind==ActionKind::Recall || kind==ActionKind::Inspection || name=="web_search" || name=="web_read" || name=="web_fetch" || name=="research_status";
+  return {name,args,kind,task,read};
+}
 Json Tools::workspace_fingerprint(const Json& inputs) {
   if(!inputs.empty()) {
     std::map<std::string,std::string> files;

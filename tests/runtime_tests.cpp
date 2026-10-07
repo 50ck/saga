@@ -135,6 +135,7 @@ int main() {
     runtime=std::make_unique<Runtime>(std::make_unique<PersonaContext>(paths,a,project),config,std::move(reviewing),[](auto&,auto&){ return true; });
     runtime->start();bool review_steering=false;
     runtime->service([&]{if(!review_steering && !runtime->persona().db->query("SELECT id FROM model_calls WHERE purpose='submit_review' AND status='running'").empty()){review_steering=true;runtime->command("steer",{{"content","Continue from the review findings"}});}});
+    runtime->command("tool",{{"name","task_create"},{"arguments",{{"title","Reviewed artifact"},{"objective","Create and verify the artifact"},{"risk","high"},{"checks",Json::array({"Artifact is observed"})}}}});
     runtime->chat("Create artifact migration",emit);runtime->service({});
     CHECK(review_steering && runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="delivered");
     CHECK(runtime->command("tasks")[0]["status"]=="verifying");
@@ -144,6 +145,7 @@ int main() {
     runtime->close("user_exit"); runtime.reset();
     runtime=activate(b); runtime->start();bool successful_review_steering=false;
     runtime->service([&]{if(!successful_review_steering && !runtime->persona().db->query("SELECT id FROM model_calls WHERE purpose='submit_review' AND status='running'").empty()){successful_review_steering=true;runtime->command("steer",{{"content","Continue after successful verification"}});}});
+    runtime->command("tool",{{"name","task_create"},{"arguments",{{"title","Reviewed artifact"},{"objective","Create and verify the artifact"},{"risk","high"},{"checks",Json::array({"Artifact is observed"})}}}});
     runtime->chat("Create artifact migration",emit);runtime->service({});
     CHECK(successful_review_steering && runtime->persona().db->query("SELECT status FROM steering_messages ORDER BY id DESC LIMIT 1")[0]["status"]=="delivered");
     events=Json::array();runtime->chat("Show live progress",emit);

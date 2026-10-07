@@ -169,6 +169,13 @@ void runtime_tests() {
     auto query=Memory::retrieval_query(std::string(8000,'a')+" std::vector src/net/http.cpp Reed-Solomon");
     CHECK(query.size()<=3072 && query.find("src/net/http.cpp")!=std::string::npos);
   }
+  {auto action=Tools::action("tool_invoke",{{"name","web_fetch"},{"arguments",{{"url","https://example.org"}}}});
+    CHECK(action.name=="web_fetch" && action.kind==ActionKind::Research && action.read_only);
+    CHECK(Tools::action("tool_invoke",{{"name","file_write"},{"arguments",Json::object()}}).task_work);
+    Fixture f;auto backend=std::make_unique<ScriptBackend>(std::vector<Segment>{tool("wrapped","tool_invoke",{{"name","research_status"},{"arguments",Json::object()}}),answer()});
+    auto r=f.runtime(std::move(backend));r->chat("hello",f.emit());
+    CHECK(std::any_of(f.events.begin(),f.events.end(),[](auto& event){return event["type"]=="cognitive.mode" && event["payload"].value("mode","")=="research";}));
+  }
   run_scenario({answer()},0);
   auto simultaneous=tool("first","file_read",{{"path","existing.txt"}});
   simultaneous.events.insert(simultaneous.events.begin()+1,{ProviderEventKind::ToolDelta,"",{{"index",1},{"id","second"},{"name","file_read"},{"arguments",Json{{"path","existing.txt"}}.dump()}}});

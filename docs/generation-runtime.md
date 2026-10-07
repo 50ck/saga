@@ -181,3 +181,11 @@ assessments; a zero exit code is not a proof of algorithmic correctness.
 Schema 13 preserves old evidence for audit and reopens legacy execution checks
 without dependency validation. Negative or ambiguous operator text cannot be
 misread as explicit confirmation.
+
+Action descriptors normalize discovery wrappers before cognitive routing. Recall,
+research, verification, planning and mutations carry explicit shared metadata;
+backend names and substrings no longer define runtime tool semantics. Operator
+language routing is marked as a heuristic attention hint. It does not classify
+risk from quoted words: task risk is supplied explicitly through task_create
+(and can be raised by its same-turn reuse), while action permissions and research
+checks continue to be enforced by the actual tool dispatcher.
