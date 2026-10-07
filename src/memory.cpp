@@ -1,6 +1,7 @@
 #include <saga/debug.hpp>
 #include <saga/memory.hpp>
 #include <saga/web.hpp>
+#include <saga/web/acquisition.hpp>
 #include <algorithm>
 #include <cmath>
 #include <set>
@@ -40,22 +41,41 @@ Json Memory::recall(const std::string &kind,Id id,Id offset,Id limit) {
   if(offset<0 || limit<1 || limit>12000)throw std::runtime_error("Invalid memory page; maximum 12000 bytes");
   auto rows=p_.db->query("SELECT * FROM "+table->second+" WHERE id=?",{id});
   if(rows.empty())return {{"error","No memory at this typed reference; repeat remember/know rather than guessing IDs"},{"error_type","MemoryReferenceError"},{"memory_ref",{{"kind",kind},{"id",id}}}};
+  if(kind=="episode")p_.db->exec("UPDATE episodes SET recall_count=recall_count+1,last_recalled_at=? WHERE id=?",{now(),id});
   auto text=rows[0].dump();size_t begin=std::min(static_cast<size_t>(offset),text.size()),end=std::min(begin+static_cast<size_t>(limit),text.size());
   while(begin && begin<text.size() && (static_cast<unsigned char>(text[begin])&0xc0)==0x80)--begin;
   while(end<text.size() && (static_cast<unsigned char>(text[end])&0xc0)==0x80)++end;
   return {{"memory_ref",memory_reference(rows[0],kind)},{"retrieval_actions",memory_actions(rows[0],kind)},{"content",text.substr(begin,end-begin)},{"offset",begin},{"next_offset",end},{"total_bytes",text.size()},{"complete",end==text.size()},{"hash",digest(text)},{"historical",true},{"untrusted",true}};
+}
+std::string Memory::retrieval_query(std::string_view request) {
+  // Retrieval receives a bounded technical query, never an operator specification.
+  static const std::set<std::string> stop={"the","and","with","for","this","that","please","create","implement","write","use","you","your","from","into","then","have","quiero","para","como","que","con","una","del","las","los","por","este","esta","haz","usa","implementa","crea"};
+  std::map<std::string,size_t> counts;
+  for(auto& token:web::technical_tokens(request))
+    if(token.size()>2 && token.size()<=128 && !stop.contains(token))++counts[token];
+  std::vector<std::string> terms;for(auto& [term,count]:counts)terms.push_back(term);
+  auto weight=[&](const std::string& term){
+    bool technical=term.find_first_of("_/:.-0123456789")!=std::string::npos;
+    return (technical?20.0:0.0)+std::min<size_t>(term.size(),16)+std::min<size_t>(counts[term],4);
+  };
+  std::stable_sort(terms.begin(),terms.end(),[&](auto& a,auto& b){return weight(a)>weight(b);});
+  std::string query;
+  for(auto& term:terms){if(query.size()+term.size()+1>3072 || std::count(query.begin(),query.end(),' ')>=47)break;if(!query.empty())query+=' ';query+=term;}
+  return query;
 }
 Json Memory::search(std::string kind, std::string query, bool deep) {
   TraceSpan span("memory","recall",{{"kind",kind},{"depth",deep?"deep":"normal"}});
   trace("memory","memory.search.started",{{"query",query},{"kind",kind},{"database",(p_.directory/"agent.db").string()},{"limit",deep?16:8}},DebugProfile::Trace);
   if (query.size() > 4096) throw std::runtime_error("Memory query exceeds limit");
   auto ws = words(query);
+  auto lowered_query=lower(query);
+  auto goals=p_.db->query("SELECT description FROM goals WHERE status='active' AND (project_id IS NULL OR project_id=?)",{p_.project});
   std::set<Id> entity_ids;
   for (auto& e : p_.db->query("SELECT * FROM entities")) {
     std::string name = lower(e["canonical_name"]);
     auto aliases = Json::parse(e["aliases_json"].get<std::string>());
-    bool match = lower(query).find(name) != std::string::npos;
-    for (auto& a : aliases) if (a.is_string() && lower(query).find(lower(a.get<std::string>())) != std::string::npos) match = true;
+    bool match = lowered_query.find(name) != std::string::npos;
+    for (auto& a : aliases) if (a.is_string() && lowered_query.find(lower(a.get<std::string>())) != std::string::npos) match = true;
     if (match) {
       entity_ids.insert(e["id"].get<Id>());
       if (deep) { auto extra = words(name); ws.insert(ws.end(),extra.begin(),extra.end()); }
@@ -72,18 +92,17 @@ Json Memory::search(std::string kind, std::string query, bool deep) {
       for (Id entity : entity_ids) for (auto& row : p_.db->query("SELECT t.*,0 AS lexical FROM " + table + " t JOIN " + link + " e ON t.id=e." + column + " WHERE e.entity_id=? LIMIT 40",{entity})) rows.push_back(row);
     }
     std::set<Id> seen;
-    auto goals = p_.db->query("SELECT description FROM goals WHERE status='active' AND (project_id IS NULL OR project_id=?)",{p_.project});
+    std::map<Id,double> overlaps;
+    if(!entity_ids.empty() && (type=="episode" || type=="fact" || type=="artifact")) {
+      for(Id entity:entity_ids)for(auto& link:p_.db->query("SELECT "+type+"_id AS id FROM "+type+"_entities WHERE entity_id=?",{entity}))++overlaps[link["id"].get<Id>()];
+    }
     for (auto row : rows) {
       Id id = row["id"];
       if (!seen.insert(id).second){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","duplicate_retrieval_candidate"}},DebugProfile::Trace);continue;}
       if (type == "praxis" && (row["status"] == "deprecated" || (!row["project_id"].is_null() && row["project_id"] != p_.project))){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","deprecated_or_different_project"}},DebugProfile::Trace);continue;}
       if (type == "fact" && !deep && !row["valid_to"].is_null()){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","superseded_fact"}},DebugProfile::Trace);continue;}
       if (type == "fact" && !deep && !row["project_id"].is_null() && row["project_id"] != p_.project){trace("memory","memory.candidate.rejected",{{"memory_id",id},{"type",type},{"reason","different_project"}},DebugProfile::Trace);continue;}
-      double entity_overlap = 0;
-      if (type == "episode" || type == "fact" || type == "artifact") {
-        auto links = p_.db->query("SELECT entity_id FROM " + type + "_entities WHERE " + type + "_id=?",{id});
-        for (auto& link : links) if (entity_ids.contains(link["entity_id"].get<Id>())) entity_overlap += 1;
-      }
+      double entity_overlap = overlaps[id];
       double lexical = std::log1p(std::abs(row.value("lexical",0.0))*1000);
       double salience = row.value("salience",0.3), confidence = row.value("confidence",0.5);
       if (type == "praxis") confidence = row.value("alpha",1.0)/(row.value("alpha",1.0)+row.value("beta",1.0));
@@ -129,17 +148,20 @@ Json Memory::search(std::string kind, std::string query, bool deep) {
   else if (kind == "inspect_open_loops") return p_.db->query("SELECT * FROM open_loops WHERE state='open' AND (project_id IS NULL OR project_id=?) ORDER BY priority DESC LIMIT 20",{p_.project});
   else throw std::runtime_error("Unknown memory kind");
   std::sort(results.begin(),results.end(),[](const Json& a,const Json& b){ return a["score"].get<double>() > b["score"].get<double>(); });
-  if(auto log=debug_logger();log && log->enabled(DebugProfile::Trace)) {
-    Json candidates=Json::array();for(size_t i=0;i<results.size();++i){auto& row=results[i];candidates.push_back({{"memory_id",row["id"]},{"memory_type",row["memory_type"]},{"ranking",row["ranking"]},{"score",row["score"]},{"tokens_estimate",estimate_tokens(row.dump())},{"included",i<(deep?16U:8U)},{"reason",i<(deep?16U:8U)?"retrieval_rank":"result_limit"}});}
-    trace("memory","memory.selection",{{"candidates",candidates},{"matched_words",ws}},DebugProfile::Trace);
+  Json selected=Json::array(),candidates=Json::array();
+  const size_t budget=deep?4000:2400;size_t used=0;
+  for(auto& original:results) {
+    auto row=original;auto type=row["memory_type"].get<std::string>();
+    row["memory_ref"]=memory_reference(row,type);row["retrieval_actions"]=memory_actions(row,type);
+    for(auto& [key,value]:row.items())if(value.is_string() && value.get_ref<const std::string&>().size()>768) {
+      value=utf8_excerpt(value.get<std::string>(),768);row["preview"]=true;
+    }
+    auto cost=estimate_tokens(row.dump());bool included=selected.size()<(deep?16U:8U) && used+cost<=budget;
+    candidates.push_back({{"memory_id",row["id"]},{"memory_type",type},{"score",row["score"]},{"tokens_estimate",cost},{"included",included},{"reason",included?"relevance_within_budget":"retrieval_budget"}});
+    if(included){used+=cost;selected.push_back(std::move(row));}
   }
-  while (results.size() > (deep ? 16U : 8U)) results.erase(results.end()-1);
-  for (auto& row : results) if (row["memory_type"] == "episode") p_.db->exec("UPDATE episodes SET recall_count=recall_count+1,last_recalled_at=?,accessibility=min(1,accessibility+0.1) WHERE id=?",{now(),row["id"]});
-  for(auto &row:results) {
-    auto type=row["memory_type"].get<std::string>();
-    row["memory_ref"]=memory_reference(row,type);
-    row["retrieval_actions"]=memory_actions(row,type);
-  }
+  trace("memory","memory.selection",{{"candidates",candidates},{"token_budget",budget},{"selected_tokens",used},{"matched_words",ws}},DebugProfile::Trace);
+  results=std::move(selected);
   Json diagnostic = {{"query",query},{"depth",deep ? "deep" : "normal"},{"kind",kind},{"results",results}};
   p_.db->exec("INSERT INTO retrieval_diagnostics(query,depth,kind,results_json,created_at) VALUES(?,?,?,?,?)",{query,diagnostic["depth"],kind,results.dump(),now()});
   p_.db->event("memory.recalled",diagnostic,p_.session,p_.task);

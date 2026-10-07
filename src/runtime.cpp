@@ -599,12 +599,12 @@ void Runtime::chat_turn(std::string input,Emit emit) {
   auto route = ExecutiveController::route(input);trace("cognition","cognition.routed",{{"module",mode_name(route)},{"trigger","operator_request"}},DebugProfile::Trace);mode(route,emit);
   bool task_work = route == CognitiveMode::Plan;
   if (route == CognitiveMode::Recall) {
-    auto recall = memory_.search("remember",input);
-    if (recall["weak_match"].get<bool>() && !recall["results"].empty()) recall = memory_.search("remember",input,true);
+    auto recall = memory_.search("remember",Memory::retrieval_query(input));
+    if (recall["weak_match"].get<bool>() && !recall["results"].empty()) recall = memory_.search("remember",Memory::retrieval_query(input),true);
     attention["recall"] = recall;
   }
   if (route == CognitiveMode::Plan) {
-    attention["praxis"] = memory_.search("know_how",input);
+    attention["praxis"] = memory_.search("know_how",Memory::retrieval_query(input));
     if (!p_->task || p_->db->query("SELECT status FROM tasks WHERE id=?",{p_->task})[0]["status"] == "completed")
     {
       auto text = lower(input); bool high_risk = false;
@@ -616,7 +616,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
   if(requested_research) {
     tools_.web().require_plan(user_event,turn_->id,p_->session,p_->task);
     attention["research_decomposition_required"]="Use research_plan to identify concrete external knowledge requirements. Operator intent, controls, paths and constraints are not verifiable claims.";
-    attention["knowledge"]=memory_.search("know",input);
+    attention["knowledge"]=memory_.search("know",Memory::retrieval_query(input));
     mode(CognitiveMode::Research,emit);
   }
   bool research_work=requested_research;

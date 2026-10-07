@@ -162,6 +162,13 @@ void runtime_tests() {
     CHECK(r->persona().db->query("SELECT id FROM model_calls WHERE purpose='submit_memory_extraction'").empty());
     CHECK(r->persona().db->query("SELECT count(*) AS n FROM tool_runs WHERE tool='file_read'")[0]["n"]==10);
   }
+  {Fixture f;auto r=f.runtime(std::make_unique<ScriptBackend>(std::vector<Segment>{answer()}));
+    r->chat("Do you remember the QR encoder with Reed-Solomon " + std::string(5000,'a'),f.emit());
+    CHECK(r->persona().db->query("SELECT status FROM turns")[0]["status"]=="completed");
+    CHECK(r->persona().db->query("SELECT id FROM model_calls WHERE purpose='chat'").size()==1);
+    auto query=Memory::retrieval_query(std::string(8000,'a')+" std::vector src/net/http.cpp Reed-Solomon");
+    CHECK(query.size()<=3072 && query.find("src/net/http.cpp")!=std::string::npos);
+  }
   run_scenario({answer()},0);
   auto simultaneous=tool("first","file_read",{{"path","existing.txt"}});
   simultaneous.events.insert(simultaneous.events.begin()+1,{ProviderEventKind::ToolDelta,"",{{"index",1},{"id","second"},{"name","file_read"},{"arguments",Json{{"path","existing.txt"}}.dump()}}});

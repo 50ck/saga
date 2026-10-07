@@ -184,6 +184,9 @@ void persistence() {
   memory.entity_links(episode,Json::array({{{"name","XLibre"},{"type","software"},{"aliases",Json::array({"the display server"})}}}));
   CHECK(!memory.search("remember","Xvfb")["results"].empty());
   CHECK(!memory.search("remember","the display server",true)["results"].empty());
+  CHECK(db->query("SELECT recall_count FROM episodes WHERE id=?",{episode})[0]["recall_count"]==0);
+  memory.recall("episode",episode);
+  CHECK(db->query("SELECT recall_count FROM episodes WHERE id=?",{episode})[0]["recall_count"]==1);
   memory.maintain(); CHECK(db->query("SELECT accessibility FROM episodes")[0]["accessibility"].get<double>() > 0);
   p.reset(); p = f.persona(a); CHECK(p->db->query("SELECT status FROM sessions WHERE id=?",{session})[0]["status"] == "needs_consolidation");
   rejects([&]{ f.paths.persona("../../escape"); });

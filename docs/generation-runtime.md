@@ -160,3 +160,10 @@ and [prompt caching guidance](https://developers.openai.com/api/docs/guides/prom
 Performance comparisons require the same model, template, endpoint, cache state,
 permissions and actual correctness checks; a shorter elapsed time alone does not
 establish equivalent output quality.
+
+Automatic recall compiles operator requests into bounded technical queries (48
+terms, at most 3072 bytes), rather than forwarding an entire specification.
+Search returns relevance-ranked previews within a 2400-token budget (4000 for
+deep recall), retaining typed references for lossless explicit inspection.
+Candidate retrieval does not increase episode accessibility; explicit recall
+records inspection separately from evidence-based confidence.

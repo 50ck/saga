@@ -6,6 +6,7 @@ class Memory {
   Config config_;
 public:
   Memory(PersonaContext& persona, Config config) : p_(persona), config_(std::move(config)) {}
+  static std::string retrieval_query(std::string_view request);
   Json search(std::string kind, std::string query, bool deep = false);
   Json recall(const std::string& kind, Id id, Id offset = 0, Id limit = 12000);
   Id episode(const Json& data, Id session);
