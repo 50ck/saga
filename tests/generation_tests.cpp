@@ -103,6 +103,43 @@ void run_scenario(std::vector<Segment> segments,int expected_tools,int continuat
 }
 void runtime_tests() {
   {Fixture f;
+    Json extraction={{"facts",Json::array()},{"praxis",Json::array()}};
+    auto backend=std::make_unique<ScriptBackend>(std::vector<Segment>{tool("extract-1","submit_memory_extraction",extraction),tool("extract-2","submit_memory_extraction",extraction)});auto* script=backend.get();auto r=f.runtime(std::move(backend));auto& db=*r->persona().db;
+    auto session=db.exec("INSERT INTO sessions(started_at,status) VALUES(?,'completed')",{now()});
+    db.exec("INSERT INTO journal_entries(session_id,started_at,ended_at,narrative,summary,outcome,created_at) VALUES(?,?,?,'Synthetic diary','Synthetic summary','conversation',?)",{session,now(),now(),now()});
+    std::vector<Id> originals;for(int i=0;i<61;++i)originals.push_back(db.event("user.message",{{"content","Synthetic memory source "+std::to_string(i)}},session));
+    r->tick();CHECK(script->requests.size()==1);
+    auto partial=db.query("SELECT payload_json FROM events WHERE session_id=? AND type='memory.extraction_partial'",{session});
+    CHECK(partial.size()==1 && Json::parse(partial[0]["payload_json"].get<std::string>())["through_event_id"]==originals[39]);
+    CHECK(db.query("SELECT id FROM events WHERE session_id=? AND type='memory.extraction_completed'",{session}).empty());
+    r->tick();r->tick();CHECK(script->requests.size()==2);
+    auto completed=db.query("SELECT payload_json FROM events WHERE session_id=? AND type='memory.extraction_completed'",{session});
+    CHECK(completed.size()==1 && Json::parse(completed[0]["payload_json"].get<std::string>())["through_event_id"]==originals.back());
+    std::vector<Id> consumed;for(auto& request:script->requests) {
+      CHECK(request.forced_tool=="submit_memory_extraction");auto prompt=request.messages[1]["content"].get<std::string>();
+      for(auto& source:Json::parse(prompt.substr(prompt.rfind('\n')+1)))consumed.push_back(source["id"].get<Id>());
+    }
+    CHECK(consumed==originals);CHECK(db.query("SELECT id FROM events WHERE session_id=? AND type='user.message'",{session}).size()==61);
+  }
+  {Fixture f;auto r=f.runtime(std::make_unique<ScriptBackend>(std::vector<Segment>{answer()}));auto& p=r->persona();
+    Memory memory(p,f.config);Tools tools(p,memory,[](auto&,auto&){return true;},f.config);
+    auto catalog=tools.execute("tool_schema",{{"names",Json::array({"record_goal","file_read"})}});
+    CHECK(catalog["schemas"].size()==2);
+    CHECK(tools.execute("tool_schema",{{"names",Json::array({"missing"})}}).contains("error"));
+    CHECK(tools.execute("tool_invoke",{{"name","record_goal"},{"arguments",{{"scope","invalid"},{"description","Bad goal"}}}}).contains("error"));
+    CHECK(tools.execute("tool_invoke",{{"name","tool_invoke"},{"arguments",Json::object()}}).contains("error"));
+    p.db->exec("INSERT INTO turns(id,session_id,status,phase,started_at) VALUES('discovery-turn',?,'active','executing_tool',?)",{p.session,now()});
+    p.turn="discovery-turn";p.tool_call="goal-once";
+    Json args={{"name","record_goal"},{"arguments",{{"scope","session"},{"description","Synthetic goal"}}}};
+    auto first=tools.execute("tool_invoke",args);auto second=tools.execute("tool_invoke",args);
+    CHECK(first==second && p.db->query("SELECT count(*) AS n FROM goals")[0]["n"]==1);
+    p.tool_call="read-once";auto read=tools.execute("tool_invoke",{{"name","file_read"},{"arguments",{{"path","existing.txt"}}}});
+    auto origin=p.db->query("SELECT payload_json FROM events WHERE id=?",{read["source_event_id"]});
+    CHECK(Json::parse(origin[0]["payload_json"].get<std::string>())["tool"]=="file_read");
+    CHECK(read.contains("invocation_event_id"));
+    CHECK(estimate_tokens(Tools::prompt_definitions().dump())<estimate_tokens(Tools::definitions().dump())*3/4);
+  }
+  {Fixture f;
     Segment burst;for(int i=0;i<1000;++i)burst.events.push_back({ProviderEventKind::Reasoning,"reason "});
     burst.events.push_back({ProviderEventKind::Text,"finished"});
     burst.events.push_back({ProviderEventKind::Finished,"",Json::object(),FinishReason::Stop});

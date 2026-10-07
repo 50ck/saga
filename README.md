@@ -317,8 +317,8 @@ their own metrics and do not replace the displayed conversation context.
 them; those measurements are also recorded as `model.cache_observed` events.
 The same Saga session remains active between messages. Each OpenAI-compatible
 request sends its working conversation again; a server generation task is not a
-new persona session. Identity and the wake snapshot stay stable until compaction
-or an explicit identity/session change. Live attention and task checks are appended
+new persona session. Identity and the wake snapshot stay stable across compaction until an explicit
+identity/session change. Checkpoint handoffs and current task state stay at the tail. Live attention and task checks are appended
 as persisted internal data messages, keeping previous turns unchanged for prefix
 cache reuse. Tool excerpts use a consistent limit, and streamed reasoning is
 preserved in assistant history when supplied by the server. Server cache reuse
@@ -330,9 +330,11 @@ older running daemon must be restarted to load context or permission updates.
 Each compaction displays
 `xN` in the status bar and `/status`, omitted before the first compaction.
 
-Before automatic or manual compaction, memory extraction persists supported facts
-and procedural candidates in their own tables. If the backend is unavailable,
-original events and existing typed cognition still persist for later consolidation.
+Automatic and manual compaction use a local transactional handoff and never invoke
+the model for memory extraction on the foreground turn. Immutable source events
+and existing typed cognition remain durable. Detached maintenance extracts facts
+and procedural candidates in bounded ascending batches, resuming a successful
+source-event watermark so earlier batches are not repeatedly processed.
 A transactional checkpoint references all typed cognitive records and saves the
 objective, latest request, decisions, evidence sources and unfinished checks.
 The new context receives this handoff alongside the same SOUL and current typed

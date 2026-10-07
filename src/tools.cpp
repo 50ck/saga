@@ -216,7 +216,8 @@ ProcessResult run_process(const fs::path& cwd,const fs::path& scratch,const std:
 static Json str() { return {{"type","string"}}; }
 static Json integer() { return {{"type","integer"}}; }
 static Json boolean() { return {{"type","boolean"}}; }
-Json Tools::definitions() {
+const Json& Tools::definitions() {
+  static const Json definitions=[] {
   Json tools = Json::array();
   auto add = [&](std::string name,std::string desc,Json props,Json req){ tools.push_back(function_tool(std::move(name),std::move(desc),std::move(props),std::move(req))); };
   add("report_progress","Publish concise public commentary before actions and after discoveries. Do not expose internal reasoning or claim unverified completion.",{{"text",str()}},{"text"});
@@ -275,7 +276,30 @@ Json Tools::definitions() {
   add("develop_trait","Record a tendency supported by at least three completed task events",{{"trait",str()},{"source_event_ids",{{"type","array"},{"items",integer()}}}},{"trait","source_event_ids"});
   add("compile_skill","Compile habitual praxis into a tool macro. Host workflows follow host permissions; sandbox workflows are automatic.",{{"praxis_id",integer()},{"name",str()},{"steps",{{"type","array"},{"items",{{"type","object"},{"properties",{{"tool",str()},{"arguments",{{"type","object"}}}}},{"required",{"tool","arguments"}},{"additionalProperties",false}}}}}},{"praxis_id","name","steps"});
   add("run_skill","Run an approved compiled macro; each action passes its own gate",{{"id",integer()}},{"id"});
+  add("tool_schema","Get exact schemas for additional cognitive tools. Empty names lists their catalog. Use tool_invoke to call a returned schema; do not guess arguments.",{{"names",strings}},{});
+  add("tool_invoke","Invoke an available tool by name with its validated arguments. Uses the same permissions, evidence checks, cancellation and durable execution as direct calls. Get its schema first with tool_schema.",{{"name",str()},{"arguments",{{"type","object"}}}},{"name","arguments"});
   return tools;
+  }();
+  return definitions;
+}
+const Json& Tools::prompt_definitions() {
+  // A fixed small working set keeps prefix caching stable. Less frequent
+  // cognitive actions remain callable through the same validated dispatcher.
+  static const Json definitions=[] {
+    const std::set<std::string> direct={"report_progress","remember","know","know_how","recall_memory","recall_session","recall_event","recall_observation",
+      "web_search","web_read","research_plan","research_status","research_question","research_resolve","research_revise",
+      "observe_environment","file_read","file_write","file_edit","project_open","shell_exec",
+      "task_create","task_update","task_add_check","check_resolve","record_assumption","resolve_assumption","tool_schema","tool_invoke"};
+    Json result=Json::array();std::string catalog;
+    for(auto& tool:Tools::definitions()) {
+      auto name=tool["function"]["name"].get<std::string>();
+      if(direct.contains(name))result.push_back(tool);
+      else {if(!catalog.empty())catalog+=", ";catalog+=name;}
+    }
+    for(auto& tool:result)if(tool["function"]["name"]=="tool_schema")tool["function"]["description"].get_ref<std::string&>()+=" Additional tools: "+catalog+".";
+    return result;
+  }();
+  return definitions;
 }
 void Tools::validate(const Json& args,const Json& schema) {
   auto type = schema.value("type","");
@@ -351,7 +375,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   TraceContext tool_context({{"tool_call_id",p_.tool_call},{"task_id",p_.task},{"turn_id",p_.turn},{"generation_id",p_.generation}});
   trace("tool","tool.call.started",{{"tool",name},{"arguments",args}},DebugProfile::Trace);
   if (service_) service_(); // Apply queued permissions before the action gate.
-  auto definitions_list = definitions();
+  const auto& definitions_list = definitions();
   auto it = std::find_if(definitions_list.begin(),definitions_list.end(),[&](auto& d){ return d["function"]["name"] == name; });
   if (it == definitions_list.end()) {trace("tool","tool.arguments.validated",{{"tool",name},{"valid",false},{"error","Unknown tool"}},DebugProfile::Debug,"WARN");return {{"error","Unknown tool"}};}
   try { validate(args,(*it)["function"]["parameters"]); } catch (const std::exception& e) {trace("tool","tool.arguments.validated",{{"tool",name},{"valid",false},{"error",e.what()}},DebugProfile::Debug,"WARN");return {{"error",e.what()}}; }
@@ -386,7 +410,7 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
     p_.db->event("tool.output",payload,p_.session,p_.task);if(emit)emit("tool.output",payload);
   };
   Json result;
-  try { result = dispatch(name,args); }
+  try { result = dispatch(name,args,emit); }
   catch(const TurnCancelled&) {
     p_.db->exec("UPDATE tool_runs SET status='cancelled',duration_ms=?,error_type='user_stop' WHERE id=?",{now()-started,run});
     p_.db->event("tool.cancelled",{{"run_id",run},{"tool",name}},p_.session,p_.task);
@@ -403,14 +427,30 @@ Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   p_.db->exec("UPDATE tool_runs SET duration_ms=?,status=?,exit_code=?,stdout_size=?,stderr_size=?,error_type=?,result_hash=? WHERE id=?",
     {now()-started,failed ? "failed" : "completed",result.value("exit_code",Json()),result.value("stdout_size",result.value("stdout",std::string()).size()),result.value("stderr_size",result.value("stderr",std::string()).size()),failed ? Json(result.value("error",std::string("nonzero_exit"))) : Json(),digest(result.dump()),run});
   Id ev = p_.db->event(type,{{"run_id",run},{"tool",name},{"result",result},{"duration_ms",now()-started}},p_.session,p_.task);
-  result["source_event_id"] = ev;
+  // Keep the actual action's provenance when a discovery wrapper invokes it.
+  if(name=="tool_invoke")result["invocation_event_id"]=ev;
+  else result["source_event_id"] = ev;
   p_.db->exec("UPDATE tool_runs SET result_json=? WHERE id=?",{result.dump(),run});
-  if (p_.task && name!="report_progress" && !name.starts_with("web_") && !name.starts_with("research_")) memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
+  if (p_.task && name!="report_progress" && name!="tool_schema" && name!="tool_invoke" && !name.starts_with("web_") && !name.starts_with("research_")) memory_.evidence("task",p_.task,"tool output",!failed,ev,0.2,0.5);
   if (emit && name!="report_progress") emit(type,{{"run_id",run},{"tool",name},{"result",result},{"duration_ms",now()-started}});
   return result;
 }
-Json Tools::dispatch(const std::string& name,const Json& a) {
+Json Tools::dispatch(const std::string& name,const Json& a,Emit emit) {
   auto db = p_.db.get();
+  if(name=="tool_schema") {
+    Json result=Json::array();auto names=a.value("names",Json::array());
+    for(auto& schema:definitions()) {
+      if(names.empty())result.push_back({{"name",schema["function"]["name"]},{"description",schema["function"]["description"]}});
+      else if(std::find(names.begin(),names.end(),schema["function"]["name"])!=names.end())result.push_back(schema);
+    }
+    for(auto& requested:names)if(std::none_of(result.begin(),result.end(),[&](auto& schema){return schema["function"]["name"]==requested;}))throw std::runtime_error("Unknown requested tool schema: "+requested.get<std::string>());
+    return {{names.empty()?"catalog":"schemas",result}};
+  }
+  if(name=="tool_invoke") {
+    auto target=a.at("name").get<std::string>();
+    if(target=="tool_invoke" || target=="tool_schema")throw std::runtime_error("Recursive discovery tool invocation is not supported");
+    return execute(target,a.at("arguments"),emit);
+  }
   if(name.starts_with("web_") || name.starts_with("research_"))return web_.dispatch(name,a,p_.session,p_.task,events_);
   bool implementation=name=="file_write" || name=="file_edit" || name=="shell_exec";
   if(implementation)web_.account_for_pending(p_.session,p_.task,events_);

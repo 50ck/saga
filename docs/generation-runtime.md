@@ -49,8 +49,12 @@ without modifying old conversations. Generations retain compact checkpoints,
 terminal classifications, input estimates and requested/effective output limits.
 The existing append-only `events` table is the event journal. Runtime events carry
 session, turn, generation, sequence and timestamp; tool events also carry call IDs.
-Text/reasoning/tool fragments are batched at 100 ms or 4 KiB and at semantic
-boundaries. Reasoning is stored privately and never emitted to the normal UI.
+UI updates are coalesced at 100 ms independently of persistence. Durable
+text/reasoning/tool fragments and generation state are committed together at
+one second or 4 KiB and at channel/terminal boundaries. Cancellation flushes
+pending buffers; a sudden process crash can lose the final uncommitted interval.
+Provider normalization diagnostics report per-kind counts at each checkpoint;
+wire logging retains the original HTTP/SSE bytes and chunk metadata. Reasoning is stored privately and never emitted to the normal UI.
 Provider buffers and tool fragments have explicit byte/count bounds.
 
 The journal is separate from the `messages` table. Spinners, usage, status and
@@ -118,3 +122,41 @@ Tests cover normalized streams, the exact 8,192-token regression, small-budget
 continuation, fragmented and multiple calls, semantic progress, transient retry
 without repeating a completed write, cancellation and crash recovery. Native HTTP
 integration tests continue to exercise the actual curl/SSE/daemon/client path.
+
+## Foreground efficiency
+
+Compaction is a local handoff over immutable sources, not another model request.
+Automatic learning runs during detached maintenance and consumes at most 40
+unprocessed events, targeting an 8,192-token input presentation per batch
+while retaining at least one bounded source event to make progress. Internal
+requests still obey the normal input-budget checks.
+A successful batch advances its source-event watermark; completion is recorded
+only after all eligible source events have been consumed. Original events remain
+unchanged, and deferred extraction can retry without losing them.
+
+Identity, SOUL and the initial wake snapshot are frozen for the session, including
+after checkpoints. Current tasks, research references and handoffs enter at the
+tail. This preserves the longest available prefix without promising server cache
+hits across compaction or unrelated clients.
+
+The provider receives a fixed 29-tool working set for chat, research and coding.
+The complete registry remains available through `tool_schema(names)` and
+`tool_invoke(name, arguments)` without changing the native schema set each round.
+Invocation uses the same validation, approval, cancellation and durable execution
+path. Wrapped results retain the actual action's source event, with a separate
+invocation event; duplicate call IDs replay the committed result. Optional
+learning, prediction and self-reflection are demand-driven, not required rituals.
+
+Research should close focused knowledge gaps using immutable passage references,
+then proceed to implementation and observed verification. Independent tool calls
+can share a generation, reducing provider round trips. Saga still executes them
+in order on its cognition thread; this change does not add parallel side effects.
+The existing evidence/risk gates and bounded search/turn budgets remain enforced.
+
+The design follows the stable-prompt and tool-loop principles documented in the
+[Hermes agent loop](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/agent-loop.md)
+and OpenAI's [latency guidance](https://developers.openai.com/api/docs/guides/latency-optimization)
+and [prompt caching guidance](https://developers.openai.com/api/docs/guides/prompt-caching).
+Performance comparisons require the same model, template, endpoint, cache state,
+permissions and actual correctness checks; a shorter elapsed time alone does not
+establish equivalent output quality.

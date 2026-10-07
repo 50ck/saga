@@ -25,11 +25,12 @@ class Tools {
   Emit events_;
   unsigned execution_depth_=0;
   fs::path safe_path(const std::string& path, bool write) const;
-  Json dispatch(const std::string& name, const Json& args);
+  Json dispatch(const std::string& name, const Json& args,Emit emit = {});
 public:
   Tools(PersonaContext& p,Memory& memory,Approve approve,Config config = {},WebTransport transport = fetch_public_web) : p_(p),memory_(memory),web_(*p.db,std::move(config),std::move(transport)),approve_(std::move(approve)) {}
   WebResearch& web() {return web_;}
-  static Json definitions();
+  static const Json& definitions();
+  static const Json& prompt_definitions();
   static void validate(const Json& args, const Json& schema);
   Json execute(const std::string& name,const Json& args,Emit emit = {});
   Json environment();
