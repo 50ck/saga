@@ -84,6 +84,7 @@ void Registry::erase(const std::string& id,int owned_lock,const std::function<vo
   // Validate all owned logs before detaching or removing anything. Names alone
   // cannot establish ownership: a rename or identical display names are legal.
   std::set<fs::path> bundles;
+  std::vector<std::pair<fs::path,fs::path>> follow_links;
   auto catalog=dir/"diagnostic-bundles.json";
   if(fs::is_symlink(catalog))throw std::runtime_error("Refusing aliased diagnostic ownership catalog");
   if(fs::exists(catalog)) {
@@ -126,11 +127,22 @@ void Registry::erase(const std::string& id,int owned_lock,const std::function<vo
     if(!name.starts_with(prefix) || name.size()==prefix.size() ||
        !std::all_of(name.begin()+static_cast<std::ptrdiff_t>(prefix.size()),name.end(),[](unsigned char c){return std::isdigit(c) || c=='-';}))
       throw std::runtime_error("Refusing non-Saga diagnostic directory");
+    if(data.contains("follow_path") && data["follow_path"].is_string()) {
+      fs::path follow=data["follow_path"].get<std::string>();
+      if(follow.is_absolute())follow_links.emplace_back(follow,bundle);
+    }
   }
   // Persist the deletion intent first. A crash or I/O failure must not revive
   // a partly deleted identity through selection or detached maintenance.
   db_.exec("UPDATE personas SET erase_pending=1 WHERE uuid=?",{id});
   if(detach)detach(); // The duplicated flock survives closing the runtime/DB.
+  // A crashed recorder may leave its alias behind. Never unlink an alias
+  // that has since moved to another session, or follow it into its target.
+  for(const auto& [follow,bundle]:follow_links)if(fs::is_symlink(follow)) {
+    auto target=fs::read_symlink(follow);
+    if(target.is_relative())target=follow.parent_path()/target;
+    if(within(target,bundle))fs::remove(follow);
+  }
   for(const auto& bundle:bundles)fs::remove_all(bundle);
   fs::remove_all(dir); // Includes SQLite WAL/SHM, SOUL, caches and artifacts.
   db_.exec("DELETE FROM personas WHERE uuid=?",{id});

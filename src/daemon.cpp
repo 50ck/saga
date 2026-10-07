@@ -77,7 +77,7 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
           auto options=DebugOptions::from_json(payload,paths);recording.bind(nullptr);recorder.reset();
           if(options.profile!=DebugProfile::Off){recorder=std::make_unique<DebugLogger>(options);install_debug_crash_handlers();}
           recording.bind(recorder.get());
-          emit("result",{{"profile",debug_profile_name(options.profile)},{"path",recorder?recorder->path().string():std::string()}});
+          emit("result",{{"profile",debug_profile_name(options.profile)},{"path",recorder?recorder->path().string():std::string()},{"follow_path",recorder?recorder->follow_path().string():std::string()}});
         }
         else if (type == "ping") emit("result",{{"runtime","Saga"},{"version","0.1.0"},{"context_revision",runtime_context_revision}});
         else if (type == "personas.list") { if (runtime) throw std::runtime_error("Return to the persona selector first"); emit("result",registry.list()); }
@@ -160,7 +160,11 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
             bool current=runtime && runtime->persona().id==target_id;
             bool owns_recording=recorder && recorder->context().value("persona_id","")==target_id;
             std::optional<DebugOptions> options;
-            if(recorder){recorder->flush();options=recorder->options();}
+            fs::path follow_path;
+            if(recorder){recorder->flush();options=recorder->options();follow_path=recorder->follow_path();}
+            auto resume_recording=[&]{
+              if(owns_recording && options && !recorder){recorder=std::make_unique<DebugLogger>(*options,follow_path);recording.bind(recorder.get());}
+            };
             bool detached=false;
             auto detach=[&]{
               if(current)runtime->discard_for_erase();
@@ -172,10 +176,11 @@ void serve_connected(int fd,Paths paths,bool authenticate = false) {
               registry.erase(target_id,current?runtime->persona().lock_fd:-1,detach,
                              options?std::vector<fs::path>{options->directory}:std::vector<fs::path>{});
             } catch(...) {
+              resume_recording();
               if(detached && current)emit("persona.erased",{{"current",true},{"complete",false}});
               throw;
             }
-            if(owns_recording && options){recorder=std::make_unique<DebugLogger>(*options);recording.bind(recorder.get());}
+            resume_recording();
             emit("result",{{"erased",true},{"current",current}});
             continue;
           }

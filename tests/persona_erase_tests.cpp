@@ -43,6 +43,12 @@ void registry_tests(const Paths& paths,const fs::path& project) {
   owned.push_back(recordings(a,project.parent_path()/"custom-recordings"));
   owned.push_back(recordings(registry.resolve(aid),paths.state/"logs"));
   auto other_log=recordings(b,paths.state/"logs");
+  // A crash skips logger destruction. Erase must unlink a stale follow alias,
+  // but preserve the same connection's alias after it moves to another profile.
+  auto stale=project.parent_path()/"crashed-follow",moved=project.parent_path()/"moved-follow";
+  fs::create_symlink(owned[0]/"missing-rotated.log",stale);
+  fs::create_symlink(other_log/"missing-rotated.log",moved);
+  for(size_t i=0;i<owned.size();++i){auto manifest=owned[i]/"manifest.json";auto data=Json::parse(read_file(manifest));data["follow_path"]=(i?moved:stale).string();atomic_write(manifest,data.dump());}
   auto dir=paths.persona(aid);
   atomic_write(dir/"artifacts/private.txt","private artifact");atomic_write(dir/"cache/snapshot.txt","cached source");
   atomic_write(project/"tetris.c","external project survives");
@@ -57,6 +63,7 @@ void registry_tests(const Paths& paths,const fs::path& project) {
   auto old_lock=attached->lock_fd;
   registry.erase(aid,old_lock,[&]{attached.reset();detached=true;rejects([&]{PersonaContext blocked(paths,a,project);});});
   CHECK(detached && !fs::exists(dir));for(const auto& bundle:owned)CHECK(!fs::exists(bundle));
+  CHECK(!fs::is_symlink(stale) && fs::is_symlink(moved));
   CHECK(fs::exists(other_log) && fs::exists(paths.persona(bid)/"agent.db") && fs::exists(project/"tetris.c"));
   CHECK(registry.list().size()==1);rejects([&]{registry.select(aid);});rejects([&]{PersonaContext stale(paths,a,project);});
   // Pre-catalog default recordings remain discoverable by UUID, not name.
@@ -73,11 +80,15 @@ void protocol_tests(const Paths& paths,const fs::path& project) {
   std::jthread server([&]{serve_connected(sockets[1],paths);});
   {
     Channel client(sockets[0]);DebugOptions options;options.profile=DebugProfile::Forensic;options.directory=project.parent_path()/"protocol-logs";
-    request(client,"debug.configure",options.json());
+    auto initial_recording=request(client,"debug.configure",options.json());
+    auto initial_follow=fs::path(initial_recording["follow_path"].get<std::string>());
+    CHECK(fs::is_symlink(initial_follow));
     auto idle=request(client,"personas.create",{{"name","Idle creation fixture"}});
     auto idle_id=idle["uuid"].get<std::string>();auto idle_logs=Json::parse(read_file(paths.persona(idle_id)/"diagnostic-bundles.json"));
     Registry(paths).erase(idle_id); // Another client can erase a newly created, unattached profile.
-    request(client,"debug.configure",options.json());
+    auto recording=request(client,"debug.configure",options.json());
+    auto follow=fs::path(recording["follow_path"].get<std::string>());
+    CHECK(!fs::is_symlink(initial_follow) && fs::is_symlink(follow));
     for(const auto& path:idle_logs)CHECK(!fs::exists(path.get<std::string>()));
     auto a=request(client,"personas.create",{{"name","Active profile"},{"soul","Synthetic A"}});
     auto b=request(client,"personas.create",{{"name","Other profile"},{"soul","Synthetic B"}});
@@ -87,6 +98,8 @@ void protocol_tests(const Paths& paths,const fs::path& project) {
     auto alias=project.parent_path()/"diagnostic-alias";fs::create_directory_symlink(paths.persona(aid),alias);
     unsafe.directory=alias/"nested";rejects([&]{request(client,"debug.configure",unsafe.json());});
     request(client,"persona.activate",{{"uuid",aid},{"cwd",project.string()}});
+    auto active_manifest=Json::parse(read_file(fs::read_symlink(follow).parent_path()/"manifest.json"));
+    CHECK(active_manifest["context"]["persona_id"]==aid && active_manifest["follow_path"]==follow.string());
     request(client,"command",{{"name","fact"},{"arguments",{{"subject","test"},{"predicate","value"},{"object","private"}}}});
     rejects([&]{erase(client,"");});rejects([&]{erase(client,"Unknown");});
     {PersonaContext busy(paths,b,project);rejects([&]{erase(client,bid);});}
@@ -94,6 +107,9 @@ void protocol_tests(const Paths& paths,const fs::path& project) {
     CHECK(request(client,"command",{{"name","soul"}})["content"]=="Synthetic A");
     auto catalog=Json::parse(read_file(paths.persona(aid)/"diagnostic-bundles.json"));
     auto erased=erase(client,"Active profile");CHECK(erased["erased"]==true && erased["current"]==true);
+    CHECK(fs::is_symlink(follow));
+    auto neutral=Json::parse(read_file(fs::read_symlink(follow).parent_path()/"manifest.json"));
+    CHECK(neutral["context"]["persona_name"]=="saga" && !neutral["context"].contains("persona_id"));
     CHECK(!fs::exists(paths.persona(aid)) && !fs::exists(paths.persona(bid)));
     for(const auto& path:catalog)CHECK(!fs::exists(path.get<std::string>()));
     CHECK(request(client,"personas.list").empty());

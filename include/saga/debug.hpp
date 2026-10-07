@@ -41,7 +41,7 @@ class DebugLogger {
   std::deque<std::string> ring_;
   std::jthread writer_;
   Json context_=Json::object(),manifest_=Json::object(),previous_context_=Json::object();
-  fs::path bundle_,log_;
+  fs::path bundle_,log_,follow_;
   int fd_=-1,signal_fd_=-1,signal_slot_=-1;
   size_t reported_drops_=0;
   size_t queued_=0,part_bytes_=0,part_=0,written_=0,dropped_=0,bytes_=0,sidecar_bytes_=0,errors_=0;
@@ -52,9 +52,10 @@ class DebugLogger {
   void run();
   void write_event(Json,bool);
   void write_manifest();
+  void publish_follow(const fs::path& target);
   void fail() noexcept;
 public:
-  explicit DebugLogger(DebugOptions);
+  explicit DebugLogger(DebugOptions,fs::path follow_path={});
   ~DebugLogger();
   DebugLogger(const DebugLogger&)=delete;
   bool enabled(DebugProfile minimum=DebugProfile::Debug) const noexcept;
@@ -71,6 +72,7 @@ public:
   void sample() noexcept;
   void record_context(const Json& messages,const Json& tools,Json fields);
   fs::path path() const {std::lock_guard lock(mutex_);return failed_?fs::path():log_;}
+  fs::path follow_path() const {std::lock_guard lock(mutex_);return failed_?fs::path():follow_;}
   const DebugOptions& options() const {return options_;}
   std::string next_span();
   static Json build_metadata();

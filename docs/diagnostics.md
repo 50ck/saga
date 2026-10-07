@@ -60,6 +60,29 @@ has `seq`, UTC `ts`, steady-clock `mono_ns`, `severity`, diagnostic `level`,
 within that persona/session recording, including emissions from multiple threads.
 The bootstrap and each rebound session start a new sequence.
 
+For live monitoring, follow the **stable connection path** printed by the client:
+
+```sh
+tail -F --max-unchanged-stats=1 /path/printed/by/saga/follow
+```
+
+Each connection owns a `follow` symlink in its initial bootstrap bundle. It is
+atomically updated when a persona is created or activated, the session changes,
+the log rotates, or the current persona is erased. Separate connections have
+separate aliases. The link copies no private events into a shared log; complete
+recordings remain in their respective persona/session bundles. Manifests and
+session headers expose `follow_path` alongside the archive location.
+
+Following the initial `saga-0-….log` archive directly stops at
+`debug.session_completed` with `reason=session_rebound`: the recorder has moved
+to a new bundle. This is a file change, not the end of agent activity. `tail -F`
+cannot switch to another pathname by itself. Use `follow` for ongoing activity
+and the manifest's `log_files` for complete historical inspection. Very brief
+intermediate sessions or rapid rotations can pass between tail's checks; those
+events remain in the archives subject to configured retention. The alias is
+removed when its connection disconnects. Erasing a persona also removes stale
+crashed-recorder aliases still pointing to its deleted bundles.
+
 Large fields become references to JSON sidecars; prompt and HTTP request bodies
 always have sidecars. References include path, byte count and SHA-256 of the
 stored **redacted** JSON representation. Decode a string-valued sidecar as JSON
@@ -215,7 +238,8 @@ metadata is retained without extra monitoring requests.
 
 `saga_debug` covers filenames, SHA-256 vectors, JSONL ordering/timestamps,
 concurrent producers, filters, redaction (including split SSE credentials),
-rotation, drop policy, private permissions, disk failure, sidecars, crash markers,
+rotation, live `tail -F` across persona/session changes and rotation, independent
+connection aliases, drop policy, private permissions, disk failure, sidecars, crash markers,
 context diffs, 8192-token continuation, dispatch/tool idempotency and transactional
 memory outcomes, file diffs, stdout/stderr, cancellation and a basic writer
 benchmark. `saga_debug_wire` exercises the production HTTP/SSE adapter,

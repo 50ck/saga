@@ -219,7 +219,7 @@ Json DebugLogger::build_metadata() {
   utsname os{};uname(&os);
   return {{"version",SAGA_BUILD_VERSION},{"git_commit",SAGA_BUILD_SHA},{"git_branch",SAGA_BUILD_BRANCH},{"git_dirty",SAGA_BUILD_DIRTY},{"build_timestamp",SAGA_BUILD_TIME},{"build_type",SAGA_BUILD_TYPE},{"compiler",SAGA_BUILD_COMPILER},{"compile_flags",SAGA_BUILD_FLAGS},{"features",{"curl","sqlite","lexbor","md4c","ncurses","provider_streaming"}},{"database_schema",12},{"runtime_context_revision",runtime_context_revision},{"protocol_version",1},{"os",os.sysname},{"kernel",os.release},{"architecture",os.machine},{"pid",getpid()},{"ppid",getppid()},{"cwd",fs::current_path().string()},{"locale",std::getenv("LANG")?std::getenv("LANG"):""},{"timezone",std::getenv("TZ")?std::getenv("TZ"):"system"}};
 }
-DebugLogger::DebugLogger(DebugOptions options):options_(std::move(options)),redact_(options_.allow_secrets),started_(std::chrono::steady_clock::now()),sampled_(started_) {
+DebugLogger::DebugLogger(DebugOptions options,fs::path follow_path):options_(std::move(options)),redact_(options_.allow_secrets),follow_(std::move(follow_path)),started_(std::chrono::steady_clock::now()),sampled_(started_) {
   std::call_once(emergency_init,[]{for(auto &entry:emergency_fds)entry.store(-1);});
   if(options_.allow_secrets)std::cerr<<"Saga warning: diagnostic secret redaction is DISABLED. Logs may contain credentials and private content.\n";
   if(options_.profile==DebugProfile::Off)return;
@@ -232,6 +232,16 @@ DebugLogger::~DebugLogger() {
   if(signal_slot_>=0)emergency_fds[signal_slot_].store(-1);
   if(signal_fd_>=0)::close(signal_fd_);
   if(fd_>=0)::close(fd_);
+  // The alias contains no copied events. Remove it when its owner disconnects;
+  // /erase can then leave no stale persona path in a bootstrap recording.
+  std::error_code ec;if(!follow_.empty() && fs::is_symlink(follow_,ec))fs::remove(follow_,ec);
+}
+void DebugLogger::publish_follow(const fs::path& target) {
+  if(follow_.empty())follow_=fs::canonical(bundle_)/"follow";
+  if(fs::exists(follow_) && !fs::is_symlink(follow_))throw std::runtime_error("Diagnostic follow path is not a symlink");
+  auto temporary=follow_.string()+".tmp-"+uuid();
+  try{fs::create_symlink(fs::absolute(target),temporary);fs::rename(temporary,follow_);}
+  catch(...){std::error_code ec;fs::remove(temporary,ec);throw;}
 }
 bool DebugLogger::enabled(DebugProfile minimum) const noexcept{return options_.profile>=minimum && options_.profile!=DebugProfile::Off;}
 void DebugLogger::session(std::string_view persona,Id id,const Json& fields) noexcept {
@@ -250,6 +260,8 @@ void DebugLogger::open_session(std::string_view persona,Id id,const Json& fields
   started_=std::chrono::steady_clock::now();sampled_=started_;
   stopping_=false;failed_=false;sequence_=0;part_=0;part_bytes_=0;written_=0;bytes_=0;errors_=0;sidecar_bytes_=0;dropped_=0;reported_drops_=0;ring_.clear();previous_context_=Json::object();context_=redact_.apply(fields);context_["session_id"]=id;context_["persona_name"]=persona;
   manifest_={{"format_version",1},{"debug_profile",debug_profile_name(options_.profile)},{"redaction_enabled",!options_.allow_secrets},{"build",build_metadata()},{"context",redact_.apply(context_)},{"start_time",timestamp()},{"log_files",Json::array({filename})},{"sidecars",Json::array()}};
+  if(follow_.empty())follow_=fs::canonical(bundle_)/"follow";
+  manifest_["follow_path"]=follow_.string();
   // Register exact bundle ownership before recording persona payloads. This
   // survives renames, custom --debug-dir locations, rotation and crashes.
   atomic_write(bundle_/"manifest.json",manifest_.dump(2));
@@ -262,9 +274,10 @@ void DebugLogger::open_session(std::string_view persona,Id id,const Json& fields
     entries.push_back(fs::canonical(bundle_).string());
     atomic_write(catalog,entries.dump());
   }
+  publish_follow(log_);
   writer_=std::jthread([this]{run();});
   // Enqueue directly while holding the initialization lock to make the header first.
-  Json header=context_;header.update({{"ts",timestamp()},{"mono_ns",std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()},{"seq",++sequence_},{"level","debug"},{"severity","INFO"},{"component","debug"},{"event","debug.session_started"},{"debug_profile",debug_profile_name(options_.profile)},{"file_path",log_.string()},{"redaction_enabled",!options_.allow_secrets},{"allow_secrets",options_.allow_secrets}});
+  Json header=context_;header.update({{"ts",timestamp()},{"mono_ns",std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()},{"seq",++sequence_},{"level","debug"},{"severity","INFO"},{"component","debug"},{"event","debug.session_started"},{"debug_profile",debug_profile_name(options_.profile)},{"file_path",log_.string()},{"follow_path",follow_.string()},{"redaction_enabled",!options_.allow_secrets},{"allow_secrets",options_.allow_secrets}});
   queue_.push_back({redact_.apply(header),header.dump().size(),true});queued_=queue_.back().bytes;condition_.notify_all();
   lock.unlock();emit("runtime","runtime.started",build_metadata());
 }
@@ -321,6 +334,7 @@ void DebugLogger::write_manifest(){std::lock_guard lock(mutex_);manifest_["event
 void DebugLogger::write_event(Json event,bool flush_event) {
   if(part_bytes_>=options_.rotate_bytes) {
     ::close(fd_);auto file=log_.filename().string()+"."+std::to_string(++part_);fd_=::open((bundle_/file).c_str(),O_CREAT|O_EXCL|O_APPEND|O_WRONLY|O_CLOEXEC|O_NOFOLLOW,0600);if(fd_<0)throw std::runtime_error("Cannot rotate diagnostic log");part_bytes_=0;manifest_["log_files"].push_back(file);
+    publish_follow(bundle_/file);
     if(options_.keep && manifest_["log_files"].size()>options_.keep){auto old=manifest_["log_files"][0].get<std::string>();fs::remove(bundle_/old);manifest_["log_files"].erase(0);}
   }
   // Sidecars contain only centrally redacted data. Hashes refer to the stored representation.

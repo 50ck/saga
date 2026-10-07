@@ -272,7 +272,7 @@ int main(int argc,char** argv) {
       debug=DebugOptions::from_json(debug.json(),paths);
       if(debug.allow_secrets)std::cerr<<"Saga warning: diagnostic secret redaction is DISABLED. Logs may contain credentials and private content.\n";
       auto recording=client.request("debug.configure",debug.json());
-      if(debug.profile!=DebugProfile::Off)std::cerr<<"Saga diagnostic recording: "<<recording.value("path","")<<'\n';
+      if(debug.profile!=DebugProfile::Off)std::cerr<<"Saga diagnostic follow: "<<recording.value("follow_path",recording.value("path",""))<<" (use tail -F --max-unchanged-stats=1)\n";
     }
     if(request_mode) {
       auto line=prompt("");auto request=Json::parse(line);client.json_output=true;

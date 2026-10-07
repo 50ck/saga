@@ -648,5 +648,7 @@ heuristics calibrated against the synthetic corpus, not guarantees for every
 site layout. Conservative token estimates may reduce context utilization.
 
 Diagnostic flight recording is available with `saga --debug debug|trace|wire|forensic`.
+For live monitoring, use `tail -F --max-unchanged-stats=1` on the printed `follow`
+path; it tracks the active persona/session and rotated log parts for that connection.
 See [runtime diagnostics](docs/diagnostics.md) for profiles, private JSONL files,
 redaction, context/memory provenance and crash guarantees.

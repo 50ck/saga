@@ -2,6 +2,7 @@
 #include <saga/db.hpp>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <poll.h>
 #include <unistd.h>
 #include <thread>
 #include <fstream>
@@ -47,6 +48,44 @@ void benchmark(const fs::path& root) {
   for(int i=0;i<5000;++i)logger.emit("runtime","benchmark.sample",{{"index",i},{"generation_id",1}},DebugProfile::Debug,"DEBUG");
   logger.flush();auto duration=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
   std::cout<<"Debug recorder benchmark: "<<duration<<" ms / 5000 events ("<<duration/5<<" us/event, including writer drain)\n";
+}
+void live_follow(const fs::path& root) {
+  DebugOptions options;options.profile=DebugProfile::Trace;options.directory=root/"follow";options.rotate_bytes=4096;
+  fs::path follow;
+  {
+    DebugLogger log(options);follow=log.follow_path();auto bootstrap=log.path();log.flush();
+    CHECK(fs::is_symlink(follow) && fs::read_symlink(follow)==fs::absolute(bootstrap));
+    int output[2];CHECK(pipe(output)==0);
+    struct Tail {
+      pid_t pid=-1;int fd=-1;
+      ~Tail(){if(pid>0){kill(pid,SIGTERM);int status;while(waitpid(pid,&status,0)<0 && errno==EINTR){}}if(fd>=0)::close(fd);}
+    } tail;
+    tail.pid=fork();CHECK(tail.pid>=0);
+    if(tail.pid==0){::close(output[0]);dup2(output[1],STDOUT_FILENO);::close(output[1]);
+      execlp("tail","tail","-n","+1","-F","--sleep-interval=0.05","--max-unchanged-stats=1",follow.c_str(),static_cast<char*>(nullptr));_exit(127);}
+    ::close(output[1]);tail.fd=output[0];std::string received;
+    auto expect=[&](std::string_view marker){
+      auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+      while(received.find(marker)==std::string::npos && std::chrono::steady_clock::now()<deadline){
+        pollfd ready{tail.fd,POLLIN,0};if(poll(&ready,1,100)>0){char buffer[4096];auto n=::read(tail.fd,buffer,sizeof buffer);CHECK(n>0);received.append(buffer,n);}
+      }
+      CHECK(received.find(marker)!=std::string::npos);
+    };
+    expect("runtime.started");
+    log.session("Synthetic profile",42,{{"persona_id","follow-fixture"}});
+    log.emit("runtime","fixture.persona_active");log.flush();expect("fixture.persona_active");
+    CHECK(log.follow_path()==follow && received.find("follow-fixture")!=std::string::npos);
+    auto manifest=Json::parse(read_file(log.path().parent_path()/"manifest.json"));CHECK(manifest["follow_path"]==follow.string());
+    CHECK(lines(bootstrap).back()["reason"]=="session_rebound");
+    log.emit("runtime","fixture.large",{{"content",std::string(5000,'x')}});log.flush();
+    log.emit("runtime","fixture.after_rotation");log.flush();expect("fixture.after_rotation");
+    CHECK(fs::read_symlink(follow)!=fs::absolute(log.path()));
+    log.session("saga",0);log.emit("runtime","fixture.back_to_selector");log.flush();expect("fixture.back_to_selector");
+    CHECK(log.follow_path()==follow);
+    {DebugLogger independent(options);CHECK(independent.follow_path()!=follow);}
+    CHECK(fs::is_symlink(follow));
+  }
+  CHECK(!fs::is_symlink(follow));
 }
 void logger_tests(const fs::path& root) {
   CHECK(debug_filename("../noa ?",42,1791310031)=="-noa-42-1791310031.log");
@@ -128,4 +167,4 @@ void fatal_recorder(const fs::path& root) {
   bool marker=false;for(auto& file:fs::recursive_directory_iterator(root/"fatal"))if(file.path().filename()=="fatal-signal.log")marker=!lines(file.path()).empty();CHECK(marker);
 }
 }
-int main(){auto root=fs::temp_directory_path()/("saga-debug-tests-"+uuid());try{private_dir(root);redaction();cli_options();logger_tests(root);runtime_recording(root);cancellation_recording(root);fatal_recorder(root);benchmark(root);fs::remove_all(root);std::cout<<"Diagnostic recorder tests passed\n";return 0;}catch(const std::exception& error){std::cerr<<error.what()<<"\nFixtures: "<<root<<'\n';return 1;}}
+int main(){auto root=fs::temp_directory_path()/("saga-debug-tests-"+uuid());try{private_dir(root);redaction();cli_options();logger_tests(root);live_follow(root);runtime_recording(root);cancellation_recording(root);fatal_recorder(root);benchmark(root);fs::remove_all(root);std::cout<<"Diagnostic recorder tests passed\n";return 0;}catch(const std::exception& error){std::cerr<<error.what()<<"\nFixtures: "<<root<<'\n';return 1;}}
