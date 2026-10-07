@@ -73,7 +73,8 @@ public:
       }
       if (last.empty()) { function("file_write",{{"path","artifact.txt"},{"content","persistent identity artifact\n"},{"description","Continuity artifact"}}); return; }
       if (last == "file_write") { function("file_read",{{"path","artifact.txt"}}); return; }
-      if (last == "file_read") { function("check_resolve",{{"check_id",state["task_checks"][0]["id"]},{"source_event_id",result["source_event_id"]},{"passed",true},{"explanation","Observed artifact contents"}}); return; }
+      if (last == "file_read") { function("shell_exec",{{"command","test -s artifact.txt"},{"execution","host"}}); return; }
+      if (last == "shell_exec") { function("check_resolve",{{"check_id",state["task_checks"][0]["id"]},{"source_event_id",result["source_event_id"]},{"passed",true},{"explanation","Observed artifact contents"}}); return; }
       if (last == "check_resolve") { function("task_update",{{"id",state["active_task"][0]["id"]},{"status","completed"}}); return; }
     }
     std::string text = input.find("remember") != std::string::npos ? "I recalled the artifact from persistent memory." : "Hello from the interchangeable reasoning engine.";
@@ -99,7 +100,7 @@ int main() {
     auto applied=runtime->persona().db->query("SELECT id FROM events WHERE type='edit.applied' ORDER BY id DESC LIMIT 1")[0]["id"];
     CHECK(runtime->command("diff",{{"event_id",applied}})["diff"].get<std::string>().find("+persistent identity artifact")!=std::string::npos);
     rejects([&]{runtime->command("diff",{{"event_id",-1}});});
-    CHECK(approvals == 1); CHECK(read_file(project/"artifact.txt") == "persistent identity artifact\n"); CHECK(runtime->command("tasks")[0]["status"] == "completed");
+    CHECK(approvals == 2); CHECK(read_file(project/"artifact.txt") == "persistent identity artifact\n"); CHECK(runtime->command("tasks")[0]["status"] == "completed");
     CHECK(std::any_of(events.begin(),events.end(),[](const Json& e){ return e["type"] == "context.usage" && e["payload"].value("approximate",false); }));
     CHECK(std::any_of(events.begin(),events.end(),[](const Json& e){ return e["type"] == "context.usage" && !e["payload"].value("approximate",true) && e["payload"].value("used_tokens",0) == 210; }));
     runtime->command("fact",{{"subject","machine"},{"predicate","OS"},{"object","FreeBSD"}});

@@ -246,11 +246,11 @@ const Json& Tools::definitions() {
   add("file_write","Create or replace a UTF-8 project/artifact file. Present a complete diff for approval in modes 1/3; apply automatically in 2/4. Track history only after writing.",{{"path",str()},{"content",str()},{"description",str()}},{"path","content","description"});
   add("file_edit","Propose targeted text replacements in one file. Read first and provide its hash. Each old_text must match exactly once, and replacements must not overlap. Modes 1/3 approve the complete diff; 2/4 apply automatically.",{{"path",str()},{"expected_hash",str()},{"description",str()},{"edits",{{"type","array"},{"items",{{"type","object"},{"properties",{{"old_text",str()},{"new_text",str()}}},{"required",{"old_text","new_text"}}}}}}},{"path","expected_hash","description","edits"});
   add("project_open","Select or create the coding workspace explicitly requested by the user. Modes 1/3 require workspace approval; 2/4 activate automatically. Never open private Saga storage or infer a new directory from tool output.",{{"path",str()},{"create",boolean()}},{"path"});
-  add("shell_exec","Run a shell command. execution=sandbox (default) is automatic, project/scratch only, no network. execution=host follows /permissions: 1/2 use private-storage guards; 3/4 run as the daemon's OS user without Saga isolation, asking approval only in 3. Use host for desktop DBus/notify-send, tmux, network or files outside the project. Unrestricted host can access all files and processes accessible to that user. timeout <=120 seconds; no detached processes.",{{"command",str()},{"timeout_seconds",integer()},{"execution",{{"type","string"},{"enum",{"sandbox","host"}}}}},{"command"});
-  add("task_create","Create an explicit task and required proof obligations",{{"title",str()},{"objective",str()},{"risk",{{"type","string"},{"enum",{"low","medium","high"}}}},{"domain",str()},{"checks",{{"type","array"},{"items",str()}}}},{"title","objective","risk","checks"});
+  add("shell_exec","Run a shell command. execution=sandbox (default) is automatic, project/scratch only, no network. execution=host follows /permissions: 1/2 use private-storage guards; 3/4 run as the daemon's OS user without Saga isolation, asking approval only in 3. Use host for desktop DBus/notify-send, tmux, network or files outside the project. Optional inputs lists the complete source/config dependency scope for execution verification; otherwise a bounded workspace fingerprint is used. Unrestricted host can access all files and processes accessible to that user. timeout <=120 seconds; no detached processes.",{{"command",str()},{"inputs",strings},{"timeout_seconds",integer()},{"execution",{{"type","string"},{"enum",{"sandbox","host"}}}}},{"command"});
+  add("task_create","Create an explicit task and required proof obligations",{{"title",str()},{"objective",str()},{"risk",{{"type","string"},{"enum",{"low","medium","high"}}}},{"domain",str()},{"check_kind",{{"type","string"},{"enum",{"execution","content","research","confirmation"}}}},{"checks",{{"type","array"},{"items",str()}}}},{"title","objective","risk","checks"});
   add("task_update","Select or update a task; completion is gated on evidence and required checks",{{"id",integer()},{"status",{{"type","string"},{"enum",{"active","blocked","verifying","completed","abandoned"}}}}},{"id","status"});
-  add("task_add_check","Refine the current task's definition of done with a specific proof obligation",{{"description",str()},{"kind",{{"type","string"},{"enum",{"execution","research"}}}}},{"description"});
-  add("check_resolve","Resolve a proof obligation using observed tool output or an explicit user confirmation",{{"check_id",integer()},{"source_event_id",integer()},{"passed",boolean()},{"explanation",str()},{"quote",str()}},{"check_id","source_event_id","passed","explanation"});
+  add("task_add_check","Refine the current task's definition of done with a specific proof obligation",{{"description",str()},{"kind",{{"type","string"},{"enum",{"execution","content","research","confirmation"}}}}},{"description"});
+  add("check_resolve","Resolve a typed proof obligation: execution needs a successful current shell result; content needs file_read plus exact quote; research needs documentation; confirmation needs an explicit operator acknowledgement",{{"check_id",integer()},{"source_event_id",integer()},{"passed",boolean()},{"explanation",str()},{"quote",str()}},{"check_id","source_event_id","passed","explanation"});
   add("record_assumption","Record an unverified assumption",{{"statement",str()},{"impact",{{"type","string"},{"enum",{"low","high"}}}},{"verification_method",str()},{"requires_research",boolean()}},{"statement","impact","verification_method"});
   add("resolve_assumption","Resolve an assumption using observed evidence",{{"id",integer()},{"source_event_id",integer()},{"confirmed",boolean()},{"quote",str()}},{"id","source_event_id","confirmed"});
   add("record_hypothesis","Store a hypothesis separately from facts",{{"statement",str()}},{"statement"});
@@ -369,6 +369,38 @@ Json Tools::environment() {
     result["commits"] = git({"log","-5","--format=%h %s","--no-show-signature"});
   }
   return result;
+}
+Json Tools::workspace_fingerprint(const Json& inputs) {
+  if(!inputs.empty()) {
+    std::map<std::string,std::string> files;
+    for(auto& input:inputs){auto path=safe_path(input.get<std::string>(),false);files[path.string()]=digest(read_file(path,8*1024*1024));}
+    return {{"root",p_.project_root.string()},{"hash",digest(Json(files).dump())},{"complete",true},{"inputs",inputs}};
+  }
+  std::map<std::string,std::string> files;size_t bytes=0;bool complete=true;
+  for(auto it=fs::recursive_directory_iterator(p_.project_root,fs::directory_options::skip_permission_denied);it!=fs::recursive_directory_iterator();++it) {
+    if(service_)service_();
+    auto path=it->path();auto name=path.filename().string();
+    if(it->is_directory() && (name==".git" || name=="node_modules" || name==".cache")){it.disable_recursion_pending();continue;}
+    if(!it->is_regular_file() || it->is_symlink())continue;
+    auto size=it->file_size();if(files.size()>=10000 || size>8*1024*1024 || bytes+size>64*1024*1024){complete=false;continue;}
+    try {auto content=read_file(safe_path(path.string(),false),8*1024*1024);bytes+=content.size();files[path.lexically_relative(p_.project_root).string()]=digest(content);}
+    catch(const TurnCancelled&){throw;}catch(const std::exception&){complete=false;}
+  }
+  return {{"root",p_.project_root.string()},{"hash",digest(Json(files).dump())},{"complete",complete},{"files",files.size()},{"bytes",bytes}};
+}
+void Tools::invalidate_checks() {
+  Json workspace;auto rows=p_.db->query("SELECT c.id,c.task_id,c.validation_json FROM task_checks c JOIN tasks t ON t.id=c.task_id WHERE t.project_id=? AND c.status='passed' AND c.scope IN ('execution','content')",{p_.project});
+  for(auto& row:rows) {
+    auto proof=Json::parse(row["validation_json"].get<std::string>());bool valid=false;
+    if(proof.contains("workspace"))try{workspace=workspace_fingerprint(proof["workspace"].value("inputs",Json::array()));valid=workspace["complete"]==true && proof["workspace"]==workspace;}catch(const TurnCancelled&){throw;}catch(const std::exception&){}
+    else if(proof.contains("path"))try{valid=proof["hash"]==digest(read_file(safe_path(proof["path"],false),8*1024*1024));}catch(const TurnCancelled&){throw;}catch(const std::exception&){}
+    if(valid)continue;
+    p_.db->transaction([&]{
+      p_.db->exec("UPDATE task_checks SET status='unresolved',evidence_id=NULL,validation_json='{}' WHERE id=?",{row["id"]});
+      p_.db->exec("UPDATE tasks SET status='verifying',completed_at=NULL WHERE id=? AND status='completed'",{row["task_id"]});
+      p_.db->event("task.check_invalidated",{{"check_id",row["id"]},{"reason","Evidence dependencies changed"}},p_.session,row["task_id"]);
+    });
+  }
 }
 Json Tools::execute(const std::string& name,const Json& args,Emit emit) {
   TraceSpan operation("tool",name,{{"tool",name}},DebugProfile::Debug);
@@ -565,6 +597,7 @@ Json Tools::dispatch(const std::string& name,const Json& a,Emit emit) {
     trace("filesystem","fs.written",{{"path",path.string()},{"bytes",content.size()},{"old_hash",digest(old)},{"new_hash",digest(content)},{"created",!existed}},DebugProfile::Debug);
     trace("filesystem","fs.diff",proposal,DebugProfile::Forensic);
     memory_.artifact(path,a["description"],content);
+    invalidate_checks();
     if(events_)events_("edit.applied",proposal);
     return {{"path",path.string()},{"bytes",content.size()},{"hash",digest(content)},{"added",diff.added},{"removed",diff.removed},{"proposal_id",proposal["proposal_id"]}};
   }
@@ -666,19 +699,22 @@ Json Tools::dispatch(const std::string& name,const Json& a,Emit emit) {
       observed_diff(path,{});(void)state;
     }
     auto result = r.json(); result["execution"] = host ? "host" : "sandbox"; result["host_restrictions"] = host ? policy["host_restrictions"] : Json("sandbox"); result["artifacts_recorded"] = tracked; result["artifact_tracking_limited"] = before.size() >= 10000 || after.size() >= 10000 || tracked >= 256;
+    invalidate_checks();
+    result["verification_workspace"]=workspace_fingerprint(a.value("inputs",Json::array()));
+    result["command"]=a["command"];result["cwd"]=p_.project_root.string();
     return result;
   }
   if (name == "task_create") {
     if(!p_.turn.empty() && p_.task && !db->query("SELECT id FROM tool_runs WHERE turn_id=? AND tool='task_create' AND status='completed' LIMIT 1",{p_.turn}).empty()) {
       if(a["risk"]=="high")db->exec("UPDATE tasks SET risk='high' WHERE id=?",{p_.task});
-      for(auto& check:a["checks"])if(db->query("SELECT id FROM task_checks WHERE task_id=? AND description=?",{p_.task,check}).empty())db->exec("INSERT INTO task_checks(task_id,description) VALUES(?,?)",{p_.task,check});
+      for(auto& check:a["checks"])if(db->query("SELECT id FROM task_checks WHERE task_id=? AND description=?",{p_.task,check}).empty())db->exec("INSERT INTO task_checks(task_id,description,kind,scope) VALUES(?,?,?,?)",{p_.task,check,a.value("check_kind","execution")=="research"?"research":"execution",a.value("check_kind","execution")});
       return {{"id",p_.task},{"reused",true},{"checks",db->query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})}};
     }
     if (a["checks"].empty()) throw std::runtime_error("A task requires at least one proof obligation");
     Id previous_task=p_.task;
     p_.task = db->exec("INSERT INTO tasks(session_id,project_id,title,objective,status,risk,domain,created_at) VALUES(?,?,?,?,'active',?,?,?)",{p_.session,p_.project,a["title"],a["objective"],a["risk"],a.value("domain","general"),now()});
     web_.rebind_task(previous_task,p_.task,p_.turn);
-    for (auto& check : a["checks"]) db->exec("INSERT INTO task_checks(task_id,description) VALUES(?,?)",{p_.task,check});
+    for (auto& check : a["checks"]) db->exec("INSERT INTO task_checks(task_id,description,kind,scope) VALUES(?,?,?,?)",{p_.task,check,a.value("check_kind","execution")=="research"?"research":"execution",a.value("check_kind","execution")});
     event("task.created",{{"id",p_.task},{"definition",a}});
     return {{"id",p_.task},{"checks",db->query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})}};
   }
@@ -686,6 +722,7 @@ Json Tools::dispatch(const std::string& name,const Json& a,Emit emit) {
     Id id = a["id"]; auto rows = db->query("SELECT * FROM tasks WHERE id=? AND project_id=?",{id,p_.project});
     if (rows.empty()) throw std::runtime_error("Unknown task in current project");
     if (a["status"] == "completed") {
+      invalidate_checks();
       auto checks = db->query("SELECT * FROM task_checks WHERE task_id=? AND required=1 AND status!='passed'",{id});
       auto assumptions = db->query("SELECT * FROM assumptions WHERE task_id=? AND status='unresolved' AND impact_if_wrong='high'",{id});
       auto research=db->query("SELECT * FROM research_questions WHERE required=1 AND superseded_by IS NULL AND status!='supported' AND task_id=?",{id});
@@ -699,7 +736,7 @@ Json Tools::dispatch(const std::string& name,const Json& a,Emit emit) {
   }
   if (name == "task_add_check") {
     active_task();
-    auto id = db->exec("INSERT INTO task_checks(task_id,description,kind) VALUES(?,?,?)",{p_.task,a["description"],a.value("kind","execution")});
+    auto id = db->exec("INSERT INTO task_checks(task_id,description,kind,scope) VALUES(?,?,?,?)",{p_.task,a["description"],a.value("kind","execution")=="research"?"research":"execution",a.value("kind","execution")});
     db->exec("UPDATE tasks SET status='verifying',completed_at=NULL WHERE id=? AND status='completed'",{p_.task});
     event("task.check_added",{{"check_id",id},{"description",a["description"]}}); return {{"check_id",id}};
   }
@@ -709,24 +746,33 @@ Json Tools::dispatch(const std::string& name,const Json& a,Emit emit) {
     if (rows.empty()) throw std::runtime_error("Unknown check on active task");
     if (origin["task_id"] != p_.task && origin["type"] != "user.message") throw std::runtime_error("Proof belongs to a different task");
     auto payload = Json::parse(origin["payload_json"].get<std::string>());
-    bool passed = a["passed"];
-    if (origin["type"] == "user.message") {
-      auto text = lower(payload.value("content","")); bool confirmation = false;
-      for (auto* word : {"confirmed","verified","passed","looks good","i checked","yes","correct","funciona","confirmado"})
-        if (text.find(word) != std::string::npos) confirmation = true;
-      if (!confirmation) throw std::runtime_error("Proof requires explicit user confirmation, not an initial request");
-    }
-    if (passed && origin["type"] == "tool.failed") throw std::runtime_error("Failed tool output cannot pass a check");
-    if (origin["type"] == "tool.completed") {
-      if(documentation(origin)) {
-        if(rows[0]["kind"]!="research")throw std::runtime_error("Documentation cannot pass an implementation/execution check");
-        quoted_document(origin);
-      } else if(rows[0]["kind"]=="research")throw std::runtime_error("Research checks require a fetched document passage or explicit user confirmation");
-      auto tool = payload.value("tool","");
-      if (tool != "shell_exec" && tool != "file_read" && tool != "file_write" && tool != "file_edit" && tool != "observe_environment" && !documentation(origin)) throw std::runtime_error("Proof must be externally observed, not a cognitive tool acknowledgement");
+    bool passed = a["passed"];Json validation=Json::object();auto scope=rows[0]["scope"].get<std::string>();
+    if(origin["type"]=="user.message") {
+      auto text=lower(trim(payload.value("content","")));
+      if(!std::set<std::string>{"yes","confirmed","verified","passed","looks good","correct","funciona","confirmado","sí","si"}.contains(text))
+        throw std::runtime_error("Proof requires an unambiguous explicit user confirmation");
+      validation={{"confirmation_event_id",sid}};
+    } else {
+      auto result=payload.value("result",Json::object());auto tool=payload.value("tool","");
+      if(passed && origin["type"]=="tool.failed")throw std::runtime_error("Failed tool output cannot pass a check");
+      if(scope=="research") {if(!documentation(origin))throw std::runtime_error("Research checks require fetched documentation");quoted_document(origin);}
+      else if(scope=="execution") {
+        if(tool!="shell_exec")throw std::runtime_error("Execution checks require an actual command result; file acknowledgements cannot prove compilation or tests");
+        if(passed && (result.value("exit_code",-1)!=0 || result.value("timed_out",false)))throw std::runtime_error("A nonzero or timed-out command cannot pass an execution check");
+        auto saved=result.value("verification_workspace",Json::object());auto current=workspace_fingerprint(saved.value("inputs",Json::array()));
+        if(passed && (saved.empty() || saved!=current || !current.value("complete",false)))throw std::runtime_error("Execution proof is stale or workspace coverage is incomplete");
+        validation={{"workspace",current},{"command_event_id",sid}};
+      } else if(scope=="content") {
+        auto quote=a.value("quote","");
+        if(tool!="file_read" || result.value("encoding","")=="base64" || quote.empty() || result.value("content","").find(quote)==std::string::npos)
+          throw std::runtime_error("Content checks require an exact quote from a file_read observation");
+        auto path=safe_path(result.at("path"),false);auto hash=digest(read_file(path,8*1024*1024));
+        if(hash!=result.at("hash").get<std::string>())throw std::runtime_error("File content evidence is stale; read the current file");
+        validation={{"path",path.string()},{"hash",hash}};
+      } else throw std::runtime_error("Confirmation checks require explicit operator confirmation");
     }
     Id evidence_id = memory_.evidence("check",a["check_id"],origin["type"] == "user.message" ? "user confirmed" : documentation(origin) ? "documentation" : "output observed",passed,sid,1,documentation(origin) ? 0.3 : 0.9);
-    db->exec("UPDATE task_checks SET status=?,evidence_id=? WHERE id=?",{passed ? "passed" : "failed",evidence_id,a["check_id"]});
+    db->exec("UPDATE task_checks SET status=?,evidence_id=?,validation_json=? WHERE id=?",{passed ? "passed" : "failed",evidence_id,validation.dump(),a["check_id"]});
     event("task.check_resolved",a); return {{"evidence_id",evidence_id}};
   }
   if (name == "record_assumption") {

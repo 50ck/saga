@@ -167,3 +167,17 @@ Search returns relevance-ranked previews within a 2400-token budget (4000 for
 deep recall), retaining typed references for lossless explicit inspection.
 Candidate retrieval does not increase episode accessibility; explicit recall
 records inspection separately from evidence-based confidence.
+
+Proof checks have execution, content, research and confirmation scopes.
+Execution requires an observed successful command, not a file-write acknowledgement.
+Commands record their workspace fingerprint; optional `shell_exec.inputs` declares
+its complete source/config dependency scope for large workspaces. Otherwise all
+regular workspace files are hashed within 10000 files/64 MiB (8 MiB per file),
+excluding Git internals, node_modules and .cache. Incomplete coverage cannot pass.
+Content checks require a current file_read hash and an exact quote. Structured
+edits, shell changes and completion attempts invalidate stale execution/content
+checks. Full command semantics and declared dependency completeness remain agent
+assessments; a zero exit code is not a proof of algorithmic correctness.
+Schema 13 preserves old evidence for audit and reopens legacy execution checks
+without dependency validation. Negative or ambiguous operator text cannot be
+misread as explicit confirmation.

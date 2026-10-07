@@ -16,7 +16,7 @@ compatible daemon. Enable recording before persona activation. Other clients are
 unaffected. The daemon also accepts these flags as defaults for new connections.
 Background detached maintenance is not automatically recorded as a user session.
 Restart an older daemon before using this client; persisted databases remain
-schema 12 and existing sessions remain readable.
+schema 13 and existing sessions remain readable.
 
 Profiles are cumulative:
 

@@ -25,6 +25,8 @@ class Tools {
   Emit events_;
   unsigned execution_depth_=0;
   fs::path safe_path(const std::string& path, bool write) const;
+  Json workspace_fingerprint(const Json& inputs = Json::array());
+  void invalidate_checks();
   Json dispatch(const std::string& name, const Json& args,Emit emit = {});
 public:
   Tools(PersonaContext& p,Memory& memory,Approve approve,Config config = {},WebTransport transport = fetch_public_web) : p_(p),memory_(memory),web_(*p.db,std::move(config),std::move(transport)),approve_(std::move(approve)) {}

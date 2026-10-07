@@ -108,9 +108,9 @@ void Database::migrate() {
   TraceSpan migration("database","migration");
   sql("CREATE TABLE IF NOT EXISTS schema_version(version INTEGER NOT NULL); INSERT INTO schema_version SELECT 0 WHERE NOT EXISTS(SELECT 1 FROM schema_version);");
   auto version = query("SELECT version FROM schema_version")[0]["version"].get<int>();
-  trace("database","database.schema",{{"database",path_.string()},{"schema_version",version},{"target_version",12}},DebugProfile::Debug);
-  if (version > 12) throw std::runtime_error("Database schema is newer than this Saga binary");
-  if(version<12)trace("database","database.migration_started",{{"database",path_.string()},{"from_version",version},{"target_version",12}});
+  trace("database","database.schema",{{"database",path_.string()},{"schema_version",version},{"target_version",13}},DebugProfile::Debug);
+  if (version > 13) throw std::runtime_error("Database schema is newer than this Saga binary");
+  if(version<13)trace("database","database.migration_started",{{"database",path_.string()},{"from_version",version},{"target_version",13}});
   if (version < 1) transaction([&]{ sql(saga_schema); sql("UPDATE schema_version SET version=1"); });
   if (version < 2) transaction([&]{
     bool scoped_facts = false;
@@ -214,7 +214,14 @@ void Database::migrate() {
     UPDATE schema_version SET version=12;
   )SQL");});
 
-  if(version<12)trace("database","database.migration_completed",{{"database",path_.string()},{"from_version",version},{"schema_version",12}});
+  if(version<13)transaction([&]{
+    bool scope=false,validation=false;
+    for(auto& column:query("PRAGMA table_info(task_checks)")){scope|=column["name"]=="scope";validation|=column["name"]=="validation_json";}
+    if(!scope)sql("ALTER TABLE task_checks ADD COLUMN scope TEXT NOT NULL DEFAULT 'execution' CHECK(scope IN ('execution','content','research','confirmation'))");
+    if(!validation)sql("ALTER TABLE task_checks ADD COLUMN validation_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(validation_json))");
+    sql("UPDATE task_checks SET scope='research' WHERE kind='research'; UPDATE task_checks SET status='unresolved',evidence_id=NULL WHERE kind='execution' AND status='passed'; UPDATE tasks SET status='verifying',completed_at=NULL WHERE status='completed' AND EXISTS(SELECT 1 FROM task_checks WHERE task_id=tasks.id AND required=1 AND status!='passed'); UPDATE schema_version SET version=13;");
+  });
+  if(version<13)trace("database","database.migration_completed",{{"database",path_.string()},{"from_version",version},{"schema_version",13}});
 }
 Id Database::event(std::string_view type, const Json& payload, Id session, Id task) {
   auto id=exec("INSERT INTO events(ts,session_id,task_id,type,payload_json) VALUES(?,?,?,?,?)",

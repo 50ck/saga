@@ -136,7 +136,7 @@ void persistence() {
   auto p = f.persona(a); CHECK(p->soul == "Identity A");
   rejects([&]{ f.persona(a); });
   auto q = f.persona(b); CHECK(q->soul == "Identity B");
-  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 12);
+  auto db = p->db.get(); db->migrate(); CHECK(db->query("SELECT version FROM schema_version")[0]["version"] == 13);
   auto id = db->event("test.event",{{"text","immutable"}});
   Json single = id;
   CHECK(db->query("SELECT type FROM events WHERE id=?",{single})[0]["type"] == "test.event");
@@ -145,7 +145,7 @@ void persistence() {
   CHECK(q->db->query("SELECT * FROM events WHERE type='test.event'").empty());
   q->db->sql("ALTER TABLE facts DROP COLUMN project_id; UPDATE schema_version SET version=1");
   q->db->migrate();
-  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 12);
+  CHECK(q->db->query("SELECT version FROM schema_version")[0]["version"] == 13);
   bool scoped_column = false;
   for (const auto& column : q->db->query("PRAGMA table_info(facts)")) if (column["name"] == "project_id") scoped_column = true;
   CHECK(scoped_column);
@@ -275,7 +275,7 @@ void gates_and_praxis() {
   auto db = p->db.get(); p->project = db->exec("INSERT INTO projects(name,root_path,created_at,last_seen_at) VALUES('test',?,?,?)",{f.project.string(),now(),now()});
   p->session = db->exec("INSERT INTO sessions(started_at,project_id,status) VALUES(?,?,'active')",{now(),p->project});
   Memory m(*p,f.config()); Tools tools(*p,m,[](auto&,auto&){ return true; });
-  auto t = tools.execute("task_create",{{"title","write artifact"},{"objective","test"},{"risk","low"},{"checks",{"file exists"}}}); CHECK(t.contains("id"));
+  auto t = tools.execute("task_create",{{"title","write artifact"},{"objective","test"},{"risk","low"},{"checks",{"file exists"}},{"check_kind","content"}}); CHECK(t.contains("id"));
   CHECK(tools.execute("task_update",{{"id",p->task},{"status","completed"}}).contains("error"));
   auto write = tools.execute("file_write",{{"path","output.txt"},{"content","artifact"},{"description","test file"}}); CHECK(!write.contains("error")); CHECK(read_file(f.project / "output.txt") == "artifact");
   CHECK(db->query("SELECT * FROM artifacts").size() == 1); CHECK(db->query("SELECT * FROM artifact_versions").size() == 1);
@@ -287,7 +287,9 @@ void gates_and_praxis() {
   CHECK(tools.execute("file_write",{{"path","SOUL.md"},{"content","mutated"},{"description","bad"}}).contains("error"));
   CHECK(tools.execute("personas.list",{}).contains("error"));
   CHECK(tools.execute("task_create",{{"title",4},{"objective","test"},{"risk","low"},{"checks",{"check"}}}).contains("error"));
-  CHECK(!tools.execute("check_resolve",{{"check_id",t["checks"][0]["id"]},{"source_event_id",write["source_event_id"]},{"passed",true},{"explanation","Write observed"}}).contains("error"));
+  CHECK(tools.execute("check_resolve",{{"check_id",t["checks"][0]["id"]},{"source_event_id",write["source_event_id"]},{"passed",true},{"explanation","Write observed"}}).contains("error"));
+  auto proof_read=tools.execute("file_read",{{"path","output.txt"}});
+  CHECK(!tools.execute("check_resolve",{{"check_id",t["checks"][0]["id"]},{"source_event_id",proof_read["source_event_id"]},{"passed",true},{"explanation","Read observed"},{"quote","artifact"}}).contains("error"));
   CHECK(!tools.execute("task_update",{{"id",p->task},{"status","completed"}}).contains("error"));
   auto belief = tools.execute("record_belief",{{"statement","The artifact contains the expected output"},{"domain","files"},{"source_event_id",write["source_event_id"]}});
   CHECK(belief.contains("id"));
@@ -332,6 +334,20 @@ void gates_and_praxis() {
     if (i == 9) CHECK(state == "habitual");
   }
   CHECK(p->soul == default_soul);
+  auto execution=tools.execute("task_add_check",{{"description","Compiler execution"},{"kind","execution"}})["check_id"];
+  CHECK(tools.execute("check_resolve",{{"check_id",execution},{"source_event_id",write["source_event_id"]},{"passed",true},{"explanation","Only wrote the source"}}).contains("error"));
+  auto command=tools.execute("shell_exec",{{"command","test -s output.txt"},{"execution","host"},{"inputs",Json::array({"output.txt"})}});
+  CHECK(!command.contains("error") && command["exit_code"]==0);
+  CHECK(!tools.execute("check_resolve",{{"check_id",execution},{"source_event_id",command["source_event_id"]},{"passed",true},{"explanation","Command succeeded on the current artifact"}}).contains("error"));
+  CHECK(!tools.execute("task_update",{{"id",p->task},{"status","completed"}}).contains("error"));
+  tools.execute("file_write",{{"path","output.txt"},{"content","changed artifact"},{"description","Invalidate old proof"}});
+  CHECK(db->query("SELECT status FROM task_checks WHERE id=?",{execution})[0]["status"]=="unresolved");
+  CHECK(tools.execute("task_update",{{"id",p->task},{"status","completed"}}).contains("error"));
+  CHECK(tools.execute("check_resolve",{{"check_id",execution},{"source_event_id",command["source_event_id"]},{"passed",true},{"explanation","Old command"}}).contains("error"));
+  auto denied_confirmation=db->event("user.message",{{"content","not correct"}},p->session,p->task);
+  CHECK(tools.execute("check_resolve",{{"check_id",execution},{"source_event_id",denied_confirmation},{"passed",true},{"explanation","Negation is not confirmation"}}).contains("error"));
+  tools.execute("file_write",{{"path","output.txt"},{"content","artifact"},{"description","Restore fixture"}});
+
   Tools declined(*p,m,[](auto&,auto&){ return false; });
   auto skill=declined.execute("compile_skill",{{"praxis_id",praxis},{"name","safe read"},{"steps",Json::array({{{"tool","file_read"},{"arguments",{{"path","output.txt"}}}}})}});CHECK(skill.contains("id"));
   CHECK(declined.execute("run_skill",{{"id",skill["id"]}})["results"][0]["content"]=="artifact");

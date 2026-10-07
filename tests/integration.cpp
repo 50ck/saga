@@ -69,7 +69,8 @@ class MockModel {
       }
       if (last.empty()) return tool("file_write",{{"path","artifact.txt"},{"content","persistent identity artifact\n"},{"description","Continuity proof artifact"}});
       if (last == "file_write") return tool("file_read",{{"path","artifact.txt"}});
-      if (last == "file_read") return tool("check_resolve",{{"check_id",state["task_checks"][0]["id"]},{"source_event_id",result["source_event_id"]},{"passed",true},{"explanation","Read verified expected artifact contents"}});
+      if (last == "file_read") return tool("shell_exec",{{"command","test -s artifact.txt"},{"execution","host"}});
+      if (last == "shell_exec") return tool("check_resolve",{{"check_id",state["task_checks"][0]["id"]},{"source_event_id",result["source_event_id"]},{"passed",true},{"explanation","Read verified expected artifact contents"}});
       if (last == "check_resolve") return tool("task_update",{{"id",state["active_task"][0]["id"]},{"status","completed"}});
       return {{"role","assistant"},{"content","Artifact created and verified."}};
     }
