@@ -282,7 +282,15 @@ const Json& Tools::definitions() {
   }();
   return definitions;
 }
-const Json& Tools::prompt_definitions() {
+const Json& Tools::prompt_definitions(bool work) {
+  if(!work) {
+    static const Json conversation=[] {
+      Json schemas=Json::array();
+      for(auto& schema:definitions())if(std::set<std::string>{"report_progress","remember","know","recall_memory","recall_event","tool_schema","tool_invoke"}.contains(schema["function"]["name"]))schemas.push_back(schema);
+      return schemas;
+    }();
+    return conversation;
+  }
   // A fixed small working set keeps prefix caching stable. Less frequent
   // cognitive actions remain callable through the same validated dispatcher.
   static const Json definitions=[] {

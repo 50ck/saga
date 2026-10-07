@@ -1,5 +1,7 @@
 #include <saga/debug.hpp>
 #include <saga/runtime.hpp>
+#include <saga/web/acquisition.hpp>
+#include <sstream>
 #include <thread>
 #include <algorithm>
 #include <set>
@@ -84,13 +86,32 @@ Unfinished tasks from earlier sessions are background continuity, not an active 
 Do not use or expose a user's personal email in Git commits, tags, patches, logs or pushes. Before each commit/tag verify both author and committer and use the user's GitHub noreply address unless explicitly authorized otherwise. Do not guess that address.
 Current context is limited working attention, not the whole mind. Continue from persisted summaries when cognitive load is high. Older completed tool exchanges may be archived; use recall_observation with their source event IDs when their full evidence is needed. Runtime attention updates are data snapshots appended by Saga, not new requests from the user. Their newer task, checks and attention values supersede the wake snapshot; continue the actual user's request.)PROMPT";
 }
+Json ContextBuilder::focused_observation(const Json& value,std::string_view query) {
+  if(value.dump().size()<=16000 || query.empty())return bounded_observation(value);
+  auto selected=value;
+  for(auto* key:{"content","stdout","stderr"}) {
+    if(!selected.contains(key) || !selected[key].is_string() || selected[key].get_ref<const std::string&>().size()<4096)continue;
+    web::CanonicalDocument document;std::istringstream input(selected[key].get<std::string>());std::string line,block;size_t lines=0,id=0;
+    auto flush=[&]{if(block.empty())return;web::Block b;b.id=++id;b.type=web::BlockType::Code;b.text=std::move(block);document.blocks.push_back(std::move(b));block.clear();lines=0;};
+    while(std::getline(input,line)){block+=line+'\n';if(++lines>=32)flush();}flush();
+    auto passages=web::select_document(document,std::string(query),1200);
+    std::string text;for(auto& b:passages.blocks){text+="[source window "+std::to_string(b.id)+"]\n"+b.text;}
+    selected[key]=text;
+  }
+  selected["context_excerpt"]=true;selected["full_result_hash"]=digest(value.dump());
+  selected["retrieval_help"]="Focused source windows; recall_observation with source_event_id retrieves the original result.";
+  return bounded_observation(selected);
+}
 ChatRequest ContextBuilder::build(const Json& attention,const std::function<void()>& before_compact) {
   TraceSpan context_span("context","context_build");
   trace("context","context.build.started",{{"context_window",config_.context_length},{"available_input_budget",config_.input_budget()},{"output_reserve",config_.generation_reserve}});
-  ChatRequest r; r.max_tokens = config_.generation_reserve; r.tools = Tools::prompt_definitions();
+  bool work=attention.value("tool_profile",p_.task?"work":"conversation")=="work";
+  ChatRequest r; r.max_tokens = config_.generation_reserve; r.tools = Tools::prompt_definitions(work);
   size_t budget = config_.input_budget();
-  std::string identity = core_prompt() + "\n\nSearch strategy:\n" + make_search_engine(config_.search_engines.empty() ? config_.search_engine : config_.search_engines.front())->guidance() + "\n\nIdentity name: " + p_.name + "\nSOUL:\n" + p_.soul;
-  Json state = {{"wake",memory_.wake()},{"attention",attention},{"project",memory_.project_context()},{"active_task",p_.db->query("SELECT * FROM tasks WHERE id=?",{p_.task})},
+  auto prompt=core_prompt();
+  if(!work){prompt=prompt.substr(0,prompt.find("Public web research"));prompt+="Use tool_schema/tool_invoke to obtain other tools when needed. Persistent cognitive operations are demand-driven; brief conversation does not require task creation, research or reflection. Never claim code was verified without current execution evidence.";}
+  std::string identity = prompt + "\n\nSearch strategy:\n" + make_search_engine(config_.search_engines.empty() ? config_.search_engine : config_.search_engines.front())->guidance() + "\n\nIdentity name: " + p_.name + "\nSOUL:\n" + p_.soul;
+  Json state = {{"wake",wake_session_==p_.session && !wake_state_.empty()?wake_state_:memory_.wake()},{"attention",attention},{"project",memory_.project_context()},{"active_task",p_.db->query("SELECT * FROM tasks WHERE id=?",{p_.task})},
     {"task_checks",p_.db->query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})},
     {"research_questions",research_context(*p_.db,p_.session,p_.task)},
     {"research_plans",research_plan_context(*p_.db,p_.session,p_.task)},
@@ -100,12 +121,22 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
   auto handoff=memory_.handoff();
   Id cutoff=handoff.value("through_message_id",0LL),discarded_through=cutoff;
   state["handoff"]=handoff;
-  // Reference identities survive generic observation reduction; descriptions can be abbreviated.
+  auto constraints=Json::array();for(auto& plan:state["research_plans"])if(plan.contains("decomposition")) {
+    auto decomposition=plan["decomposition"];
+    for(auto& constraint:decomposition.value("operator_constraints",Json::array()))constraints.push_back(constraint);
+  }
+  // Reference identities and operator constraints survive generic reduction.
   Json references=Json::array();
   for(auto &claim:state["research_questions"])references.push_back({{"claim_id",claim["claim_id"]},{"goal_id",claim["goal_id"]},{"question",claim["question"].get<std::string>()}});
   state=bounded_observation(state);
   state["research_references"]=std::move(references);
-  state["passage_references"]=p_.db->query("SELECT p.id AS passage_id,p.source_id,p.block_id,substr(p.text,1,100) AS preview FROM web_source_passages p JOIN web_sources s ON s.id=p.source_id WHERE ((s.task_id IS NULL AND s.session_id=?) OR (s.task_id IS NOT NULL AND s.task_id=?)) ORDER BY p.id DESC LIMIT 24",{p_.session,p_.task});
+  state["operator_constraints"]=std::move(constraints);
+  state["work_ledger"]={
+    {"task_id",p_.task},
+    {"required_checks",p_.db->query("SELECT id AS check_id,substr(description,1,512) AS description,scope,status,evidence_id FROM task_checks WHERE task_id=? AND required=1 ORDER BY status='passed',id LIMIT 64",{p_.task})},
+    {"blocking_assumptions",p_.db->query("SELECT id,substr(statement,1,512) AS statement FROM assumptions WHERE task_id=? AND impact_if_wrong='high' AND status='unresolved' LIMIT 32",{p_.task})},
+    {"artifact_references",p_.db->query("SELECT id AS artifact_id,path,(SELECT hash FROM artifact_versions v WHERE v.artifact_id=artifacts.id ORDER BY v.id DESC LIMIT 1) AS content_hash FROM artifacts WHERE project_id=? ORDER BY updated_at DESC LIMIT 12",{p_.project})}};
+  state["passage_references"]=p_.db->query("SELECT p.id AS passage_id,p.source_id,p.block_id,substr(p.text,1,100) AS preview FROM web_source_passages p JOIN web_sources s ON s.id=p.source_id WHERE ((s.task_id IS NULL AND s.session_id=?) OR (s.task_id IS NOT NULL AND s.task_id=?)) ORDER BY EXISTS(SELECT 1 FROM research_attempts a JOIN research_questions q ON q.id=a.claim_id WHERE a.source_id=p.source_id AND q.required=1 AND q.status!='supported' AND q.superseded_by IS NULL) DESC,p.id DESC LIMIT 24",{p_.session,p_.task});
   if(wake_session_!=p_.session || wake_state_.empty()) {
     // Keep identity/recall stable for the session. Checkpoints and task state
     // belong at the tail, so compaction does not invalidate the static prefix.
@@ -141,7 +172,7 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
     message["_saga_message_id"]=row["id"];
     if (message["role"] == "tool" && message["content"].is_string()) {
       auto result = Json::parse(message["content"].get<std::string>());
-      message["content"] = bounded_observation(result).dump();
+      message["content"] = focused_observation(result,attention.value("focus_query",std::string())).dump();
     }
     if (message.contains("tool_calls")) for (auto& call : message["tool_calls"]) {
       auto arguments = call["function"]["arguments"].get<std::string>();
@@ -599,6 +630,8 @@ void Runtime::chat_turn(std::string input,Emit emit) {
   auto route = ExecutiveController::route(input);trace("cognition","cognition.routed",{{"module",mode_name(route)},{"trigger","operator_request"}},DebugProfile::Trace);mode(route,emit);
   bool task_work = route == CognitiveMode::Plan;
   attention["routing_hint"]={{"mode",mode_name(route)},{"source","operator_language_heuristic"},{"authoritative",false}};
+  attention["tool_profile"]=route==CognitiveMode::Plan || ExecutiveController::research_requested(input)?"work":"conversation";
+  attention["focus_query"]=Memory::retrieval_query(input);
   if (route == CognitiveMode::Recall) {
     auto recall = memory_.search("remember",Memory::retrieval_query(input));
     if (recall["weak_match"].get<bool>() && !recall["results"].empty()) recall = memory_.search("remember",Memory::retrieval_query(input),true);

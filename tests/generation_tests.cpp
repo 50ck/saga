@@ -176,6 +176,14 @@ void runtime_tests() {
     auto r=f.runtime(std::move(backend));r->chat("hello",f.emit());
     CHECK(std::any_of(f.events.begin(),f.events.end(),[](auto& event){return event["type"]=="cognitive.mode" && event["payload"].value("mode","")=="research";}));
   }
+  {CHECK(Tools::prompt_definitions(false).size()==7);
+    CHECK(estimate_tokens(Tools::prompt_definitions(false).dump())<estimate_tokens(Tools::prompt_definitions().dump())/2);
+    std::string content;for(int i=0;i<800;++i)content+="unrelated line\n";content+="Reed-Solomon required configuration\n";
+    auto focused=ContextBuilder::focused_observation({{"source_event_id",42},{"content",content+content}},"Reed-Solomon configuration");
+    CHECK(focused["content"].get<std::string>().size()<content.size() && focused["source_event_id"]==42 && focused["content"].get<std::string>().find("required configuration")!=std::string::npos);
+    Fixture f;auto backend=std::make_unique<ScriptBackend>(std::vector<Segment>{answer()});auto* script=backend.get();auto r=f.runtime(std::move(backend));r->chat("hello",f.emit());
+    CHECK(script->requests[0].tools.size()==7 && script->requests[0].messages[0]["content"].get<std::string>().size()<ContextBuilder::core_prompt().size());
+  }
   run_scenario({answer()},0);
   auto simultaneous=tool("first","file_read",{{"path","existing.txt"}});
   simultaneous.events.insert(simultaneous.events.begin()+1,{ProviderEventKind::ToolDelta,"",{{"index",1},{"id","second"},{"name","file_read"},{"arguments",Json{{"path","existing.txt"}}.dump()}}});

@@ -19,6 +19,7 @@ class ContextBuilder {
 public:
   ContextBuilder(PersonaContext& p,Memory& m,Config c) : p_(p),memory_(m),config_(std::move(c)) {}
   ChatRequest build(const Json& attention = Json::object(),const std::function<void()>& before_compact = {});
+  static Json focused_observation(const Json&,std::string_view query);
   static std::string core_prompt();
 };
 class Runtime {

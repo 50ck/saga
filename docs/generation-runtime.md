@@ -189,3 +189,13 @@ language routing is marked as a heuristic attention hint. It does not classify
 risk from quoted words: task risk is supplied explicitly through task_create
 (and can be raised by its same-turn reuse), while action permissions and research
 checks continue to be enforced by the actual tool dispatcher.
+
+Context attention uses stable per-turn conversation/work tool profiles. Conversation
+loads seven schemas and the identity/epistemic core; other operations remain
+available through discovery. Work retains the common native action set. The
+session wake snapshot is reused instead of rebuilding its database projection
+on every generation. Live state pins operator constraints, required check IDs,
+blocking assumptions and artifact-version hashes independently of generic output
+reduction. Passage references prioritize unresolved required claims over recency.
+Large text observations are selected by local BM25 over intact 32-line windows,
+preserving whitespace and original provenance for lossless explicit retrieval.

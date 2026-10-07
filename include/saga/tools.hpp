@@ -40,7 +40,7 @@ public:
   WebResearch& web() {return web_;}
   static ActionDescriptor action(const std::string& name,const Json& args);
   static const Json& definitions();
-  static const Json& prompt_definitions();
+  static const Json& prompt_definitions(bool work = true);
   static void validate(const Json& args, const Json& schema);
   Json execute(const std::string& name,const Json& args,Emit emit = {});
   Json environment();
