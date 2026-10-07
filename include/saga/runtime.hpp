@@ -13,7 +13,7 @@ class ContextBuilder {
   PersonaContext& p_;
   Memory& memory_;
   Config config_;
-  Id wake_session_=0,wake_checkpoint_=0;
+  Id wake_session_=0;
   Id attention_session_=0,attention_cutoff_=0;
   Json wake_state_=Json::object();
 public:

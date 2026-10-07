@@ -102,6 +102,16 @@ void run_scenario(std::vector<Segment> segments,int expected_tools,int continuat
   if(expected_tools){CHECK(db.query("SELECT count(*) AS n FROM tool_runs WHERE turn_id IS NULL OR generation_id IS NULL OR tool_call_id IS NULL")[0]["n"]==0);CHECK(!db.query("SELECT id FROM events WHERE type='tool.result.committed'").empty());}
 }
 void runtime_tests() {
+  {Fixture f;
+    atomic_write(f.root/"project/existing.txt",std::string(12000,'d'));
+    std::vector<Segment> segments;for(int i=0;i<10;++i)segments.push_back(tool("read-"+std::to_string(i),"file_read",{{"path","existing.txt"}}));segments.push_back(answer());
+    auto backend=std::make_unique<ScriptBackend>(std::move(segments));auto* script=backend.get();auto r=f.runtime(std::move(backend));r->chat("hello",f.emit());
+    CHECK(script->requests.size()==11);
+    for(const auto& request:script->requests){CHECK(!request.forced_tool);CHECK(request.messages[0]==script->requests[0].messages[0]);}
+    CHECK(!r->persona().db->query("SELECT id FROM context_checkpoints").empty());
+    CHECK(r->persona().db->query("SELECT id FROM model_calls WHERE purpose='submit_memory_extraction'").empty());
+    CHECK(r->persona().db->query("SELECT count(*) AS n FROM tool_runs WHERE tool='file_read'")[0]["n"]==10);
+  }
   run_scenario({answer()},0);
   auto simultaneous=tool("first","file_read",{{"path","existing.txt"}});
   simultaneous.events.insert(simultaneous.events.begin()+1,{ProviderEventKind::ToolDelta,"",{{"index",1},{"id","second"},{"name","file_read"},{"arguments",Json{{"path","existing.txt"}}.dump()}}});

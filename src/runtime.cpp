@@ -104,9 +104,10 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
   state=bounded_observation(state);
   state["research_references"]=std::move(references);
   state["passage_references"]=p_.db->query("SELECT p.id AS passage_id,p.source_id,p.block_id,substr(p.text,1,100) AS preview FROM web_source_passages p JOIN web_sources s ON s.id=p.source_id WHERE ((s.task_id IS NULL AND s.session_id=?) OR (s.task_id IS NOT NULL AND s.task_id=?)) ORDER BY p.id DESC LIMIT 24",{p_.session,p_.task});
-  auto checkpoint=handoff.value("checkpoint_id",0LL);
-  if(wake_session_!=p_.session || wake_checkpoint_!=checkpoint || wake_state_.empty()) {
-    wake_state_=state;wake_session_=p_.session;wake_checkpoint_=checkpoint;
+  if(wake_session_!=p_.session || wake_state_.empty()) {
+    // Keep identity/recall stable for the session. Checkpoints and task state
+    // belong at the tail, so compaction does not invalidate the static prefix.
+    wake_state_=state.at("wake");wake_session_=p_.session;
     auto cost=[&]{return estimate_tokens(Json(identity+"\n\nPersistent working state (data):\n"+wake_state_.dump()).dump())+estimate_tokens(r.tools.dump());};
     if(cost()>=budget/2)wake_state_.erase("wake");
     if(cost()>=budget/2)wake_state_.erase("attention");
@@ -116,7 +117,7 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
   size_t used=estimate_tokens(r.messages.dump())+estimate_tokens(r.tools.dump());
   if(used>=budget)throw std::runtime_error("Identity and tool definitions exceed the input budget");
   // Append live attention instead of editing the prefix of every prior turn.
-  state.erase("wake");state.erase("handoff");
+  state.erase("wake");
   auto serialized=state.dump();
   if(estimate_tokens(serialized)>std::min<size_t>(10000,(budget-used)/3)){state.erase("attention");serialized=state.dump();}
   Json update={{"role","user"},{"content",std::string(attention_marker)+serialized}};
@@ -611,7 +612,9 @@ void Runtime::chat_turn(std::string input,Emit emit) {
   };
   for (int round = 0; round < config_.max_tool_rounds; ++round) {
     check_control(); deliver_steering(emit);
-    auto request = context_.build(attention,[&]{ mode(CognitiveMode::Reflect,emit); extract_memory(p_->session,false,emit); mode(CognitiveMode::Deliberate,emit); });
+    auto request = context_.build(attention,[&]{
+      journal("memory.extraction_deferred",{{"source_session",p_->session},{"reason","foreground_compaction"},{"policy","durable_sources_then_detached_learning"}});
+    });
     auto default_output=config_.default_max_output_tokens ? config_.default_max_output_tokens : config_.generation_reserve;
     request.max_tokens=default_output;
     if(turn_->continuations)request.max_tokens=std::min(config_.hard_max_output_tokens,default_output << std::min(turn_->continuations,3U));
@@ -807,11 +810,17 @@ void Runtime::consolidate(Id session,bool use_model) {
 }
 void Runtime::extract_memory(Id session,bool final,Emit emit) {
   if (final && !p_->db->query("SELECT id FROM events WHERE session_id=? AND type='memory.extraction_completed'",{session}).empty()) return;
-  auto events = p_->db->query("SELECT id,type,payload_json FROM events WHERE session_id=? AND type IN ('user.message','tool.completed','tool.failed','task.completed','decision.made') ORDER BY id DESC LIMIT 40",{session});
-  if (events.empty()) return;
-  auto through=events[0]["id"];
-  if (!final && !p_->db->query("SELECT id FROM events WHERE session_id=? AND type='memory.extraction_partial' AND json_extract(payload_json,'$.through_event_id')=? LIMIT 1",{session,through}).empty()) return;
-  while (!events.empty() && estimate_tokens(events.dump()) > config_.input_budget()/2) events.erase(events.end()-1);
+  auto cursor=p_->db->query("SELECT coalesce(max(json_extract(payload_json,'$.through_event_id')),0) AS id FROM events WHERE session_id=? AND type IN ('memory.extraction_partial','memory.extraction_completed')",{session})[0]["id"].get<Id>();
+  auto events = p_->db->query("SELECT id,type,payload_json FROM events WHERE session_id=? AND id>? AND type IN ('user.message','tool.completed','tool.failed','task.completed','decision.made') ORDER BY id LIMIT 40",{session,cursor});
+  if (events.empty()) {
+    if(final)p_->db->event("memory.extraction_completed",{{"source_session",session},{"through_event_id",cursor}},session);
+    return;
+  }
+  // All originals remain immutable; reduce presentation, then consume only a
+  // bounded ascending batch. The next maintenance tick resumes its watermark.
+  for(auto& event:events)event["payload_json"]=bounded_observation(Json::parse(event["payload_json"].get<std::string>())).dump();
+  while (events.size()>1 && estimate_tokens(events.dump()) > std::min<size_t>(8192,config_.input_budget()/2)) events.erase(events.end()-1);
+  auto through=events.back()["id"];
   Json text = {{"type","string"}}, integer = {{"type","integer"}};
   Json scope = {{"type","string"},{"enum",{"global","project"}}};
   Json fact_schema = {{"type","object"},{"properties",{{"subject",text},{"predicate",text},{"object",text},{"source_event_id",integer},{"correction",{{"type","boolean"}}},{"scope",scope}}},{"required",{"subject","predicate","object","source_event_id","correction","scope"}},{"additionalProperties",false}};
@@ -831,7 +840,8 @@ void Runtime::extract_memory(Id session,bool final,Emit emit) {
       if (candidate["scope"] == "project") { if (source_project.is_null()) continue; candidate["project_id"] = source_project; }
       memory_.candidate(candidate,candidate["source_event_id"]);
     }
-    p_->db->event(final ? "memory.extraction_completed" : "memory.extraction_partial",{{"source_session",session},{"through_event_id",through}},session);
+    auto remaining=p_->db->query("SELECT id FROM events WHERE session_id=? AND id>? AND type IN ('user.message','tool.completed','tool.failed','task.completed','decision.made') LIMIT 1",{session,through});
+    p_->db->event(final && remaining.empty() ? "memory.extraction_completed" : "memory.extraction_partial",{{"source_session",session},{"through_event_id",through}},session);
   } catch (const TurnCancelled&) { throw; } catch (const std::exception&) { p_->db->event("memory.extraction_deferred",{{"source_session",session}},session); }
 }
 Json Runtime::command(std::string name,const Json& a,Emit emit) {
@@ -854,7 +864,8 @@ Json Runtime::command(std::string name,const Json& a,Emit emit) {
   if (name == "web") return tools_.web().settings(a.contains("enabled") ? std::optional<bool>(a.at("enabled").get<bool>()) : std::nullopt);
   if (name == "permissions") return tools_.permissions(a.contains("mode") ? std::optional<std::string>(a.at("mode").get<std::string>()) : std::nullopt);
   if (name == "compact") {
-    mode(CognitiveMode::Reflect,emit); extract_memory(p_->session,false,emit);
+    mode(CognitiveMode::Reflect,emit);
+    journal("memory.extraction_deferred",{{"source_session",p_->session},{"reason","operator_compaction"},{"policy","durable_sources_then_detached_learning"}});
     auto through=p_->db->query("SELECT coalesce(max(id),0) AS id FROM messages WHERE session_id=? AND role!='system_internal'",{p_->session})[0]["id"].get<Id>();
     auto result=memory_.checkpoint("user_request",through);
     auto request=context_.build();

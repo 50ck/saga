@@ -359,7 +359,8 @@ void gates_and_praxis() {
   auto system = request.messages[0]["content"].get<std::string>();
   CHECK(system.find(p->soul) != std::string::npos);
   auto marker = system.find("Persistent working state (data):\n"); CHECK(marker != std::string::npos);
-  CHECK(Json::parse(system.substr(marker+std::string("Persistent working state (data):\n").size())).contains("task_checks"));
+  CHECK(Json::parse(system.substr(marker+std::string("Persistent working state (data):\n").size())).is_object());
+  CHECK(std::any_of(request.messages.begin()+1,request.messages.end(),[](const auto& message){return message.value("content",std::string()).find("\"task_checks\"")!=std::string::npos;}));
   for (size_t i=1; i<request.messages.size(); ++i) CHECK(request.messages[i]["role"] != "system");
   CHECK(request.messages.size() < 160);
   Json long_turn = {{"role","user"},{"content","Continue the long diagnostic task"}};

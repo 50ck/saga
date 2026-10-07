@@ -186,7 +186,8 @@ int main() {
     CHECK(db.query("SELECT * FROM messages WHERE session_id=? AND id<=?",{session,original_messages.back()["id"]})==original_messages);
     CHECK(db.query("SELECT id FROM messages WHERE session_id=? AND id>? AND role!='system_internal'",{session,original_messages.back()["id"]}).empty());
     CHECK(runtime->persona().soul==soul);
-    CHECK(!db.query("SELECT id FROM events WHERE session_id=? AND type='memory.extraction_partial'",{session}).empty());
+    CHECK(!db.query("SELECT id FROM events WHERE session_id=? AND type='memory.extraction_deferred'",{session}).empty());
+    CHECK(db.query("SELECT id FROM model_calls WHERE session_id=? AND purpose='submit_memory_extraction'",{session}).empty());
     CHECK(db.query("SELECT id FROM context_checkpoints WHERE session_id=?",{session}).size()==1);
     runtime->command("compact");CHECK(runtime->command("status")["compactions"]==1);
     runtime->chat("Continue from the saved handoff",emit);
