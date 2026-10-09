@@ -115,6 +115,7 @@ ChatRequest ContextBuilder::build(const Json& attention,const std::function<void
     {"task_checks",p_.db->query("SELECT * FROM task_checks WHERE task_id=?",{p_.task})},
     {"research_questions",research_context(*p_.db,p_.session,p_.task)},
     {"research_plans",research_plan_context(*p_.db,p_.session,p_.task)},
+    {"research_coverage",research_coverage(*p_.db,p_.session,p_.task)},
     {"web_enabled",p_.db->query("SELECT value FROM runtime_settings WHERE key='web_enabled'")[0]["value"]=="true"},
     {"last_user_source_event",p_.db->query("SELECT id FROM events WHERE type='user.message' AND session_id=? ORDER BY id DESC LIMIT 1",{p_.session})}};
   state["wake"].erase("handoff");
@@ -664,7 +665,13 @@ void Runtime::chat_turn(std::string input,Emit emit) {
   auto store = [&](const Json& message,const std::string& role){
     p_->db->exec("INSERT INTO messages(session_id,ts,role,content_json,tool_call_id,token_count) VALUES(?,?,?,?,?,?)",{p_->session,now(),role,message.dump(),message.value("tool_call_id",Json()),estimate_tokens(message.dump())});
   };
-  for (int round = 0; round < config_.max_tool_rounds; ++round) {
+  std::map<std::string,std::pair<std::string,unsigned>> observations;unsigned unchanged=0,productive=0;
+  int work_rounds=0,free_commentary=0;
+  for (int round = 0; round < config_.max_tool_rounds+config_.max_continuations+2; ++round) {
+    if(work_rounds>=config_.max_tool_rounds)break;
+    ++work_rounds;
+    attention["effort"]={{"remaining_generations",config_.max_tool_rounds-work_rounds},{"productive_actions",productive},{"unchanged_observations",unchanged},{"research_budget",tools_.web().settings()}};
+    if(config_.max_tool_rounds-work_rounds<=2)attention["budget_instruction"]="Prioritize essential work and current verification. Preserve concrete next actions if the budget cannot complete the task; do not claim unverified completion.";
     check_control(); deliver_steering(emit);
     auto request = context_.build(attention,[&]{
       journal("memory.extraction_deferred",{{"source_session",p_->session},{"reason","foreground_compaction"},{"policy","durable_sources_then_detached_learning"}});
@@ -693,7 +700,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
       p_->db->event("assistant.segment",{{"generation_id",completion.id},{"status",generation_status_name(completion.status)}},p_->session,p_->task);
       if(!completion.content.empty())emit("assistant.segment.completed",{{"content",completion.content},{"interrupted",true}});
       if(turn_->continuations>=static_cast<unsigned>(config_.max_continuations))throw std::runtime_error("Generation continuation budget exhausted. Reasoning, partial output and unfinished work are preserved.");
-      ++turn_->continuations;
+      ++turn_->continuations;--work_rounds;
       trace("runtime","runtime.decision",{{"decision","continue_generation"},{"reason",generation_status_name(completion.status)},{"continuation_of",completion.id},{"policy","preserve_valid_incomplete_generation"}});
       Json incomplete=Json::array();for(auto& [index,tool]:completion.calls)incomplete.push_back({{"index",index},{"call",tool}});
       attention["generation_continuation"]={{"generation_id",completion.id},{"reason",generation_status_name(completion.status)},{"incomplete_tool_calls",incomplete},{"instruction","Continue this same operator turn from the preserved assistant reasoning and output. Produce the next action or public answer; do not restart the task or repeat completed tools. Reissue any incomplete tool call as complete valid JSON; it has not executed."}};
@@ -715,6 +722,11 @@ void Runtime::chat_turn(std::string input,Emit emit) {
       trace("runtime","runtime.decision",{{"decision","execute_tool"},{"reason","validated_tool_calls"},{"count",completion.calls.size()}});
       store(message,"assistant"); p_->db->event("assistant.message",message,p_->session,p_->task);
       if(!completion.content.empty())emit("assistant.segment.completed",{{"content",completion.content},{"commentary",true}});
+      bool commentary_only=true;for(auto& c:message["tool_calls"]) {
+        auto a=Tools::action(c["function"]["name"],Json::parse(c["function"]["arguments"].get<std::string>()));
+        commentary_only=commentary_only && a.kind==ActionKind::Communication;
+      }
+      if(commentary_only && free_commentary++<2)--work_rounds;
       for (size_t i=0;i<message["tool_calls"].size();++i) {
         auto& call=message["tool_calls"][i];
         p_->tool_call=call["id"].get<std::string>();
@@ -736,6 +748,16 @@ void Runtime::chat_turn(std::string input,Emit emit) {
           mode(cognitive,emit);
           phase(TurnPhase::ExecutingTool,emit);
           result = tools_.execute(name,args,emit);
+          if(action.read_only && !result.contains("error")) {
+            auto semantic=result;for(auto* key:{"source_event_id","invocation_event_id","cache_hit","retrieved_at","document_event_id"})semantic.erase(key);
+            auto key=action.name+":"+digest(action.arguments.dump());auto hash=digest(semantic.dump());auto& previous=observations[key];
+            previous.second=previous.first==hash?previous.second+1:1;previous.first=hash;
+            if(previous.second>1)++unchanged;else ++productive;
+            if(previous.second>=3) {
+              attention["stalled_operation"]={{"action",action.name},{"occurrences",previous.second},{"source_event_id",result.value("source_event_id",Json())},{"instruction","This observation is unchanged. Reuse it; change the query or strategy only to address a concrete remaining gap."}};
+              p_->db->event("effort.no_information_gain",attention["stalled_operation"],p_->session,p_->task);
+            }
+          } else if(!result.contains("error") && action.kind!=ActionKind::Communication){++productive;attention.erase("stalled_operation");}
           if(action.kind==ActionKind::Research){research_work=true;if(emit)emit("agent.status",command("status"));}
           if(action.task_work)task_work=true;
         } catch (const TurnCancelled&) {
@@ -803,7 +825,7 @@ void Runtime::chat_turn(std::string input,Emit emit) {
     emit("assistant.completed",{{"content",completion.content},{"session_id",p_->session}}); return;
   }
   p_->db->event("turn.budget_exhausted",{{"max_tool_rounds",config_.max_tool_rounds}},p_->session,p_->task);
-  continuity(); throw std::runtime_error("Tool-round budget exhausted; work is persisted and may be continued");
+  memory_.checkpoint("work_budget",p_->db->query("SELECT coalesce(max(id),0) AS id FROM messages WHERE session_id=?",{p_->session})[0]["id"],attention);continuity(); throw std::runtime_error("Tool-round budget exhausted; work, evidence and next-action attention are persisted and may be continued");
 }
 void Runtime::continuity() {
   auto unfinished = p_->db->query("SELECT id FROM tasks WHERE status IN ('planned','active','blocked','verifying') AND (project_id IS NULL OR project_id=?)",{p_->project});

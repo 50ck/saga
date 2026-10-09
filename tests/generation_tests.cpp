@@ -184,6 +184,12 @@ void runtime_tests() {
     Fixture f;auto backend=std::make_unique<ScriptBackend>(std::vector<Segment>{answer()});auto* script=backend.get();auto r=f.runtime(std::move(backend));r->chat("hello",f.emit());
     CHECK(script->requests[0].tools.size()==7 && script->requests[0].messages[0]["content"].get<std::string>().size()<ContextBuilder::core_prompt().size());
   }
+  {Fixture f;f.config.max_tool_rounds=1;auto r=f.runtime(std::make_unique<ScriptBackend>(std::vector<Segment>{limited(),answer()}));r->chat("hello",f.emit());
+    CHECK(r->persona().db->query("SELECT status FROM turns")[0]["status"]=="completed");
+  }
+  {Fixture f;auto r=f.runtime(std::make_unique<ScriptBackend>(std::vector<Segment>{tool("a","file_read",{{"path","existing.txt"}}),tool("b","file_read",{{"path","existing.txt"}}),tool("c","file_read",{{"path","existing.txt"}}),answer()}));r->chat("hello",f.emit());
+    CHECK(r->persona().db->query("SELECT id FROM events WHERE type='effort.no_information_gain'").size()==1);
+  }
   run_scenario({answer()},0);
   auto simultaneous=tool("first","file_read",{{"path","existing.txt"}});
   simultaneous.events.insert(simultaneous.events.begin()+1,{ProviderEventKind::ToolDelta,"",{{"index",1},{"id","second"},{"name","file_read"},{"arguments",Json{{"path","existing.txt"}}.dump()}}});

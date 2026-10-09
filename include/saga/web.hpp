@@ -67,6 +67,7 @@ public:
 std::unique_ptr<SearchEngine> make_search_engine(const std::string &name,
                                                  WebTransport transport = fetch_public_web);
 Json research_context(Database &, Id session, Id task);
+Json research_coverage(Database &, Id session, Id task);
 Json research_plan_context(Database &, Id session, Id task);
 struct ResearchReferenceError : std::runtime_error {
   Json references;
@@ -85,8 +86,9 @@ class WebResearch {
   std::unique_ptr<SearchOrchestrator> engine_;
   std::shared_ptr<web::WebAcquisitionEngine> acquisition_;
   int searches_ = 0, reads_ = 0;
-  Id session_ = 0, task_ = 0;
+  Id session_ = 0, task_ = 0, source_cutoff_ = 0;
   std::string turn_;
+  std::map<std::string,Json> turn_searches_;
   std::function<void()> service_;
   void network_control();
   Json lookup_claim(Id, Id session, Id task) const;

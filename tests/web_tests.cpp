@@ -149,8 +149,8 @@ void proof_and_failure_gates() {
   p.db->exec("UPDATE tasks SET risk='high' WHERE id=?",{p.task});CHECK(tools.execute("file_write",{{"path","dangerous.txt"},{"content","bad"},{"description","fixture"}}).contains("error"));CHECK(!fs::exists(root/"project/dangerous.txt"));
   CHECK(tools.execute("file_read",{{"path","uncertain.txt"}})["content"]=="reversible draft");
   tools.web().settings(true);tools.web().begin_turn(p.session,p.task);
-  for(int i=0;i<8;++i)CHECK(!tools.execute("web_read",{{"url","https://docs.example.com/rules"}}).contains("error"));
-  auto network_before=fetches;CHECK(tools.execute("web_read",{{"url","https://docs.example.com/rules"}}).contains("error"));CHECK(fetches==network_before);
+  for(int i=0;i<8;++i)CHECK(!tools.execute("web_read",{{"url","https://docs.example.com/rules"},{"refresh",true}}).contains("error"));
+  auto network_before=fetches;CHECK(tools.execute("web_read",{{"url","https://docs.example.com/rules"},{"refresh",true}}).contains("error"));CHECK(fetches==network_before);
   tools.web().begin_turn(p.session,p.task);
   auto snapshots_before=p.db->query("SELECT count(*) AS n FROM web_sources")[0]["n"];
   tools.service([&]{if(transferring)tools.web().settings(false);});

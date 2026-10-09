@@ -366,7 +366,8 @@ void WebResearch::begin_turn(Id session, Id task, std::string turn) {
   turn_=std::move(turn);
   session_ = session;
   task_ = task;
-  searches_ = reads_ = 0;
+  searches_ = reads_ = 0;turn_searches_.clear();
+  source_cutoff_=db_.query("SELECT coalesce(max(id),0) AS id FROM web_sources")[0]["id"];
   acquisition_->begin_operation();
 }
 Json WebResearch::settings(const std::optional<bool> &enabled) {
@@ -602,6 +603,9 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
   }
   if (name == "web_search") {
     network_control();
+    auto key_args=args;key_args.erase("question_id");key_args.erase("goal_id");key_args["query"]=lower(trim(args.at("query").get<std::string>()));
+    auto key=digest(key_args.dump());
+    if(auto cached=turn_searches_.find(key);cached!=turn_searches_.end()){auto result=cached->second;result["cache_hit"]=true;trace("research","research.search_reused",{{"query_hash",key}},DebugProfile::Trace);return result;}
     if (searches_ >= config_.web_search_limit)
       throw std::runtime_error(
           "Research search budget exhausted; disclose uncertainty or continue next turn");
@@ -643,6 +647,7 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
                       digest(entry["snippet"].get<std::string>()), entry["snippet"], ev});
       }
     });
+    turn_searches_[key]=result;
     return result;
   }
   if (name == "web_read" || name == "web_fetch") {
@@ -677,6 +682,10 @@ Json WebResearch::dispatch_operation(const std::string &name, const Json &args, 
       throw std::runtime_error("URL and source_id refer to different sources");
     url = web_url(url, {}, config_.web_allow_private_network);
     network_control();
+    if(!args.value("refresh",false)) {
+      auto cached=db_.query("SELECT s.id FROM web_sources s JOIN web_source_documents d ON d.source_id=s.id WHERE s.id>? AND s.kind='document' AND ((s.task_id IS NULL AND s.session_id=?) OR s.task_id=?) AND (s.url=? OR json_extract(d.document_json,'$.source.requested_url')=?) ORDER BY s.id DESC LIMIT 1",{source_cutoff_,session,task,url,url});
+      if(!cached.empty())return source_excerpt(cached[0]["id"],args.value("offset",Id(0)),args.value("limit",Id(12288)),args.contains("query")?std::optional<std::string>(args["query"].get<std::string>()):std::nullopt,args.value("max_output_tokens",Id(0)));
+    }
     if (reads_ >= config_.web_read_limit)
       throw std::runtime_error("Research page-read budget exhausted");
     ++reads_;

@@ -41,6 +41,20 @@ Json research_context(Database &db, Id session, Id task) {
                   "((task_id IS NULL AND session_id=?) OR (task_id IS NOT NULL AND task_id=?)) ORDER BY status='pending' DESC,updated_at DESC,id DESC LIMIT 64",
                   {session, task});
 }
+Json research_coverage(Database& db,Id session,Id task) {
+  Json claims=Json::array(),gaps=Json::array();bool verified=true,accounted=true;
+  for(auto& q:db.query("SELECT id,goal_id,question,required,status,sources_json,assessment_json FROM research_questions WHERE superseded_by IS NULL AND ((task_id IS NULL AND session_id=?) OR task_id=?) ORDER BY required DESC,status='supported',id LIMIT 64",{session,task})) {
+    auto assessment=Json::parse(q["assessment_json"].get<std::string>());
+    auto sources=Json::parse(q["sources_json"].get<std::string>());
+    auto attempts=db.query("SELECT count(*) AS attempted,coalesce(sum(succeeded),0) AS successful FROM research_attempts WHERE claim_id=?",{q["id"]})[0];
+    auto unique=db.query("SELECT count(DISTINCT s.content_hash) AS n FROM research_attempts a JOIN web_sources s ON s.id=a.source_id WHERE a.claim_id=? AND a.succeeded=1 AND s.kind='document'",{q["id"]})[0]["n"];
+    Json row={{"claim_id",q["id"]},{"goal_id",q["goal_id"]},{"question",q["question"]},{"required",q["required"]},{"status",q["status"]},{"citations",sources},{"attempts",attempts},{"distinct_documents",unique},{"semantic_assessment",assessment.value("assessed_by","not_assessed")}};
+    claims.push_back(row);
+    if(q["required"]==1 && q["status"]!="supported"){verified=false;gaps.push_back({{"claim_id",q["id"]},{"question",q["question"]},{"status",q["status"]},{"next_action",q["status"]=="contradicted"?"Reconcile conflicting evidence or revise the proposition":unique.get<Id>()?"Inspect existing passages before another search":"Acquire focused primary evidence"}});}
+    if(q["required"]==1 && q["status"]=="pending")accounted=false;
+  }
+  return {{"claims",claims},{"critical_gaps",gaps},{"required_claims_verified",verified},{"required_claims_accounted",accounted},{"proof_boundary","Discovery is not evidence; validated citations are not automatic entailment or implementation verification"}};
+}
 Json WebResearch::questions(Id session, Id task) const {
   return research_context(db_, session, task);
 }
@@ -185,7 +199,8 @@ Json WebResearch::references(Id session,Id task) const {
     goals[id]["claim_ids"].push_back(claim["claim_id"]);
   }
   for(auto &[id,goal]:goals)result["available_goals"].push_back(std::move(goal));
-  result["available_passages"]=db_.query("SELECT p.id AS passage_id,p.source_id,p.block_id,substr(p.text,1,100) AS preview FROM web_source_passages p JOIN web_sources s ON s.id=p.source_id WHERE ((s.task_id IS NULL AND s.session_id=?) OR (s.task_id IS NOT NULL AND s.task_id=?)) ORDER BY p.id DESC LIMIT 24",{session,task});
+  result["coverage"]=research_coverage(db_,session,task);
+  result["available_passages"]=db_.query("SELECT p.id AS passage_id,p.source_id,p.block_id,substr(p.text,1,100) AS preview FROM web_source_passages p JOIN web_sources s ON s.id=p.source_id WHERE ((s.task_id IS NULL AND s.session_id=?) OR (s.task_id IS NOT NULL AND s.task_id=?)) ORDER BY EXISTS(SELECT 1 FROM research_attempts a JOIN research_questions q ON q.id=a.claim_id WHERE a.source_id=p.source_id AND q.required=1 AND q.status!='supported' AND q.superseded_by IS NULL) DESC,p.id DESC LIMIT 24",{session,task});
   return result;
 }
 Json WebResearch::lookup_claim(Id id,Id session,Id task) const {

@@ -199,3 +199,17 @@ blocking assumptions and artifact-version hashes independently of generic output
 reduction. Passage references prioritize unresolved required claims over recency.
 Large text observations are selected by local BM25 over intact 32-line windows,
 preserving whitespace and original provenance for lossless explicit retrieval.
+
+Research coverage exposes each active claim, inspected-document count, citations,
+remaining critical gaps and the distinction between accounted and verified work.
+Within a turn, identical successful queries reuse normalized results and source
+IDs without spending another search attempt; repeated URL reads reuse the same
+immutable document and can select new focused sections. A new turn does not
+silently pin an old URL snapshot; explicit source_id reads always address history,
+and refresh requests spend the acquisition budget.
+The effort controller counts changed observations separately from repeated
+unchanged results and supplies a strategy-change instruction after three identical
+observations. Hard work/research limits remain in force. Output-limit continuations
+and at most two commentary-only segments have bounded separate allowances instead
+of consuming the normal work-round budget. Exhaustion saves next-action attention
+in a local checkpoint, without adding a memory-generation detour.

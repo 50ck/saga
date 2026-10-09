@@ -103,8 +103,14 @@ void failure_is_not_verification() {
   rejects([&]{research.dispatch("web_search",{{"query","rotation"},{"question_id",claim}},session,0);});
   research.account_for_pending(session,0,{});CHECK(research.questions(session,0)[0]["status"]=="pending");
   auto source=research.dispatch("web_read",{{"url","https://rules.example.com/rotation"},{"question_id",claim}},session,0);
+  CHECK(research_coverage(*p.db,session,0)["required_claims_verified"]==false);
   CHECK(p.db->query("SELECT engine FROM web_sources WHERE id=?",{source["source_id"]})[0]["engine"]=="web_acquisition");
   research.dispatch("research_resolve",{{"id",claim},{"status","supported"},{"assessment",{{"proposition","Rotation direction?"},{"coverage","full"},{"rationale","The fetched fixture directly specifies the direction."}}},{"conclusion","Clockwise rotation is documented."},{"sources",Json::array({{{"source_id",source["source_id"]},{"quote","Rotation is clockwise."},{"relation","supports"}}})}},session,0);
+  auto coverage=research_coverage(*p.db,session,0);CHECK(coverage["required_claims_verified"]==true);
+  CHECK(coverage["claims"][0]["distinct_documents"]==1);
+  auto reads=research.settings()["reads"];
+  auto reused=research.dispatch("web_read",{{"url","https://rules.example.com/rotation"},{"question_id",claim}},session,0);
+  CHECK(reused["source_id"]==source["source_id"] && research.settings()["reads"]==reads);
   CHECK(research.unresolved_required(session,0).empty());CHECK(p.db->query("SELECT id FROM research_attempts WHERE succeeded=0").size()==1);
   auto user=p.db->event("user.message",{{"content","Implement a program with C in /tmp/widget; inspect modern rules."}},session);
   rejects([&]{research.question("Implement a program with C in /tmp/widget; inspect modern rules.",true,session,0);});
@@ -165,6 +171,9 @@ void reference_contract() {
   }
   CHECK(requests==3);CHECK(db.query("SELECT id FROM research_attempts WHERE succeeded=1").size()==11);
   CHECK(db.query("SELECT id FROM research_questions WHERE session_id=? AND status='pending'",{p.session}).size()==11);
+  auto before_reuse=requests;
+  auto reused_search=tools.execute("web_search",{{"query","Goal query 1"},{"goal_id",1}});
+  CHECK(!reused_search.contains("error") && reused_search["cache_hit"]==true && requests==before_reuse);
   auto mismatch=tools.execute("web_search",{{"query","Wrong goal"},{"goal_id",1},{"question_id",9}});CHECK(mismatch["error_type"]=="ResearchReferenceError");CHECK(requests==3);
   auto source=tools.execute("web_read",{{"url","https://rules.example.com/rotation"},{"goal_id",1}});CHECK(source["claim_ids"].size()==4);
   CHECK(db.query("SELECT id FROM research_attempts WHERE source_id=?",{source["source_id"]}).size()==4);
